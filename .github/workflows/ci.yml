@@ -45,6 +45,15 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
+      rabbitmq:
+        image: rabbitmq:3
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 15
     steps:
       - uses: actions/checkout@v4
 
@@ -53,12 +62,13 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install (with redis extra)
+      - name: Install (with redis + amqp extras)
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[redis,dev]"
+          pip install -e ".[redis,amqp,dev]"
 
-      - name: Run tests (Redis transport included)
+      - name: Run tests (Redis + RabbitMQ transports included)
         env:
           BABELQUEUE_TEST_REDIS: redis://localhost:6379/0
+          BABELQUEUE_TEST_AMQP: amqp://guest:guest@localhost:5672/
         run: pytest

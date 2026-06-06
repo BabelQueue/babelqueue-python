@@ -82,17 +82,19 @@ dlq = dead_letter.annotate(envelope, "failed", "orders", attempts=3, error="boom
 
 ## Runtime — produce & consume
 
-For an end-to-end app, use `BabelQueue` with a broker. Redis support comes via an
-extra:
+For an end-to-end app, use `BabelQueue` with a broker. Broker clients come via
+extras:
 
 ```bash
-pip install "babelqueue[redis]"
+pip install "babelqueue[redis]"   # redis://
+pip install "babelqueue[amqp]"    # amqp:// (RabbitMQ)
 ```
 
 ```python
 from babelqueue import BabelQueue
 
 app = BabelQueue("redis://localhost:6379/0", queue="orders")
+# or: BabelQueue("amqp://guest:guest@localhost:5672/", queue="orders")
 
 @app.handler("urn:babel:orders:created")
 def on_order_created(data, meta):       # AI/ML, data processing, anything
@@ -112,16 +114,17 @@ app.run()                               # consume forever (Ctrl-C to stop)
 - **Retry & dead-letter:** failures are retried up to `max_attempts` (bumping the
   envelope's `attempts`); enable `dead_letter=True` to quarantine exhausted
   messages on `<queue>.dlq`. `on_unknown_urn` = `fail` | `delete` | `release` | `dead_letter`.
-- **Transports:** `redis://` (reliable-queue pattern) and `memory://` (in-process,
-  great for tests/local). Bring your own by passing `transport=...`.
+- **Transports:** `redis://` (reliable-queue pattern), `amqp://` (RabbitMQ via
+  `pika`, with the contract AMQP properties) and `memory://` (in-process, great for
+  tests/local). Bring your own by passing `transport=...`.
 
-> RabbitMQ (`pika`) and **Celery** / **Django** adapters are the next iterations.
+> **Celery** / **Django** adapters are the next iterations.
 
 ## What's here
 
 The codec/contracts/dead-letter (zero-dep core) **and** the `BabelQueue` runtime
-above (in-memory built in; Redis via the `[redis]` extra). For framework
-integration, the Celery and Django adapters are planned.
+above (in-memory built in; Redis via `[redis]`, RabbitMQ via `[amqp]`). For
+framework integration, the Celery and Django adapters are planned.
 
 ## Testing
 

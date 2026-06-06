@@ -10,14 +10,22 @@ The envelope wire format is versioned separately by `meta.schema_version`
 ## [Unreleased]
 
 ### Added
+- **RabbitMQ transport** (`PikaTransport`, `amqp://`): durable queue, persistent
+  delivery, `basic_get` + manual ack, and the contract AMQP properties (`type`=URN,
+  `correlation_id`=trace_id, `x-schema-version`/`x-source-lang`/`x-attempts`).
+  Optional `[amqp]` extra (lazy `pika` import) — the core stays zero-dep.
+
+## [0.2.0] - 2026-06-06
+
+### Added
 - **Runtime** — `BabelQueue(broker_url=...)` app with a `@app.handler("urn:...")`
   decorator, `publish()`, and a `consume()` / `run()` loop. Routes by URN over the
   canonical envelope; `attempts`-based retry → opt-in dead-letter queue;
   `on_unknown_urn` strategies (`fail`/`delete`/`release`/`dead_letter`).
 - **Transports** — a pluggable `Transport` abstraction with `InMemoryTransport`
   (`memory://`, for tests/local) and `RedisTransport` (`redis://`, reliable-queue
-  pattern via `BLMOVE` + a processing list). Redis client is an optional extra
-  (`pip install "babelqueue[redis]"`), imported lazily — the core stays zero-dep.
+  pattern via `BLMOVE` + a processing list). Redis client is an optional `[redis]`
+  extra, imported lazily — the core stays zero-dep.
 
 ## [0.1.0] - 2026-06-06
 
@@ -36,5 +44,6 @@ The envelope wire format is versioned separately by `meta.schema_version`
 - Pre-1.0: the public API may change before the `1.0.0` tag.
 - The core has **zero runtime dependencies** (standard library only); Python `>=3.9`.
 
-[Unreleased]: https://github.com/BabelQueue/babelqueue-python/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/BabelQueue/babelqueue-python/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/BabelQueue/babelqueue-python/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/BabelQueue/babelqueue-python/releases/tag/v0.1.0

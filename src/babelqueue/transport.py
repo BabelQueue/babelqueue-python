@@ -75,8 +75,12 @@ def make_transport(broker_url: str) -> Transport:
         from .redis_transport import RedisTransport
 
         return RedisTransport(broker_url)
+    if scheme in ("amqp", "amqps"):
+        from .pika_transport import PikaTransport
+
+        return PikaTransport(broker_url)
 
     raise BabelQueueError(
-        f"Unsupported broker scheme {scheme!r}. Use 'memory://' or 'redis://', "
-        "or pass your own Transport via BabelQueue(transport=...)."
+        f"Unsupported broker scheme {scheme!r}. Use 'memory://', 'redis://' or "
+        "'amqp://', or pass your own Transport via BabelQueue(transport=...)."
     )
