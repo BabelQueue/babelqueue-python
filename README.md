@@ -80,13 +80,48 @@ dlq = dead_letter.annotate(envelope, "failed", "orders", attempts=3, error="boom
 # publish `EnvelopeCodec.encode(dlq)` to the "orders.dlq" queue
 ```
 
-## What's here vs. coming
+## Runtime — produce & consume
 
-- **Now (this package):** the codec, contracts, dead-letter and unknown-URN
-  helpers, plus the shared conformance fixtures. Bring your own broker client.
-- **Next (planned):** a built-in runtime — `BabelQueue(broker_url=...)` with an
-  `@app.handler("urn:…")` decorator over `redis`/`pika` — and **Celery** / **Django**
-  adapters. Install via extras (`babelqueue[redis]`, `babelqueue[celery]`, …).
+For an end-to-end app, use `BabelQueue` with a broker. Redis support comes via an
+extra:
+
+```bash
+pip install "babelqueue[redis]"
+```
+
+```python
+from babelqueue import BabelQueue
+
+app = BabelQueue("redis://localhost:6379/0", queue="orders")
+
+@app.handler("urn:babel:orders:created")
+def on_order_created(data, meta):       # AI/ML, data processing, anything
+    print("order", data["order_id"])
+
+# producer (any service, any language) …
+app.publish("urn:babel:orders:created", {"order_id": 1042})
+
+# worker
+app.run()                               # consume forever (Ctrl-C to stop)
+```
+
+- **Routing** is by URN; the wire format is the canonical envelope, so this
+  consumes messages produced by *any* BabelQueue SDK.
+- **Handlers** receive `(data, meta)`, or `(data, meta, message)` to get the full
+  envelope (incl. `trace_id`).
+- **Retry & dead-letter:** failures are retried up to `max_attempts` (bumping the
+  envelope's `attempts`); enable `dead_letter=True` to quarantine exhausted
+  messages on `<queue>.dlq`. `on_unknown_urn` = `fail` | `delete` | `release` | `dead_letter`.
+- **Transports:** `redis://` (reliable-queue pattern) and `memory://` (in-process,
+  great for tests/local). Bring your own by passing `transport=...`.
+
+> RabbitMQ (`pika`) and **Celery** / **Django** adapters are the next iterations.
+
+## What's here
+
+The codec/contracts/dead-letter (zero-dep core) **and** the `BabelQueue` runtime
+above (in-memory built in; Redis via the `[redis]` extra). For framework
+integration, the Celery and Django adapters are planned.
 
 ## Testing
 

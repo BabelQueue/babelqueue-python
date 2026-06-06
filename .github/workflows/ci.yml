@@ -31,3 +31,34 @@ jobs:
 
       - name: Run tests
         run: pytest
+
+  integration:
+    name: Redis integration
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install (with redis extra)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[redis,dev]"
+
+      - name: Run tests (Redis transport included)
+        env:
+          BABELQUEUE_TEST_REDIS: redis://localhost:6379/0
+        run: pytest
