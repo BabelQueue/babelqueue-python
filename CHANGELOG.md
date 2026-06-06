@@ -14,6 +14,11 @@ The envelope wire format is versioned separately by `meta.schema_version`
   delivery, `basic_get` + manual ack, and the contract AMQP properties (`type`=URN,
   `correlation_id`=trace_id, `x-schema-version`/`x-source-lang`/`x-attempts`).
   Optional `[amqp]` extra (lazy `pika` import) — the core stays zero-dep.
+- `EnvelopeCodec.urn()` — resolve the URN (`job`, accepting `urn` as an alias).
+- `EnvelopeCodec.accepts()` — consumer-side envelope validation (rejects empty URN,
+  unsupported `meta.schema_version`, blank `trace_id`, non-object `data`).
+- Shared **cross-SDK conformance suite** under `tests/conformance/` (vendored from
+  the canonical `conformance/` set) plus a `test_conformance.py` runner.
 
 ## [0.2.0] - 2026-06-06
 

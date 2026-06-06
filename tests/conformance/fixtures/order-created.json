@@ -1,0 +1,15 @@
+{
+  "job": "urn:babel:orders:created",
+  "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+  "data": {
+    "order_id": 1042
+  },
+  "meta": {
+    "id": "f1e2d3c4-b5a6-4789-90ab-cdef01234567",
+    "queue": "orders",
+    "lang": "php",
+    "schema_version": 1,
+    "created_at": 1749132727000
+  },
+  "attempts": 0
+}

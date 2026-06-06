@@ -94,3 +94,36 @@ class EnvelopeCodec:
         except (ValueError, TypeError):
             return {}
         return decoded if isinstance(decoded, dict) else {}
+
+    @staticmethod
+    def urn(envelope: Mapping[str, Any]) -> str:
+        """The message URN: canonical ``job``, with ``urn`` accepted as an alias."""
+        return str(envelope.get("job") or envelope.get("urn") or "")
+
+    @staticmethod
+    def accepts(envelope: Mapping[str, Any]) -> bool:
+        """Whether a consumer should accept this envelope (consumer-side validation).
+
+        Rejects messages with no URN, an unsupported ``meta.schema_version``, a
+        missing/blank ``trace_id``, or a non-object ``data`` / non-integer
+        ``attempts``. (Accepts the ``urn`` alias, unlike the producer JSON Schema.)
+        """
+        if EnvelopeCodec.urn(envelope) == "":
+            return False
+
+        meta = envelope.get("meta")
+        if not isinstance(meta, dict) or meta.get("schema_version") != SCHEMA_VERSION:
+            return False
+
+        if not isinstance(envelope.get("data"), dict):
+            return False
+
+        attempts = envelope.get("attempts")
+        if not isinstance(attempts, int) or isinstance(attempts, bool):
+            return False
+
+        trace_id = envelope.get("trace_id")
+        if not isinstance(trace_id, str) or trace_id == "":
+            return False
+
+        return True

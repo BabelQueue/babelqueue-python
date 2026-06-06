@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "description": "Cross-SDK conformance cases. Every BabelQueue SDK core must satisfy these against the canonical wire envelope. Per-message fields (meta.id, trace_id, meta.created_at) are intrinsically unique and are NOT asserted by value.",
+  "cases": [
+    {
+      "name": "order-created",
+      "file": "fixtures/order-created.json",
+      "valid": true,
+      "description": "A normal produced envelope.",
+      "expect": {
+        "urn": "urn:babel:orders:created",
+        "data": { "order_id": 1042 },
+        "attempts": 0,
+        "lang": "php",
+        "schema_version": 1
+      }
+    },
+    {
+      "name": "urn-alias",
+      "file": "fixtures/urn-alias.json",
+      "valid": true,
+      "description": "Consumers MUST accept 'urn' as an inbound alias for 'job'.",
+      "expect": {
+        "urn": "urn:babel:orders:created",
+        "data": { "order_id": 1042 },
+        "attempts": 0,
+        "lang": "go",
+        "schema_version": 1
+      }
+    },
+    {
+      "name": "dead-lettered",
+      "file": "fixtures/dead-lettered.json",
+      "valid": true,
+      "description": "A dead-lettered message: original preserved + additive dead_letter block.",
+      "expect": {
+        "urn": "urn:babel:orders:created",
+        "data": { "order_id": 1042 },
+        "attempts": 3,
+        "lang": "php",
+        "schema_version": 1,
+        "dead_letter": { "reason": "failed", "original_queue": "orders" }
+      }
+    },
+    {
+      "name": "unicode-and-numbers",
+      "file": "fixtures/unicode-and-numbers.json",
+      "valid": true,
+      "description": "UTF-8 strings, integers, an exact float, boolean and null round-trip identically.",
+      "expect": {
+        "urn": "urn:babel:catalog:item.indexed",
+        "data": { "title": "Café — naïve ☕", "qty": 7, "price_cents": 1299, "ratio": 0.5, "active": true, "note": null },
+        "attempts": 2,
+        "lang": "python",
+        "schema_version": 1
+      }
+    },
+    {
+      "name": "invalid-unknown-schema-version",
+      "file": "fixtures/invalid-unknown-schema-version.json",
+      "valid": false,
+      "reason": "meta.schema_version is not a version this SDK supports"
+    },
+    {
+      "name": "invalid-missing-urn",
+      "file": "fixtures/invalid-missing-urn.json",
+      "valid": false,
+      "reason": "no 'job' or 'urn' — the message has no identity"
+    }
+  ]
+}

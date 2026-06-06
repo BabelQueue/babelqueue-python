@@ -1,0 +1,20 @@
+{
+  "job": "urn:babel:catalog:item.indexed",
+  "trace_id": "3f7a1d2e-9b4c-4a8d-bc1e-0f5a6b7c8d90",
+  "data": {
+    "title": "Café — naïve ☕",
+    "qty": 7,
+    "price_cents": 1299,
+    "ratio": 0.5,
+    "active": true,
+    "note": null
+  },
+  "meta": {
+    "id": "b2c3d4e5-f607-4890-a1b2-c3d4e5f60718",
+    "queue": "catalog",
+    "lang": "python",
+    "schema_version": 1,
+    "created_at": 1749132727000
+  },
+  "attempts": 2
+}
