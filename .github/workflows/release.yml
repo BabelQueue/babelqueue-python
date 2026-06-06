@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Build, test & publish to PyPI
+    runs-on: ubuntu-latest
+    # Recommended for PyPI Trusted Publishing — configure a "pypi" environment +
+    # a trusted publisher on PyPI (repo BabelQueue/babelqueue-python, this workflow).
+    environment: pypi
+    permissions:
+      id-token: write   # PyPI Trusted Publishing (OIDC) — no API token needed
+      contents: write   # create the GitHub release
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install & test
+        run: |
+          python -m pip install --upgrade pip build
+          pip install -e ".[dev]"
+          pytest
+
+      - name: Build distributions
+        run: python -m build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # Or, with a token instead of trusted publishing:
+        #   with:
+        #     password: ${{ secrets.PYPI_API_TOKEN }}
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true

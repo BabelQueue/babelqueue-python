@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "babelqueue"
+version = "0.1.0"
+description = "Polyglot Queues, Simplified — the Python core: the canonical BabelQueue wire-envelope codec, contracts and dead-letter helpers."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Muhammet Şafak", email = "info@muhammetsafak.com.tr" }]
+keywords = ["queue", "polyglot", "microservices", "json", "envelope", "messaging"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+# Planned runtime / adapters — standard, zero-heavy-dep drivers.
+redis = ["redis>=4"]
+amqp = ["pika>=1.3"]
+dev = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://babelqueue.com"
+Source = "https://github.com/BabelQueue/babelqueue-python"
+Issues = "https://github.com/BabelQueue/babelqueue-python/issues"
+Changelog = "https://github.com/BabelQueue/babelqueue-python/blob/main/CHANGELOG.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/babelqueue"]
