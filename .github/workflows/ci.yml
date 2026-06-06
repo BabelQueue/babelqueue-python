@@ -72,3 +72,16 @@ jobs:
           BABELQUEUE_TEST_REDIS: redis://localhost:6379/0
           BABELQUEUE_TEST_AMQP: amqp://guest:guest@localhost:5672/
         run: pytest
+
+  conformance:
+    name: Conformance suite in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Verify vendored conformance matches the canonical suite
+        run: |
+          git clone --depth 1 https://github.com/BabelQueue/conformance.git "$RUNNER_TEMP/conformance"
+          diff -ru "$RUNNER_TEMP/conformance/manifest.json" "tests/conformance/manifest.json"
+          diff -ru "$RUNNER_TEMP/conformance/fixtures"      "tests/conformance/fixtures"
+          diff -ru "$RUNNER_TEMP/conformance/schema"        "tests/conformance/schema"
+          echo "Vendored conformance is in sync with the canonical suite."
