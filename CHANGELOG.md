@@ -9,16 +9,22 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-06
+
 ### Added
-- **RabbitMQ transport** (`PikaTransport`, `amqp://`): durable queue, persistent
-  delivery, `basic_get` + manual ack, and the contract AMQP properties (`type`=URN,
-  `correlation_id`=trace_id, `x-schema-version`/`x-source-lang`/`x-attempts`).
-  Optional `[amqp]` extra (lazy `pika` import) — the core stays zero-dep.
 - `EnvelopeCodec.urn()` — resolve the URN (`job`, accepting `urn` as an alias).
 - `EnvelopeCodec.accepts()` — consumer-side envelope validation (rejects empty URN,
   unsupported `meta.schema_version`, blank `trace_id`, non-object `data`).
 - Shared **cross-SDK conformance suite** under `tests/conformance/` (vendored from
   the canonical `conformance/` set) plus a `test_conformance.py` runner.
+
+## [0.3.0] - 2026-06-06
+
+### Added
+- **RabbitMQ transport** (`PikaTransport`, `amqp://`): durable queue, persistent
+  delivery, `basic_get` + manual ack, and the contract AMQP properties (`type`=URN,
+  `correlation_id`=trace_id, `x-schema-version`/`x-source-lang`/`x-attempts`).
+  Optional `[amqp]` extra (lazy `pika` import) — the core stays zero-dep.
 
 ## [0.2.0] - 2026-06-06
 
@@ -49,6 +55,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 - Pre-1.0: the public API may change before the `1.0.0` tag.
 - The core has **zero runtime dependencies** (standard library only); Python `>=3.9`.
 
-[Unreleased]: https://github.com/BabelQueue/babelqueue-python/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/BabelQueue/babelqueue-python/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/BabelQueue/babelqueue-python/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/BabelQueue/babelqueue-python/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/BabelQueue/babelqueue-python/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/BabelQueue/babelqueue-python/releases/tag/v0.1.0
