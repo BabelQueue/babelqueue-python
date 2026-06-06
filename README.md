@@ -118,13 +118,51 @@ app.run()                               # consume forever (Ctrl-C to stop)
   `pika`, with the contract AMQP properties) and `memory://` (in-process, great for
   tests/local). Bring your own by passing `transport=...`.
 
-> **Celery** / **Django** adapters are the next iterations.
+## Framework adapters — Celery & Django
+
+**Celery** (`pip install "babelqueue[celery]"`) — reuse your Celery app's broker for
+polyglot interop, and consume inbound messages as a Celery worker bootstep:
+
+```python
+from babelqueue.celery import from_celery, install_worker
+
+bq = from_celery(celery_app, queue="orders")    # runtime on Celery's broker
+bq.publish("urn:babel:orders:created", {"order_id": 1042})
+
+@bq.handler("urn:babel:orders:created")
+def on_created(data, meta): ...
+
+install_worker(celery_app, bq)                   # `celery worker` also drains URN messages
+```
+
+**Django** (`pip install "babelqueue[django]"`) — add `"babelqueue.django"` to
+`INSTALLED_APPS` and configure a `BABELQUEUE` dict:
+
+```python
+# settings.py
+BABELQUEUE = {"broker_url": "redis://localhost:6379/0", "queue": "orders", "dead_letter": True}
+```
+
+```python
+from babelqueue.django import publish, get_app
+
+publish("urn:babel:orders:created", {"order_id": 1042})   # in a view / signal
+
+@get_app().handler("urn:babel:orders:created")            # register handlers at startup
+def on_created(data, meta): ...
+```
+
+```bash
+python manage.py babelqueue_worker --queue orders          # run the consumer
+```
 
 ## What's here
 
-The codec/contracts/dead-letter (zero-dep core) **and** the `BabelQueue` runtime
-above (in-memory built in; Redis via `[redis]`, RabbitMQ via `[amqp]`). For
-framework integration, the Celery and Django adapters are planned.
+The codec/contracts/dead-letter (zero-dep core), the `BabelQueue` runtime
+(in-memory built in; Redis via `[redis]`, RabbitMQ via `[amqp]`), and framework
+adapters for **Celery** (`[celery]`) and **Django** (`[django]`). Every layer
+speaks the one canonical envelope, so it interoperates with the PHP/Laravel,
+Symfony, Go, Node and .NET SDKs.
 
 ## Testing
 

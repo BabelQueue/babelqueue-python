@@ -9,6 +9,19 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-06
+
+### Added
+- **Celery adapter** (`babelqueue.celery`, `[celery]` extra) — `from_celery(app)`
+  builds a `BabelQueue` runtime on a Celery app's broker, and `install_worker(app)`
+  registers a Celery worker bootstep that drains URN-routed polyglot messages in a
+  background thread alongside Celery's own consumer.
+- **Django adapter** (`babelqueue.django`, `[django]` extra) — settings-driven
+  `BABELQUEUE` config, `get_app()` / `publish()` shortcuts, and a
+  `manage.py babelqueue_worker` management command. Add `"babelqueue.django"` to
+  `INSTALLED_APPS`.
+- Both adapters lazy-import their framework, so the core stays dependency-free.
+
 ## [0.4.0] - 2026-06-06
 
 ### Added
@@ -55,7 +68,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 - Pre-1.0: the public API may change before the `1.0.0` tag.
 - The core has **zero runtime dependencies** (standard library only); Python `>=3.9`.
 
-[Unreleased]: https://github.com/BabelQueue/babelqueue-python/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/BabelQueue/babelqueue-python/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/BabelQueue/babelqueue-python/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/BabelQueue/babelqueue-python/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/BabelQueue/babelqueue-python/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/BabelQueue/babelqueue-python/compare/v0.1.0...v0.2.0

@@ -19,7 +19,7 @@ from .exceptions import BabelQueueError, UnknownUrnError
 from .routing import UnknownUrnStrategy
 from .transport import InMemoryTransport, ReceivedMessage, Transport
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "BabelQueue",

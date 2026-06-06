@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "babelqueue"
-version = "0.4.0"
+version = "0.5.0"
 description = "Polyglot Queues, Simplified — the Python core: the canonical BabelQueue wire-envelope codec, contracts and dead-letter helpers."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -28,9 +28,11 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-# Planned runtime / adapters — standard, zero-heavy-dep drivers.
+# Optional runtime drivers + framework adapters — standard, zero-heavy-dep.
 redis = ["redis>=4"]
 amqp = ["pika>=1.3"]
+celery = ["celery>=5"]
+django = ["django>=4.2"]
 dev = ["pytest>=7"]
 
 [project.urls]
