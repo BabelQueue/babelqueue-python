@@ -36,10 +36,15 @@ class RedisTransport(Transport):
         self._redis.rpush(queue, body)
 
     def pop(self, queue: str, timeout: float = 1.0) -> Optional[ReceivedMessage]:
-        body = self._redis.blmove(queue, self._processing(queue), timeout, "LEFT", "RIGHT")
+        # redis-py types the BLMOVE timeout as int, but Redis accepts a float
+        # (sub-second) timeout; passing it through is correct at runtime.
+        body = self._redis.blmove(queue, self._processing(queue), timeout, "LEFT", "RIGHT")  # type: ignore[arg-type]
         if body is None:
             return None
-        return ReceivedMessage(body=body, queue=queue, handle=body)
+        # decode_responses=True yields str; the guard satisfies the type checker
+        # (and is a harmless safety net otherwise).
+        text = body if isinstance(body, str) else body.decode()
+        return ReceivedMessage(body=text, queue=queue, handle=text)
 
     def ack(self, message: ReceivedMessage) -> None:
         self._redis.lrem(self._processing(message.queue), 1, message.handle)

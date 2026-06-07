@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "babelqueue"
-version = "0.5.0"
+version = "1.0.0"
 description = "Polyglot Queues, Simplified — the Python core: the canonical BabelQueue wire-envelope codec, contracts and dead-letter helpers."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -33,7 +33,7 @@ redis = ["redis>=4"]
 amqp = ["pika>=1.3"]
 celery = ["celery>=5"]
 django = ["django>=4.2"]
-dev = ["pytest>=7"]
+dev = ["pytest>=7", "pytest-cov>=4", "mypy>=1.8", "ruff>=0.5"]
 
 [project.urls]
 Homepage = "https://babelqueue.com"
@@ -43,3 +43,21 @@ Changelog = "https://github.com/BabelQueue/babelqueue-python/blob/main/CHANGELOG
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/babelqueue"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+
+[tool.mypy]
+# Lowest target mypy accepts; the package itself still supports Python 3.9 at
+# runtime (requires-python >=3.9) and uses only 3.9-compatible typing.
+python_version = "3.10"
+files = ["src/babelqueue"]
+ignore_missing_imports = true
+
+[tool.coverage.run]
+source = ["babelqueue"]
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = ["pragma: no cover", "raise NotImplementedError", "if TYPE_CHECKING:"]

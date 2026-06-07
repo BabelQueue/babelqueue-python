@@ -9,6 +9,22 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-06-07
+
+**1.0.0 — the public API is now SemVer-stable**: breaking changes require a MAJOR,
+following the deprecation policy. The wire envelope is unchanged
+(`schema_version: 1`); the core + Celery/Django adapters ship together. Full
+reference at [babelqueue.com](https://babelqueue.com).
+
+### Internal
+- CI adds **ruff** + **mypy** static analysis and a **>=90% coverage gate**
+  (`pytest --cov --cov-fail-under=90`, run in the broker-backed job so the Redis /
+  RabbitMQ transports count). Type-safety fix in `redis_transport` (str-narrow the
+  BLMOVE reply) surfaced by mypy — no behaviour change.
+- **GR-8 latency benchmark** (`tests/test_overhead.py`) — asserts the envelope
+  encode/decode path adds **≤2%** over plain-JSON serialization vs a conservative
+  750µs broker round-trip.
+
 ## [0.5.0] - 2026-06-06
 
 ### Added
@@ -68,7 +84,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 - Pre-1.0: the public API may change before the `1.0.0` tag.
 - The core has **zero runtime dependencies** (standard library only); Python `>=3.9`.
 
-[Unreleased]: https://github.com/BabelQueue/babelqueue-python/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/BabelQueue/babelqueue-python/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/BabelQueue/babelqueue-python/compare/v0.5.0...v1.0.0
 [0.5.0]: https://github.com/BabelQueue/babelqueue-python/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/BabelQueue/babelqueue-python/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/BabelQueue/babelqueue-python/compare/v0.2.0...v0.3.0
