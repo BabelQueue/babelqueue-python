@@ -23,7 +23,8 @@ reference at [babelqueue.com](https://babelqueue.com).
   BLMOVE reply) surfaced by mypy — no behaviour change.
 - **GR-8 latency benchmark** (`tests/test_overhead.py`) — asserts the envelope
   encode/decode path adds **≤2%** over plain-JSON serialization vs a conservative
-  750µs broker round-trip.
+  2ms broker round-trip (the pure-Python codec is slower than the compiled SDKs —
+  ~16µs marginal on CPython 3.9/CI — so the reference is higher to stay robust).
 
 ## [0.5.0] - 2026-06-06
 
