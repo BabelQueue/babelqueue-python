@@ -67,5 +67,31 @@
       "valid": false,
       "reason": "no 'job' or 'urn' — the message has no identity"
     }
-  ]
+  ],
+  "sqs": {
+    "description": "Amazon SQS binding conformance (broker-bindings.md §3). Every SDK that ships an SQS transport must satisfy these. The envelope body stays byte-identical (the 'cases' above); these lock the native projection + reconciliation the binding adds. Per-message values reuse fixtures/order-created.json so the expected attributes are deterministic.",
+    "attribute_projection": {
+      "description": "On produce, the transport MUST project these native MessageAttributes from the envelope (a redundant, routable view of the body; ids/strings are DataType String, counters are DataType Number). Applies to every SQS-producing SDK.",
+      "envelope_file": "fixtures/order-created.json",
+      "message_attributes": {
+        "bq-job":            { "DataType": "String", "StringValue": "urn:babel:orders:created" },
+        "bq-trace-id":       { "DataType": "String", "StringValue": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b" },
+        "bq-message-id":     { "DataType": "String", "StringValue": "f1e2d3c4-b5a6-4789-90ab-cdef01234567" },
+        "bq-schema-version": { "DataType": "Number", "StringValue": "1" },
+        "bq-source-lang":    { "DataType": "String", "StringValue": "php" },
+        "bq-created-at":     { "DataType": "Number", "StringValue": "1749132727000" }
+      }
+    },
+    "attempts_reconciliation": {
+      "description": "On consume, attempts = max(body.attempts, ApproximateReceiveCount - 1): a first delivery reads 0, an absent/garbage count is ignored, a runtime-incremented count is never lowered. Applies to SDKs that reconcile the envelope body on consume (the framework-less/runtime transports). A drop-in driver that surfaces the broker's native delivery count instead (e.g. Laravel's SqsJob.attempts() = ApproximateReceiveCount) is exempt — it documents that divergence.",
+      "cases": [
+        { "name": "first-delivery",        "body_attempts": 0, "approximate_receive_count": "1",            "expected_attempts": 0 },
+        { "name": "third-delivery",        "body_attempts": 0, "approximate_receive_count": "3",            "expected_attempts": 2 },
+        { "name": "native-exceeds-body",   "body_attempts": 2, "approximate_receive_count": "5",            "expected_attempts": 4 },
+        { "name": "never-lower-runtime",   "body_attempts": 5, "approximate_receive_count": "1",            "expected_attempts": 5 },
+        { "name": "garbage-count-ignored", "body_attempts": 4, "approximate_receive_count": "not-a-number", "expected_attempts": 4 },
+        { "name": "absent-count",          "body_attempts": 3, "approximate_receive_count": null,           "expected_attempts": 3 }
+      ]
+    }
+  }
 }

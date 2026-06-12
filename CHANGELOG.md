@@ -7,7 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**) — see the contract at [babelqueue.com](https://babelqueue.com).
 
-## [Unreleased]
+## [1.1.0] - 2026-06-12
+
+### Added
+- **Amazon SQS transport** (`babelqueue[sqs]`, `boto3`) — `SqsTransport`, selected by
+  the `sqs://` URL scheme (e.g. `sqs://us-east-1?endpoint=http://localhost:4566` for
+  LocalStack). Implements [§3 of the broker-bindings contract](https://babelqueue.com):
+  the canonical envelope is the `MessageBody`, projected onto native `MessageAttributes`
+  (`bq-job`/`bq-trace-id`/`bq-message-id`/`bq-schema-version`/`bq-source-lang`/`bq-created-at`);
+  visibility-timeout reserve → `delete_message` ack; `attempts` reconciled to
+  `ApproximateReceiveCount − 1` (never lowering a runtime-incremented count). Supports
+  FIFO (`MessageGroupId`/`MessageDeduplicationId` = `meta.id`), content-based dedup,
+  configurable wait/visibility, and a `queue_url_prefix` that skips `GetQueueUrl`. A
+  client can be injected for tests/DI. 16 unit tests run against a fake client (no boto3,
+  no broker); a LocalStack integration test round-trips the real `boto3` path. The
+  envelope is unchanged (`schema_version: 1`); SQS is purely additive. Ships as a MINOR.
 
 ## [1.0.0] - 2026-06-07
 
@@ -85,7 +99,8 @@ reference at [babelqueue.com](https://babelqueue.com).
 - Pre-1.0: the public API may change before the `1.0.0` tag.
 - The core has **zero runtime dependencies** (standard library only); Python `>=3.9`.
 
-[Unreleased]: https://github.com/BabelQueue/babelqueue-python/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/BabelQueue/babelqueue-python/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/BabelQueue/babelqueue-python/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/BabelQueue/babelqueue-python/compare/v0.5.0...v1.0.0
 [0.5.0]: https://github.com/BabelQueue/babelqueue-python/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/BabelQueue/babelqueue-python/compare/v0.3.0...v0.4.0

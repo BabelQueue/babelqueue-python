@@ -79,8 +79,12 @@ def make_transport(broker_url: str) -> Transport:
         from .pika_transport import PikaTransport
 
         return PikaTransport(broker_url)
+    if scheme == "sqs":
+        from .sqs_transport import SqsTransport
+
+        return SqsTransport(broker_url)
 
     raise BabelQueueError(
-        f"Unsupported broker scheme {scheme!r}. Use 'memory://', 'redis://' or "
-        "'amqp://', or pass your own Transport via BabelQueue(transport=...)."
+        f"Unsupported broker scheme {scheme!r}. Use 'memory://', 'redis://', "
+        "'amqp://' or 'sqs://', or pass your own Transport via BabelQueue(transport=...)."
     )
