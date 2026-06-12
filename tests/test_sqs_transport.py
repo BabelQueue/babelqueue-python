@@ -7,7 +7,6 @@ unless ``boto3`` + a reachable endpoint are present (CI runs it).
 
 from __future__ import annotations
 
-import json
 import os
 import unittest
 import uuid
