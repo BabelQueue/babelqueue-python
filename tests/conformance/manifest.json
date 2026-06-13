@@ -173,5 +173,32 @@
         { "name": "header-higher-than-body",        "body_attempts": 1, "header_attempts": 4,    "expected_attempts": 4 }
       ]
     }
+  },
+  "artemis": {
+    "description": "Apache ActiveMQ Artemis binding conformance (broker-bindings.md §7). Every SDK that ships an Artemis transport must satisfy these. The message body stays byte-identical (the 'cases' above); these lock the AMQP-1.0 projection + reconciliation the binding adds. Per-message values reuse fixtures/order-created.json so the expected projection is deterministic.",
+    "property_projection": {
+      "description": "On produce, the transport MUST project the envelope onto the AMQP a JMS peer reads: the x-opt-jms-type message annotation = job (the URN, the AMQP-JMS mapping of JMSType), correlation-id = trace_id (JMSCorrelationID), creation-time = meta.created_at (JMSTimestamp, Unix ms), plus the bq- application properties, all string-valued (matching the Java JMS setStringProperty projection): bq-schema-version = str(meta.schema_version), bq-source-lang = meta.lang, bq-attempts = str(attempts), bq-app-id = 'babelqueue'. The body is the byte-identical envelope. Unlike Kafka/Pulsar, the URN / trace_id / message-id are NOT bq- properties — they ride the JMS-native slots. Applies to every Artemis-producing SDK.",
+      "envelope_file": "fixtures/order-created.json",
+      "jms_type_annotation": "x-opt-jms-type",
+      "jms_type": "urn:babel:orders:created",
+      "correlation_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+      "properties": {
+        "bq-schema-version": "1",
+        "bq-source-lang":    "php",
+        "bq-attempts":       "0",
+        "bq-app-id":         "babelqueue"
+      }
+    },
+    "attempts_reconciliation": {
+      "description": "On consume, attempts = max(body.attempts, delivery-count): the AMQP delivery-count header is 0-based (0 on first delivery) so it maps directly with NO -1, a runtime-incremented body count is never lowered, and delivery-count 0 leaves the body's own count untouched (the runtime/App retries by republishing with attempts+1, which resets the broker's delivery-count to 0). The Java JMS binding reads the 1-based JMSXDeliveryCount and subtracts 1, arriving at the same 0-based attempts. The rule is identical across the native-consumer SDKs (.NET/Java/Node) and the Transport+App SDKs (Python/Go).",
+      "cases": [
+        { "name": "first-delivery",           "body_attempts": 0, "delivery_count": 0, "expected_attempts": 0 },
+        { "name": "third-delivery",            "body_attempts": 0, "delivery_count": 2, "expected_attempts": 2 },
+        { "name": "native-exceeds-body",       "body_attempts": 2, "delivery_count": 5, "expected_attempts": 5 },
+        { "name": "never-lower-runtime",       "body_attempts": 5, "delivery_count": 1, "expected_attempts": 5 },
+        { "name": "first-delivery-keeps-body", "body_attempts": 4, "delivery_count": 0, "expected_attempts": 4 },
+        { "name": "native-equals-body",        "body_attempts": 3, "delivery_count": 3, "expected_attempts": 3 }
+      ]
+    }
   }
 }
