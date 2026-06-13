@@ -177,16 +177,16 @@
   "artemis": {
     "description": "Apache ActiveMQ Artemis binding conformance (broker-bindings.md §7). Every SDK that ships an Artemis transport must satisfy these. The message body stays byte-identical (the 'cases' above); these lock the AMQP-1.0 projection + reconciliation the binding adds. Per-message values reuse fixtures/order-created.json so the expected projection is deterministic.",
     "property_projection": {
-      "description": "On produce, the transport MUST project the envelope onto the AMQP a JMS peer reads: the x-opt-jms-type message annotation = job (the URN, the AMQP-JMS mapping of JMSType), correlation-id = trace_id (JMSCorrelationID), creation-time = meta.created_at (JMSTimestamp, Unix ms), plus the bq- application properties, all string-valued (matching the Java JMS setStringProperty projection): bq-schema-version = str(meta.schema_version), bq-source-lang = meta.lang, bq-attempts = str(attempts), bq-app-id = 'babelqueue'. The body is the byte-identical envelope. Unlike Kafka/Pulsar, the URN / trace_id / message-id are NOT bq- properties — they ride the JMS-native slots. Applies to every Artemis-producing SDK.",
+      "description": "On produce, the transport MUST project the envelope onto the AMQP a JMS peer reads: the x-opt-jms-type message annotation = job (the URN, the AMQP-JMS mapping of JMSType), correlation-id = trace_id (JMSCorrelationID), creation-time = meta.created_at (JMSTimestamp, Unix ms), plus the bq_ application properties, all string-valued. The names use UNDERSCORES (bq_schema_version, not bq-schema-version): JMS property names must be valid Java identifiers (no hyphens), and the Java binding consumes/produces over JMS, so every Artemis SDK uses the JMS-legal underscore form for cross-protocol parity. bq_schema_version = str(meta.schema_version), bq_source_lang = meta.lang, bq_attempts = str(attempts), bq_app_id = 'babelqueue'. The body is the byte-identical envelope. Unlike Kafka/Pulsar, the URN / trace_id / message-id are NOT bq_ properties — they ride the JMS-native slots. Applies to every Artemis-producing SDK.",
       "envelope_file": "fixtures/order-created.json",
       "jms_type_annotation": "x-opt-jms-type",
       "jms_type": "urn:babel:orders:created",
       "correlation_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
       "properties": {
-        "bq-schema-version": "1",
-        "bq-source-lang":    "php",
-        "bq-attempts":       "0",
-        "bq-app-id":         "babelqueue"
+        "bq_schema_version": "1",
+        "bq_source_lang":    "php",
+        "bq_attempts":       "0",
+        "bq_app_id":         "babelqueue"
       }
     },
     "attempts_reconciliation": {

@@ -84,13 +84,13 @@ class FakeConnection:
 class ArtemisProjectionTest(unittest.TestCase):
     def test_application_properties_mirror_the_contract_fields(self) -> None:
         props = ArtemisTransport._projection(body(attempts=2))
-        self.assertEqual("1", props["bq-schema-version"])
-        self.assertEqual("python", props["bq-source-lang"])
-        self.assertEqual("2", props["bq-attempts"])
-        self.assertEqual("babelqueue", props["bq-app-id"])
+        self.assertEqual("1", props["bq_schema_version"])
+        self.assertEqual("python", props["bq_source_lang"])
+        self.assertEqual("2", props["bq_attempts"])
+        self.assertEqual("babelqueue", props["bq_app_id"])
         # The URN and trace_id ride JMS-native slots, not application properties.
-        self.assertNotIn("bq-job", props)
-        self.assertNotIn("bq-trace-id", props)
+        self.assertNotIn("bq_job", props)
+        self.assertNotIn("bq_trace_id", props)
 
     def test_jms_type_and_correlation_id_come_from_the_body(self) -> None:
         self.assertEqual(URN, ArtemisTransport._jms_type(body()))
@@ -194,8 +194,8 @@ class ArtemisPublishTest(unittest.TestCase):
         self.assertEqual(1, len(sender.sent))
         message = sender.sent[0]
         self.assertEqual("trace-xyz", message.correlation_id)
-        self.assertEqual("1", message.properties["bq-schema-version"])
-        self.assertEqual("babelqueue", message.properties["bq-app-id"])
+        self.assertEqual("1", message.properties["bq_schema_version"])
+        self.assertEqual("babelqueue", message.properties["bq_app_id"])
         self.assertEqual(URN, dict(message.annotations)[symbol("x-opt-jms-type")])
         # The body is the byte-identical canonical envelope.
         self.assertEqual(URN, EnvelopeCodec.decode(message.body)["job"])

@@ -7,8 +7,9 @@ Artemis speaks AMQP 1.0 (not the 0-9-1 of RabbitMQ), so this transport uses the
 envelope as the message body and projects the contract envelope fields onto the AMQP
 properties a JMS peer reads: ``correlation-id`` = trace_id (JMSCorrelationID), ``creation-time``
 = meta.created_at (JMSTimestamp), the ``x-opt-jms-type`` message annotation = URN (JMSType, the
-AMQP-JMS mapping), plus the ``bq-`` application properties (``bq-schema-version`` /
-``bq-source-lang`` / ``bq-attempts`` / ``bq-app-id``) — so a Java (JMS) or .NET/Node/... peer
+AMQP-JMS mapping), plus the ``bq_`` application properties (``bq_schema_version`` /
+``bq_source_lang`` / ``bq_attempts`` / ``bq_app_id``; underscores, since JMS property names must
+be valid Java identifiers) — so a Java (JMS) or .NET/Node/... peer
 routes and correlates without parsing the body. The URN in the body's ``job`` field stays
 authoritative.
 
@@ -100,8 +101,10 @@ class ArtemisTransport(Transport):
     @staticmethod
     def _projection(body: str) -> Dict[str, str]:
         """AMQP application properties (string->string) — a redundant, routable view of the
-        body: bq-schema-version/bq-source-lang/bq-attempts/bq-app-id. §7.2 (the URN is carried
-        by the x-opt-jms-type annotation, trace_id by correlation-id)."""
+        body: bq_schema_version/bq_source_lang/bq_attempts/bq_app_id. §7.2 (the URN is carried
+        by the x-opt-jms-type annotation, trace_id by correlation-id). The names use UNDERSCORES,
+        not hyphens: a JMS property name must be a valid Java identifier, and every Artemis SDK
+        uses the same JMS-legal form for cross-protocol parity."""
         env = EnvelopeCodec.decode(body)
         if not env:
             return {}
@@ -109,11 +112,11 @@ class ArtemisTransport(Transport):
 
         props: Dict[str, str] = {}
         if meta.get("schema_version") is not None:
-            props["bq-schema-version"] = str(meta["schema_version"])
+            props["bq_schema_version"] = str(meta["schema_version"])
         if meta.get("lang"):
-            props["bq-source-lang"] = str(meta["lang"])
-        props["bq-attempts"] = str(int(env.get("attempts", 0) or 0))
-        props["bq-app-id"] = APP_ID
+            props["bq_source_lang"] = str(meta["lang"])
+        props["bq_attempts"] = str(int(env.get("attempts", 0) or 0))
+        props["bq_app_id"] = APP_ID
         return props
 
     @staticmethod
