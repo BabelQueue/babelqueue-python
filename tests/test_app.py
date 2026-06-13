@@ -118,7 +118,7 @@ class AppTest(unittest.TestCase):
         from babelqueue import BabelQueueError
 
         with self.assertRaises(BabelQueueError):
-            BabelQueue("kafka://localhost:9092")
+            BabelQueue("frobnicate://localhost:9092")
 
 
 if __name__ == "__main__":
