@@ -91,9 +91,13 @@ def make_transport(broker_url: str) -> Transport:
         from .pulsar_transport import PulsarTransport
 
         return PulsarTransport(broker_url)
+    if scheme == "kafka":
+        from .kafka_transport import KafkaTransport
+
+        return KafkaTransport(broker_url)
 
     raise BabelQueueError(
         f"Unsupported broker scheme {scheme!r}. Use 'memory://', 'redis://', "
-        "'amqp://', 'sqs://', 'sb://' or 'pulsar://', or pass your own Transport via "
-        "BabelQueue(transport=...)."
+        "'amqp://', 'sqs://', 'sb://', 'pulsar://' or 'kafka://', or pass your own Transport "
+        "via BabelQueue(transport=...)."
     )

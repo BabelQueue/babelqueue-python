@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**) — see the contract at [babelqueue.com](https://babelqueue.com).
 
+## [1.4.0] - 2026-06-13
+
+### Added
+- **Apache Kafka transport** (`babelqueue[kafka]`, `confluent-kafka`) — `KafkaTransport`,
+  selected by the `kafka://` URL scheme (e.g. `kafka://host:9092`; or pass an injected
+  `producer` + `consumer_factory`). Implements [§6 of the broker-bindings
+  contract](https://babelqueue.com/docs/spec/1.x/broker-bindings#apache-kafka): the record
+  **value** is the canonical envelope, projected onto native Kafka record headers (UTF-8 byte
+  strings) — `bq-job` = URN, `bq-trace-id`, `bq-message-id`, plus `bq-schema-version`/
+  `bq-source-lang`/`bq-attempts` — with the record timestamp mirroring `meta.created_at`.
+  Consume is **process-then-commit** (`pop` reserves via `poll` with `enable.auto.commit=false`,
+  `ack` commits the offset); the **`bq-attempts` header is the authoritative attempt counter**
+  (the body's `attempts` is the fallback for non-BabelQueue producers). The projection +
+  reconciliation + publish/pop/ack flow are unit-tested with no broker and no `confluent-kafka`
+  (the kafka import is lazy; the transport talks to injected producer/consumer fakes). The
+  envelope is unchanged (`schema_version: 1`); Apache Kafka is purely additive. Ships as a MINOR.
+
 ## [1.3.0] - 2026-06-13
 
 ### Added

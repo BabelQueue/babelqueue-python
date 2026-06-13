@@ -12,3 +12,6 @@ venv/
 .coverage
 coverage.xml
 htmlcov/
+
+# CommitBrief local config and cache
+.commitbrief/
