@@ -44,7 +44,7 @@ jobs:
       - name: Install (dev + all adapters for type context)
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev,celery,django,redis,amqp,sqs,azureservicebus]"
+          pip install -e ".[dev,celery,django,redis,amqp,sqs,azureservicebus,artemis]"
       - name: Ruff
         run: ruff check src tests
       - name: Mypy
@@ -89,7 +89,7 @@ jobs:
       - name: Install (all adapters — full coverage with brokers)
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[redis,amqp,sqs,azureservicebus,celery,django,dev]"
+          pip install -e ".[redis,amqp,sqs,azureservicebus,artemis,celery,django,dev]"
 
       - name: Wait for ElasticMQ
         run: |

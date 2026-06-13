@@ -95,9 +95,13 @@ def make_transport(broker_url: str) -> Transport:
         from .kafka_transport import KafkaTransport
 
         return KafkaTransport(broker_url)
+    if scheme in ("artemis", "artemis+ssl"):
+        from .artemis_transport import ArtemisTransport
+
+        return ArtemisTransport(broker_url)
 
     raise BabelQueueError(
         f"Unsupported broker scheme {scheme!r}. Use 'memory://', 'redis://', "
-        "'amqp://', 'sqs://', 'sb://', 'pulsar://' or 'kafka://', or pass your own Transport "
-        "via BabelQueue(transport=...)."
+        "'amqp://', 'sqs://', 'sb://', 'pulsar://', 'kafka://' or 'artemis://', or pass your "
+        "own Transport via BabelQueue(transport=...)."
     )

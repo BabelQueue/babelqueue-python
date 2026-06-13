@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**) — see the contract at [babelqueue.com](https://babelqueue.com).
 
+## [1.5.0] - 2026-06-13
+
+### Added
+- **Apache ActiveMQ Artemis transport** (`babelqueue[artemis]`, `python-qpid-proton`) —
+  `ArtemisTransport`, selected by the `artemis://` (or `artemis+ssl://`) URL scheme (e.g.
+  `artemis://localhost:5672`; or pass an injected `connection`). Artemis speaks **AMQP 1.0**
+  (not RabbitMQ's 0-9-1), so the transport uses the `python-qpid-proton` blocking client.
+  Implements [§7 of the broker-bindings
+  contract](https://babelqueue.com/docs/spec/1.x/broker-bindings#apache-activemq-artemis): the
+  canonical envelope is the message body, projected onto the AMQP fields a JMS peer reads —
+  `correlation-id` = `trace_id` (JMSCorrelationID), `creation-time` = `meta.created_at`
+  (JMSTimestamp), the `x-opt-jms-type` annotation = URN (JMSType, the AMQP-JMS mapping), plus
+  the `bq-schema-version`/`bq-source-lang`/`bq-attempts`/`bq-app-id` application properties.
+  Consume reserves one message at a time (`receive` → process → `accept`); `attempts` is
+  reconciled to `max(body, delivery_count)` — the AMQP delivery-count header is 0-based, so it
+  maps directly with no −1 (the Java JMS binding reads the 1-based `JMSXDeliveryCount` and
+  subtracts 1, arriving at the same 0-based `attempts`), and the `max` never lowers a higher
+  body count carried by a republish-driven retry. The projection + reconciliation + pop/ack
+  flow are unit-tested with no broker and no `python-qpid-proton` (the proton import is lazy;
+  the transport talks to an injected connection fake); the publish flow that builds a real
+  proton `Message` is exercised wherever proton is installed. The envelope is unchanged
+  (`schema_version: 1`); Apache ActiveMQ Artemis is purely additive. Ships as a MINOR.
+
 ## [1.4.0] - 2026-06-13
 
 ### Added
