@@ -148,5 +148,30 @@
         { "name": "native-equals-body",        "body_attempts": 3, "redelivery_count": 3, "expected_attempts": 3 }
       ]
     }
+  },
+  "kafka": {
+    "description": "Apache Kafka binding conformance (broker-bindings.md §6). Every SDK that ships a Kafka transport must satisfy these. The record value is the byte-identical envelope (the 'cases' above); these lock the bq- header projection + the bq-attempts-authoritative reconciliation the binding adds. Per-message values reuse fixtures/order-created.json so the expected projection is deterministic.",
+    "property_projection": {
+      "description": "On produce, the transport MUST project these native Kafka record headers from the envelope, all UTF-8 byte strings (Kafka headers are bytes, so integers are stringified): bq-job = job (the URN), bq-trace-id = trace_id, bq-message-id = meta.id, bq-schema-version = str(meta.schema_version), bq-source-lang = meta.lang, bq-attempts = str(attempts). The record value is the byte-identical envelope and the record timestamp mirrors meta.created_at (Unix ms). Applies to every Kafka-producing SDK.",
+      "envelope_file": "fixtures/order-created.json",
+      "headers": {
+        "bq-job":            "urn:babel:orders:created",
+        "bq-trace-id":       "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "bq-message-id":     "f1e2d3c4-b5a6-4789-90ab-cdef01234567",
+        "bq-schema-version": "1",
+        "bq-source-lang":    "php",
+        "bq-attempts":       "0"
+      }
+    },
+    "attempts_reconciliation": {
+      "description": "On consume, attempts = the bq-attempts header when present (AUTHORITATIVE — Kafka has no native delivery count), else the body's own attempts (the fallback for a non-BabelQueue producer). This is NOT a max: the header overrides the body even when lower. A null header_attempts means the header is absent. The rule is identical across all five Kafka SDKs.",
+      "cases": [
+        { "name": "header-matches-body",            "body_attempts": 0, "header_attempts": 0,    "expected_attempts": 0 },
+        { "name": "header-present",                 "body_attempts": 0, "header_attempts": 2,    "expected_attempts": 2 },
+        { "name": "header-absent-falls-back",       "body_attempts": 3, "header_attempts": null, "expected_attempts": 3 },
+        { "name": "header-authoritative-overrides", "body_attempts": 5, "header_attempts": 1,    "expected_attempts": 1 },
+        { "name": "header-higher-than-body",        "body_attempts": 1, "header_attempts": 4,    "expected_attempts": 4 }
+      ]
+    }
   }
 }
