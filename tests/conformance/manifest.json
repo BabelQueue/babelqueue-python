@@ -122,5 +122,31 @@
         { "name": "zero-count-keeps-body",     "body_attempts": 3, "delivery_count": 0, "expected_attempts": 3 }
       ]
     }
+  },
+  "pulsar": {
+    "description": "Apache Pulsar binding conformance (broker-bindings.md §5). Every SDK that ships a Pulsar transport must satisfy these. The envelope body stays byte-identical (the 'cases' above); these lock the native projection + reconciliation the binding adds. Per-message values reuse fixtures/order-created.json so the expected projection is deterministic.",
+    "property_projection": {
+      "description": "On produce, the transport MUST project these native Pulsar message properties from the envelope, all string->string (Pulsar properties are string-typed, so numbers are stringified): bq-job = job (the URN), bq-trace-id = trace_id, bq-message-id = meta.id, bq-schema-version = str(meta.schema_version), bq-source-lang = meta.lang, bq-attempts = str(attempts). The payload is the byte-identical envelope; the native publishTime mirrors meta.created_at (broker-set, body authoritative). Applies to every Pulsar-producing SDK.",
+      "envelope_file": "fixtures/order-created.json",
+      "properties": {
+        "bq-job":            "urn:babel:orders:created",
+        "bq-trace-id":       "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "bq-message-id":     "f1e2d3c4-b5a6-4789-90ab-cdef01234567",
+        "bq-schema-version": "1",
+        "bq-source-lang":    "php",
+        "bq-attempts":       "0"
+      }
+    },
+    "attempts_reconciliation": {
+      "description": "On consume, attempts = max(body.attempts, RedeliveryCount): Pulsar's RedeliveryCount is 0-based (0 on first delivery) so it maps directly with NO -1, a runtime-incremented body count is never lowered, and RedeliveryCount 0 leaves the body's own count untouched (the runtime retries by republishing with attempts+1, which resets the broker's redelivery count to 0). The rule is identical across the native-consumer SDKs (.NET/Java/Node) and the Transport+App SDKs (Python/Go).",
+      "cases": [
+        { "name": "first-delivery",            "body_attempts": 0, "redelivery_count": 0, "expected_attempts": 0 },
+        { "name": "third-delivery",            "body_attempts": 0, "redelivery_count": 2, "expected_attempts": 2 },
+        { "name": "native-exceeds-body",       "body_attempts": 2, "redelivery_count": 5, "expected_attempts": 5 },
+        { "name": "never-lower-runtime",       "body_attempts": 5, "redelivery_count": 1, "expected_attempts": 5 },
+        { "name": "first-delivery-keeps-body", "body_attempts": 4, "redelivery_count": 0, "expected_attempts": 4 },
+        { "name": "native-equals-body",        "body_attempts": 3, "redelivery_count": 3, "expected_attempts": 3 }
+      ]
+    }
   }
 }
