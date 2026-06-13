@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**) — see the contract at [babelqueue.com](https://babelqueue.com).
 
+## [Unreleased]
+
+### Added
+- **Azure Service Bus transport** (`babelqueue[azureservicebus]`, `azure-servicebus`) —
+  `AsbTransport`, selected by the `sb://` URL scheme (e.g.
+  `sb://<namespace>.servicebus.windows.net`, Azure AD via `DefaultAzureCredential`; or pass
+  `connection_string=...` / a built `client`). Implements [§4 of the broker-bindings
+  contract](https://babelqueue.com/docs/spec/1.x/broker-bindings#azure-service-bus): the
+  canonical envelope is the message body, projected onto native Service Bus fields
+  (`Subject` = URN, `CorrelationId` = `trace_id`, `MessageId` = `meta.id`, plus the `bq-`
+  application properties); PeekLock reserve → `complete_message` ack; `attempts` reconciled
+  to the broker-authoritative `DeliveryCount − 1`. A client can be injected for tests/DI. The
+  projection + reconciliation are unit-tested with no broker and no `azure-servicebus` (the
+  azure import is lazy); the publish flow is covered with a fake client. The envelope is
+  unchanged (`schema_version: 1`); Azure Service Bus is purely additive. Ships as a MINOR.
+
 ## [1.1.0] - 2026-06-12
 
 ### Added

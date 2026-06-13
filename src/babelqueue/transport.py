@@ -83,8 +83,12 @@ def make_transport(broker_url: str) -> Transport:
         from .sqs_transport import SqsTransport
 
         return SqsTransport(broker_url)
+    if scheme in ("sb", "servicebus", "azureservicebus"):
+        from .asb_transport import AsbTransport
+
+        return AsbTransport(broker_url)
 
     raise BabelQueueError(
         f"Unsupported broker scheme {scheme!r}. Use 'memory://', 'redis://', "
-        "'amqp://' or 'sqs://', or pass your own Transport via BabelQueue(transport=...)."
+        "'amqp://', 'sqs://' or 'sb://', or pass your own Transport via BabelQueue(transport=...)."
     )

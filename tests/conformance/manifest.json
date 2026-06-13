@@ -93,5 +93,34 @@
         { "name": "absent-count",          "body_attempts": 3, "approximate_receive_count": null,           "expected_attempts": 3 }
       ]
     }
+  },
+  "asb": {
+    "description": "Azure Service Bus binding conformance (broker-bindings.md §4). Every SDK that ships an ASB transport must satisfy these. The envelope body stays byte-identical (the 'cases' above); these lock the native projection + reconciliation the binding adds. Per-message values reuse fixtures/order-created.json so the expected projection is deterministic.",
+    "property_projection": {
+      "description": "On produce, the transport MUST project these native Service Bus message fields from the envelope: Subject = job (the URN), CorrelationId = trace_id, MessageId = meta.id, ContentType = application/json, plus the bq- ApplicationProperties as native AMQP-typed values (numbers stay numbers, not strings). Applies to every ASB-producing SDK.",
+      "envelope_file": "fixtures/order-created.json",
+      "message": {
+        "subject":        "urn:babel:orders:created",
+        "correlation_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "message_id":     "f1e2d3c4-b5a6-4789-90ab-cdef01234567",
+        "content_type":   "application/json"
+      },
+      "application_properties": {
+        "bq-schema-version": 1,
+        "bq-source-lang":    "php",
+        "bq-created-at":     1749132727000
+      }
+    },
+    "attempts_reconciliation": {
+      "description": "On consume, attempts = max(body.attempts, DeliveryCount - 1): a first delivery (DeliveryCount 1) reads 0, a runtime-incremented body count is never lowered, and DeliveryCount <= 1 leaves the body's own count untouched (the runtime retries by republishing with attempts+1). DeliveryCount is the native 1-based ASB redelivery counter; the rule is identical across the native-consumer SDKs (.NET/Java/Node) and the Transport+App SDKs (Python/Go).",
+      "cases": [
+        { "name": "first-delivery",            "body_attempts": 0, "delivery_count": 1, "expected_attempts": 0 },
+        { "name": "third-delivery",            "body_attempts": 0, "delivery_count": 3, "expected_attempts": 2 },
+        { "name": "native-exceeds-body",       "body_attempts": 2, "delivery_count": 5, "expected_attempts": 4 },
+        { "name": "never-lower-runtime",       "body_attempts": 5, "delivery_count": 2, "expected_attempts": 5 },
+        { "name": "first-delivery-keeps-body", "body_attempts": 4, "delivery_count": 1, "expected_attempts": 4 },
+        { "name": "zero-count-keeps-body",     "body_attempts": 3, "delivery_count": 0, "expected_attempts": 3 }
+      ]
+    }
   }
 }
