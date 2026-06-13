@@ -200,5 +200,31 @@
         { "name": "native-equals-body",        "body_attempts": 3, "delivery_count": 3, "expected_attempts": 3 }
       ]
     }
+  },
+  "redis": {
+    "description": "Redis binding conformance (broker-bindings.md §1 — the reliable-queue list pattern). Redis lists carry no native metadata, so there is NO property projection: the queue element IS the canonical envelope JSON, byte-for-byte, with NO wrapping (unlike BullMQ's job structure) and NO added fields. The reserve/ack reliability (Laravel's reserved-sorted-set vs the App runtimes' processing-list) and attempts handling are SDK-runtime-specific and proven by the live interop round-trip, not a static fixture. The one cross-SDK invariant locked here is payload identity.",
+    "payload_identity": {
+      "description": "On produce, the transport MUST store the envelope JSON byte-for-byte as the queue element (RPUSH / equivalent); on reserve it MUST return that element unchanged — no wrapping, no envelope mutation, no added metadata. A §1 SDK round-trips fixtures/order-created.json through produce→reserve and gets back the identical bytes. Applies to every Redis-producing SDK.",
+      "envelope_file": "fixtures/order-created.json"
+    }
+  },
+  "rabbitmq": {
+    "description": "RabbitMQ binding conformance (broker-bindings.md §2 — AMQP 0-9-1). The envelope body stays byte-identical (the 'cases' above); this locks the native AMQP-0-9-1 property projection every producer emits. NOTE: consume-side attempts handling is NOT in scope here because it is runtime-specific — the Laravel driver reads the authoritative x-attempts header (§2.5), while the App-runtime SDKs (Go/Python) keep attempts in the body and republish with attempts+1 (the x-attempts header is then a redundant produce-side mirror). Both stay consistent because Laravel increments the body's attempts too. Per-message values reuse fixtures/order-created.json.",
+    "property_projection": {
+      "description": "On produce, the transport MUST project these native AMQP 0-9-1 properties + headers from the envelope. Header values are NATIVE-typed (AMQP 0-9-1 field-tables carry typed values — integers stay integers, NOT stringified like Kafka/Pulsar): type = job (the URN, route on it without reading the body), correlation_id = trace_id, message_id = meta.id, app_id = 'babelqueue', content_type = 'application/json', header x-schema-version = meta.schema_version (number), x-source-lang = meta.lang, x-attempts = attempts (number). The body is the byte-identical envelope. Applies to every RabbitMQ-producing SDK.",
+      "envelope_file": "fixtures/order-created.json",
+      "properties": {
+        "type":           "urn:babel:orders:created",
+        "correlation_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "message_id":     "f1e2d3c4-b5a6-4789-90ab-cdef01234567",
+        "app_id":         "babelqueue",
+        "content_type":   "application/json"
+      },
+      "headers": {
+        "x-schema-version": 1,
+        "x-source-lang":    "php",
+        "x-attempts":       0
+      }
+    }
   }
 }
