@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**) — see the contract at [babelqueue.com](https://babelqueue.com).
 
-## [Unreleased]
+## [1.2.0] - 2026-06-13
 
 ### Added
 - **Azure Service Bus transport** (`babelqueue[azureservicebus]`, `azure-servicebus`) —
@@ -115,7 +115,8 @@ reference at [babelqueue.com](https://babelqueue.com).
 - Pre-1.0: the public API may change before the `1.0.0` tag.
 - The core has **zero runtime dependencies** (standard library only); Python `>=3.9`.
 
-[Unreleased]: https://github.com/BabelQueue/babelqueue-python/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/BabelQueue/babelqueue-python/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/BabelQueue/babelqueue-python/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/BabelQueue/babelqueue-python/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/BabelQueue/babelqueue-python/compare/v0.5.0...v1.0.0
 [0.5.0]: https://github.com/BabelQueue/babelqueue-python/compare/v0.4.0...v0.5.0
