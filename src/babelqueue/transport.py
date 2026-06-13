@@ -87,8 +87,13 @@ def make_transport(broker_url: str) -> Transport:
         from .asb_transport import AsbTransport
 
         return AsbTransport(broker_url)
+    if scheme in ("pulsar", "pulsar+ssl"):
+        from .pulsar_transport import PulsarTransport
+
+        return PulsarTransport(broker_url)
 
     raise BabelQueueError(
         f"Unsupported broker scheme {scheme!r}. Use 'memory://', 'redis://', "
-        "'amqp://', 'sqs://' or 'sb://', or pass your own Transport via BabelQueue(transport=...)."
+        "'amqp://', 'sqs://', 'sb://' or 'pulsar://', or pass your own Transport via "
+        "BabelQueue(transport=...)."
     )

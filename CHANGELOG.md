@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**) — see the contract at [babelqueue.com](https://babelqueue.com).
 
+## [1.3.0] - 2026-06-13
+
+### Added
+- **Apache Pulsar transport** (`babelqueue[pulsar]`, `pulsar-client`) — `PulsarTransport`,
+  selected by the `pulsar://` (or `pulsar+ssl://`) URL scheme (e.g.
+  `pulsar://localhost:6650`; or pass a built `client`). Implements [§5 of the broker-bindings
+  contract](https://babelqueue.com/docs/spec/1.x/broker-bindings#apache-pulsar): the canonical
+  envelope is the message payload, projected onto native Pulsar message properties
+  (string→string) — `bq-job` = URN, `bq-trace-id` = `trace_id`, `bq-message-id` = `meta.id`,
+  plus `bq-schema-version`/`bq-source-lang`/`bq-attempts`; receive → `acknowledge`; `attempts`
+  reconciled to `max(bq-attempts, redelivery_count)` (Pulsar's redelivery count is 0-based, so
+  it maps directly with no −1, and the `max` never lowers a higher body count carried by a
+  republish-driven retry). Default `Shared` subscription named `babelqueue`; a client can be
+  injected for tests/DI. The projection + reconciliation + publish/pop/ack flow are unit-tested
+  with no broker and no `pulsar-client` (the pulsar import is lazy and publishing sends raw
+  bytes). The envelope is unchanged (`schema_version: 1`); Apache Pulsar is purely additive.
+  Ships as a MINOR.
+
 ## [1.2.0] - 2026-06-13
 
 ### Added
