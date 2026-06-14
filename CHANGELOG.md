@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**) — see the contract at [babelqueue.com](https://babelqueue.com).
 
+## [Unreleased]
+
+### Added
+- **Redis/Laravel reservation parity** — the Redis transport can now consume a
+  **shared** Laravel BabelQueue Redis queue using Laravel's reserved-set / reliable-queue
+  semantics, not just a Python-owned queue. Enable it with the `laravel=1` URL flag
+  (`redis://host:6379/0?laravel=1`) or `RedisTransport(..., laravel_compat=True)`. In this
+  mode the key layout is Laravel's stock Redis queue ([§1 of the broker-bindings
+  contract](https://babelqueue.com/docs/spec/1.x/broker-bindings#redis)): a `queues:<name>`
+  ready list, a `queues:<name>:reserved` **sorted set** scored by a `retry_after` deadline
+  (default 60s), a `queues:<name>:delayed` set, and a `queues:<name>:notify` wake-up list.
+  Reserve, ack and release run the **byte-for-byte same Lua scripts** Laravel uses, so the
+  reserved member a Python worker writes is identical to a Laravel worker's — either side can
+  ack (`ZREM`) the other's reservation, so a Python worker and a Laravel worker share one
+  Redis queue without losing or double-processing messages. Before each pop, expired
+  reserved/delayed jobs migrate back to the ready list, so a crashed worker's in-flight job
+  is re-reserved exactly as Laravel does. Tunable via `?prefix=` / `?retry_after=` (or the
+  `key_prefix` / `retry_after` constructor args). The default Python-owned reliable-queue
+  mode (`BLMOVE` + `<queue>:processing` list) is unchanged and stays the default, so existing
+  callers are unaffected. The reservation logic is fully unit-tested with an injected
+  in-memory Redis double (no `redis` package, no broker); a live cross-runtime PHP↔Python
+  shared-queue round-trip is covered by the integration suite where a real Redis is present.
+  The envelope is unchanged (`schema_version: 1`); this is purely additive. Ships as a MINOR.
+
 ## [1.5.0] - 2026-06-13
 
 ### Added

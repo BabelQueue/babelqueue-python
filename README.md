@@ -114,9 +114,35 @@ app.run()                               # consume forever (Ctrl-C to stop)
 - **Retry & dead-letter:** failures are retried up to `max_attempts` (bumping the
   envelope's `attempts`); enable `dead_letter=True` to quarantine exhausted
   messages on `<queue>.dlq`. `on_unknown_urn` = `fail` | `delete` | `release` | `dead_letter`.
-- **Transports:** `redis://` (reliable-queue pattern), `amqp://` (RabbitMQ via
-  `pika`, with the contract AMQP properties) and `memory://` (in-process, great for
-  tests/local). Bring your own by passing `transport=...`.
+- **Transports:** `redis://` (reliable-queue pattern; add `?laravel=1` to share a
+  Redis queue with a Laravel BabelQueue worker using its reserved-set semantics —
+  see below), `amqp://` (RabbitMQ via `pika`, with the contract AMQP properties)
+  and `memory://` (in-process, great for tests/local). Bring your own by passing
+  `transport=...`.
+
+### Sharing a Redis queue with Laravel
+
+By default the Redis transport owns its queue end-to-end (`RPUSH` to produce;
+`BLMOVE` into a `<queue>:processing` list to reserve; `LREM` on ack). To consume a
+**shared** Laravel BabelQueue Redis queue instead, enable Laravel-compatible mode:
+
+```python
+app = BabelQueue("redis://localhost:6379/0?laravel=1", queue="orders")
+# or: RedisTransport("redis://localhost:6379/0", laravel_compat=True)
+```
+
+This replicates Laravel's stock Redis reservation exactly ([§1 of the
+broker-bindings contract](https://babelqueue.com/docs/spec/1.x/broker-bindings#redis)):
+the ready list is `queues:<name>`, reservations move into the `queues:<name>:reserved`
+**sorted set** scored by a `retry_after` deadline (default 60s), with a
+`queues:<name>:delayed` set and a `queues:<name>:notify` wake-up list. Reserve, ack
+and release run the **byte-for-byte same Lua scripts** Laravel uses, so the reserved
+member a Python worker writes is identical to a Laravel worker's — either side can
+ack (`ZREM`) the other's reservation, so a Python worker and a Laravel worker share
+one queue without losing or double-processing messages. Before each pop, expired
+reserved/delayed jobs migrate back to the ready list, so a crashed worker's
+in-flight job is re-reserved. Options: `?prefix=queues:` and `?retry_after=60`
+(or the `key_prefix` / `retry_after` constructor args).
 
 ## Framework adapters — Celery & Django
 
