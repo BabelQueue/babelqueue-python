@@ -226,5 +226,28 @@
         "x-attempts":       0
       }
     }
+  },
+  "payload_schema": {
+    "description": "Per-URN data schema validation (ADR-0024). Each case validates `data` against `schema`; every SDK's optional payload validator (Go schema, PHP BabelQueue\\Schema, Python babelqueue.schema) MUST agree on `valid`. The wire envelope stays frozen — this governs the data block only, and is opt-in (consumers/producers without a registered schema skip it).",
+    "schema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "required": ["order_id"],
+      "properties": {
+        "order_id": { "type": "integer", "minimum": 1 },
+        "amount": { "type": "number", "minimum": 0 },
+        "currency": { "enum": ["USD", "EUR", "TRY"] }
+      },
+      "additionalProperties": false
+    },
+    "cases": [
+      { "name": "valid-minimal", "valid": true, "data": { "order_id": 1042 } },
+      { "name": "valid-full", "valid": true, "data": { "order_id": 1042, "amount": 99.9, "currency": "USD" } },
+      { "name": "invalid-missing-required", "valid": false, "data": { "amount": 10 } },
+      { "name": "invalid-wrong-type", "valid": false, "data": { "order_id": "x" } },
+      { "name": "invalid-additional-property", "valid": false, "data": { "order_id": 1, "extra": true } },
+      { "name": "invalid-enum", "valid": false, "data": { "order_id": 1, "currency": "GBP" } },
+      { "name": "invalid-below-minimum", "valid": false, "data": { "order_id": 0 } }
+    ]
   }
 }
