@@ -33,6 +33,7 @@ def test_redrive_to_source():
     result = redrive(t, "orders.dlq")
 
     assert result.redriven == 1 and result.skipped == 0
+    assert result.items[0].bypassed is False  # bypass is off by default
     got = _drain(t, "orders")
     assert len(got) == 1
     assert "dead_letter" not in got[0]

@@ -20,12 +20,13 @@ dry-run, or undecodable) are never re-encountered in the same run; a DLQ message
 acknowledged only after a successful re-publish, and an undecodable body is restored, not
 dropped.
 
-Replay safety today is sandbox routing (``to_queue``) + ``dry_run``. The **Replay-Bypass**
-guard — a ``bq-replay-bypass`` transport header surfaced to handlers so a replay can skip
-external side-effects (don't re-charge, don't re-email) — is a documented phase two: like the
-OpenTelemetry ``traceparent`` follow-up, it carries out-of-band metadata as a transport header
-and so touches the runtime + every transport binding. Until then, sandbox routing is the
-safe-replay answer.
+Replay safety is sandbox routing (``to_queue``) + ``dry_run``, plus the **Replay-Bypass** guard
+(``bypass=True``): it stamps a ``bq-replay-bypass`` transport header that the runtime surfaces to
+handlers via :func:`babelqueue.is_replay` / :func:`babelqueue.bypass_external_effects`, so a
+replay can skip external side-effects that already fired (don't re-charge, don't re-email) — see
+:mod:`babelqueue.replay` (ADR-0027). The header rides out of band, so the envelope stays frozen;
+it propagates over a real broker only once that broker's transport implements the optional
+:class:`~babelqueue.transport.HeaderPublisher` capability (the in-memory transport does today).
 """
 
 from __future__ import annotations
@@ -34,7 +35,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from .codec import EnvelopeCodec
-from .transport import ReceivedMessage, Transport
+from .replay import HEADER_REPLAY_BYPASS
+from .transport import HeaderPublisher, ReceivedMessage, Transport
 
 Envelope = Mapping[str, Any]
 Select = Callable[[Envelope], bool]
@@ -51,6 +53,7 @@ class RedriveItem:
     from_queue: str
     to: str  # target queue (the plan, even on a dry run; "" when skipped/undecodable)
     redriven: bool  # True only when actually re-published to ``to``
+    bypassed: bool = False  # True when the bq-replay-bypass header was stamped on the message
 
 
 @dataclass
@@ -70,6 +73,7 @@ def redrive(
     max: int = 0,
     dry_run: bool = False,
     select: Optional[Select] = None,
+    bypass: bool = False,
     timeout: float = 1.0,
 ) -> RedriveResult:
     """Move dead-lettered messages off ``dlq`` and replay them; see the module docstring."""
@@ -125,7 +129,9 @@ def redrive(
         reset.pop("dead_letter", None)
         reset["attempts"] = 0
         try:
-            transport.publish(target, EnvelopeCodec.encode(reset))
+            item.bypassed = _publish_redriven(
+                transport, target, EnvelopeCodec.encode(reset), bypass
+            )
         except Exception:
             transport.publish(dlq, message.body)  # restore on a publish failure, then surface
             transport.ack(message)
@@ -148,6 +154,17 @@ def _decoded(body: str) -> Optional[Dict[str, Any]]:
     if not envelope or not isinstance(envelope.get("job"), str):
         return None
     return envelope
+
+
+def _publish_redriven(transport: Transport, queue: str, body: str, bypass: bool) -> bool:
+    """Re-publish a reset message to ``queue``. When ``bypass`` is set and the transport is a
+    :class:`~babelqueue.transport.HeaderPublisher`, stamp the ``bq-replay-bypass`` header and
+    return True; otherwise publish plainly and return False."""
+    if bypass and isinstance(transport, HeaderPublisher):
+        transport.publish_with_headers(queue, body, {HEADER_REPLAY_BYPASS: "1"})
+        return True
+    transport.publish(queue, body)
+    return False
 
 
 def _source_queue_of(envelope: Envelope) -> str:

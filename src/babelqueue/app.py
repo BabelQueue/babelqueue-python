@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, Mapping, Optional
 from . import dead_letter
 from .codec import EnvelopeCodec
 from .exceptions import UnknownUrnError
+from .replay import HEADER_REPLAY_BYPASS, _replay_scope
 from .routing import UnknownUrnStrategy
 from .transport import ReceivedMessage, Transport, make_transport
 
@@ -116,18 +117,19 @@ class BabelQueue:
 
     def dispatch(self, received: ReceivedMessage) -> None:
         """Route one reserved message to its handler and acknowledge it."""
-        envelope = EnvelopeCodec.decode(received.body)
-        urn = str(envelope.get("job") or envelope.get("urn") or "")
-        handler = self._handlers.get(urn) if urn else None
+        with _replay_scope(bool(received.headers.get(HEADER_REPLAY_BYPASS))):
+            envelope = EnvelopeCodec.decode(received.body)
+            urn = str(envelope.get("job") or envelope.get("urn") or "")
+            handler = self._handlers.get(urn) if urn else None
 
-        try:
-            if handler is None:
-                self._route_unknown(urn, received, envelope)
-                return
-            self._invoke(handler, envelope)
-            self.transport.ack(received)
-        except Exception as exc:  # noqa: BLE001 - one bad message must not kill the loop
-            self._retry_or_dead_letter(received, envelope, exc)
+            try:
+                if handler is None:
+                    self._route_unknown(urn, received, envelope)
+                    return
+                self._invoke(handler, envelope)
+                self.transport.ack(received)
+            except Exception as exc:  # noqa: BLE001 - one bad message must not kill the loop
+                self._retry_or_dead_letter(received, envelope, exc)
 
     # -- Internals ----------------------------------------------------------
 
