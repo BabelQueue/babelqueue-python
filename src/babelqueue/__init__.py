@@ -11,7 +11,7 @@ and dead-letter helpers. Framework adapters (Celery, Django, ...) build on this.
 
 from __future__ import annotations
 
-from . import dead_letter, idempotency
+from . import dead_letter, idempotency, redrive
 from .app import BabelQueue
 from .codec import SCHEMA_VERSION, SOURCE_LANG, EnvelopeCodec
 from .contracts import HasTraceId, PolyglotMessage
@@ -37,6 +37,7 @@ __all__ = [
     "UnknownUrnError",
     "dead_letter",
     "idempotency",
+    "redrive",
     "IdempotencyStore",
     "InMemoryStore",
     "__version__",
