@@ -8,8 +8,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
-from dataclasses import dataclass
-from typing import Any, Deque, Dict, Optional
+from dataclasses import dataclass, field
+from typing import Any, Deque, Dict, Optional, Protocol, runtime_checkable
 
 from .exceptions import BabelQueueError
 
@@ -21,6 +21,9 @@ class ReceivedMessage:
     body: str
     queue: str
     handle: Any = None
+    #: Out-of-band transport headers a :class:`HeaderPublisher` carried with the message
+    #: (e.g. the ``bq-replay-bypass`` marker). Empty for transports that don't surface them.
+    headers: Dict[str, str] = field(default_factory=dict)
 
 
 class Transport(ABC):
@@ -42,20 +45,42 @@ class Transport(ABC):
         """Release any resources (override if needed)."""
 
 
+@runtime_checkable
+class HeaderPublisher(Protocol):
+    """Optional :class:`Transport` capability: publish a body together with out-of-band
+    transport headers (e.g. the replay-bypass marker), for brokers that carry per-message
+    metadata. A transport that does not implement it simply does not propagate headers —
+    callers fall back to plain :meth:`Transport.publish` (ADR-0027)."""
+
+    def publish_with_headers(self, queue: str, body: str, headers: Dict[str, str]) -> None:
+        """Append ``body`` to ``queue`` along with out-of-band ``headers``."""
+        ...
+
+
 class InMemoryTransport(Transport):
     """In-process transport for tests and broker-free local runs (``memory://``)."""
 
     def __init__(self) -> None:
+        # Bodies and their out-of-band headers are kept in lockstep parallel deques, so the
+        # body storage layout stays a plain Deque[str].
         self._queues: Dict[str, Deque[str]] = defaultdict(deque)
+        self._headers: Dict[str, Deque[Dict[str, str]]] = defaultdict(deque)
 
     def publish(self, queue: str, body: str) -> None:
         self._queues[queue].append(body)
+        self._headers[queue].append({})
+
+    def publish_with_headers(self, queue: str, body: str, headers: Dict[str, str]) -> None:
+        self._queues[queue].append(body)
+        self._headers[queue].append(dict(headers))
 
     def pop(self, queue: str, timeout: float = 1.0) -> Optional[ReceivedMessage]:
         dq = self._queues.get(queue)
         if not dq:
             return None
-        return ReceivedMessage(body=dq.popleft(), queue=queue)
+        return ReceivedMessage(
+            body=dq.popleft(), queue=queue, headers=self._headers[queue].popleft()
+        )
 
     def ack(self, message: ReceivedMessage) -> None:
         # Already removed on pop; nothing to do.
