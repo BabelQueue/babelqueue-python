@@ -25,9 +25,10 @@ from typing import Any, Callable, Dict, Mapping, Optional
 from . import dead_letter
 from .codec import EnvelopeCodec
 from .exceptions import UnknownUrnError
+from .headers import _headers_scope
 from .replay import HEADER_REPLAY_BYPASS, _replay_scope
 from .routing import UnknownUrnStrategy
-from .transport import ReceivedMessage, Transport, make_transport
+from .transport import HeaderPublisher, ReceivedMessage, Transport, make_transport
 
 Handler = Callable[..., None]
 
@@ -68,6 +69,37 @@ class BabelQueue:
         target = queue or self.queue
         envelope = EnvelopeCodec.make(urn, data, queue=target, trace_id=trace_id)
         self.transport.publish(target, EnvelopeCodec.encode(envelope))
+        return envelope["meta"]["id"]
+
+    def publish_with_headers(
+        self,
+        urn: str,
+        data: Mapping[str, Any],
+        headers: Mapping[str, str],
+        *,
+        queue: Optional[str] = None,
+        trace_id: Optional[str] = None,
+    ) -> str:
+        """Publish a message together with out-of-band transport ``headers``; returns its id.
+
+        The headers ride **beside** the frozen envelope (GR-1) on the transport's per-message
+        metadata channel — e.g. a W3C ``traceparent`` for cross-hop span linkage (ADR-0028) —
+        never inside it. It is the produce-side counterpart of the headers the runtime surfaces
+        to a handler via :func:`~babelqueue.headers.headers_from_context`.
+
+        When the transport implements :class:`~babelqueue.transport.HeaderPublisher` and
+        ``headers`` is non-empty, the headers are propagated; otherwise it transparently falls
+        back to a plain :meth:`publish` (the headers are dropped — no error, no regression),
+        exactly as :func:`~babelqueue.redrive.redrive` degrades. Passing empty headers is
+        equivalent to :meth:`publish`, so callers need not branch on transport capability.
+        """
+        target = queue or self.queue
+        envelope = EnvelopeCodec.make(urn, data, queue=target, trace_id=trace_id)
+        body = EnvelopeCodec.encode(envelope)
+        if headers and isinstance(self.transport, HeaderPublisher):
+            self.transport.publish_with_headers(target, body, dict(headers))
+        else:
+            self.transport.publish(target, body)
         return envelope["meta"]["id"]
 
     # -- Register handlers --------------------------------------------------
@@ -116,8 +148,16 @@ class BabelQueue:
     run = consume
 
     def dispatch(self, received: ReceivedMessage) -> None:
-        """Route one reserved message to its handler and acknowledge it."""
-        with _replay_scope(bool(received.headers.get(HEADER_REPLAY_BYPASS))):
+        """Route one reserved message to its handler and acknowledge it.
+
+        The delivered message's out-of-band transport headers are surfaced onto the context for
+        the span of this dispatch (:func:`~babelqueue.headers.headers_from_context`), so a handler
+        or an optional wrapper (e.g. the ``otel`` module reading a W3C ``traceparent``, ADR-0028)
+        can read metadata that travels beside the frozen envelope (GR-1).
+        """
+        with _headers_scope(received.headers), _replay_scope(
+            bool(received.headers.get(HEADER_REPLAY_BYPASS))
+        ):
             envelope = EnvelopeCodec.decode(received.body)
             urn = str(envelope.get("job") or envelope.get("urn") or "")
             handler = self._handlers.get(urn) if urn else None

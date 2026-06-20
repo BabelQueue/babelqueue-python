@@ -23,17 +23,41 @@ list, so a crashed worker's in-flight job is re-reserved exactly as Laravel does
 
 The envelope is unchanged (``schema_version`` stays 1); Redis is purely additive.
 
+**Out-of-band headers (ADR-0028).** Redis stores only the raw list value (the LREM/ZREM ack
+handle *is* that value), so — unlike AMQP headers or SQS MessageAttributes — there is no native
+per-message metadata channel. To carry headers (e.g. a W3C ``traceparent`` for cross-hop span
+linkage) the transport owns a tiny JSON *frame* distinct from the wire envelope::
+
+    {"__bq_frame": 1, "headers": {"traceparent": "00-…"}, "body": "<raw wire envelope>"}
+
+RPUSH stores the frame, so the ack handle stays byte-for-byte what was pushed and the
+reliable-queue semantics are untouched. Framing is opt-in and backward compatible: only
+:meth:`~RedisTransport.publish_with_headers` with a non-empty header map writes a frame in the
+default Python-owned mode; plain :meth:`~RedisTransport.publish` (and ``publish_with_headers``
+with no usable headers) stores the **bare** envelope byte-for-byte. :meth:`~RedisTransport.pop`
+detects frame-vs-bare by the reserved ``__bq_frame`` sentinel — a frozen wire envelope never
+carries it — and a bare value consumes with ``headers={}`` and ``handle=value``, so cross-version
+queues interoperate. Laravel-compatible mode keeps the bare wire value (its reservation Lua
+``cjson.decode``s the job), so headers degrade to a plain publish there (GR-1, never an error).
+
 URL form: ``redis://host:port/db[?laravel=1&prefix=queues:&retry_after=60]``.
 For richer setups, build the transport directly and pass ``BabelQueue(transport=...)``.
 """
 
 from __future__ import annotations
 
+import json
 import time
-from typing import Any, Optional
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import parse_qs, urlsplit
 
 from .transport import ReceivedMessage, Transport
+
+# The reserved header-frame discriminator key + its current schema version. A frozen wire envelope
+# never carries ``__bq_frame``, so its presence is how ``pop`` tells a transport frame from a bare
+# envelope without structural guessing.
+_FRAME_KEY = "__bq_frame"
+_FRAME_VERSION = 1
 
 # Laravel's stock Redis queue Lua scripts (Illuminate\Queue\LuaScripts). Replicated
 # verbatim so the reserved-set member byte form matches Laravel's — that exact match
@@ -141,6 +165,22 @@ class RedisTransport(Transport):
         ready = self._ready(queue)
         self._redis.eval(_PUSH, 2, ready, f"{ready}:notify", body)
 
+    def publish_with_headers(self, queue: str, body: str, headers: Dict[str, str]) -> None:
+        """Append ``body`` to ``queue`` together with out-of-band ``headers``
+        (:class:`~babelqueue.transport.HeaderPublisher`, ADR-0028).
+
+        In the default Python-owned mode, a non-empty header map is RPUSHed as a transport-owned
+        frame (``{"__bq_frame":1,"headers":…,"body":<raw envelope>}``) that carries the headers
+        beside the frozen envelope (GR-1); blank keys/values are dropped, and if nothing survives
+        it degrades to a byte-identical bare :meth:`publish`. In Laravel-compatible mode the
+        reservation Lua decodes the stored job, so a frame can't ride there — it degrades to a
+        plain :meth:`publish` (headers dropped, no error), exactly as a non-header transport does.
+        """
+        if self._laravel_compat:
+            self.publish(queue, body)
+            return
+        self._redis.rpush(queue, _frame_value(body, headers))
+
     def pop(self, queue: str, timeout: float = 1.0) -> Optional[ReceivedMessage]:
         if not self._laravel_compat:
             return self._pop_owned(queue, timeout)
@@ -181,7 +221,11 @@ class RedisTransport(Transport):
         if body is None:
             return None
         text = _as_text(body)
-        return ReceivedMessage(body=text, queue=queue, handle=text)
+        # The stored value may be a header frame (publish_with_headers) or a bare wire envelope
+        # (publish / older publisher). Either way the handle is the raw stored value, so LREM
+        # still matches; unframe yields the wire envelope body plus any carried headers.
+        unframed, headers = _unframe(text)
+        return ReceivedMessage(body=unframed, queue=queue, handle=text, headers=headers)
 
     # -- Laravel-compatible reservation -------------------------------------
 
@@ -217,6 +261,63 @@ class RedisTransport(Transport):
         # (a crashed worker's in-flight job) — both move back to the ready list.
         self._redis.eval(_MIGRATE, 3, f"{ready}:delayed", ready, f"{ready}:notify", now, -1)
         self._redis.eval(_MIGRATE, 3, f"{ready}:reserved", ready, f"{ready}:notify", now, -1)
+
+
+def _sanitize_headers(headers: Optional[Dict[str, str]]) -> Dict[str, str]:
+    """Copy ``headers`` dropping blank keys and blank values; ``{}`` when nothing survives, so
+    callers can treat the result as 'no headers'."""
+    if not headers:
+        return {}
+    out: Dict[str, str] = {}
+    for key, value in headers.items():
+        if not key or value is None or value == "":
+            continue
+        out[str(key)] = str(value)
+    return out
+
+
+def _frame_value(body: str, headers: Optional[Dict[str, str]]) -> str:
+    """The pure produce-side decision: the exact string to RPUSH for ``body`` + ``headers``.
+
+    With no usable headers it returns ``body`` verbatim (the bare form, so plain ``publish`` and
+    ``publish_with_headers``-without-headers store byte-identical values); otherwise it returns the
+    transport-owned frame JSON. Kept pure so framing is unit-testable without a broker.
+    """
+    clean = _sanitize_headers(headers)
+    if not clean:
+        return body
+    return json.dumps(
+        {_FRAME_KEY: _FRAME_VERSION, "headers": clean, "body": body},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _unframe(value: str) -> Tuple[str, Dict[str, str]]:
+    """Interpret a stored Redis list value: ``(wire-envelope-body, headers)``.
+
+    A value is a header frame iff it is a JSON object carrying the reserved ``__bq_frame``
+    sentinel (a frozen wire envelope never has it); then it yields the unframed body plus the
+    carried headers. Any other value — a bare envelope, non-JSON, or JSON without the sentinel —
+    is returned verbatim as the body with ``{}`` headers, so older/cross-version queue values
+    consume exactly as before.
+    """
+    # Cheap reject: a frame is always a JSON object and the sentinel substring must appear. This
+    # avoids a full parse for the common bare-envelope case (the check only short-circuits negatives).
+    if not value or value[0] != "{" or f'"{_FRAME_KEY}"' not in value:
+        return value, {}
+    try:
+        decoded = json.loads(value)
+    except (ValueError, TypeError):
+        return value, {}
+    if not isinstance(decoded, dict) or not decoded.get(_FRAME_KEY) or "body" not in decoded:
+        return value, {}
+    body = decoded["body"]
+    if not isinstance(body, str):
+        return value, {}
+    raw_headers = decoded.get("headers")
+    headers = raw_headers if isinstance(raw_headers, dict) else None
+    return body, _sanitize_headers(headers)
 
 
 def _as_text(value: Any) -> str:

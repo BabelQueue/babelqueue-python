@@ -9,6 +9,31 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-06-21
+
+### Added
+- **W3C `traceparent` span-context propagation** (OpenTelemetry v0.2, ADR-0028) — the optional
+  `babelqueue.otel` module now carries true cross-hop **span** parent-child linkage, not just
+  shared-`trace_id` correlation. On publish, `otel.publish` injects the active span context as a
+  W3C `traceparent` **transport header** (and still stamps `trace_id` for the v0.1 fallback); on
+  consume, `otel.wrap_handler` extracts it and starts the CONSUMER span as a true **child** of the
+  producer span. With no `traceparent` present it falls back to the v0.1 `trace_id`-derived parent,
+  so it is a strict, backward-compatible upgrade — no regression. The header rides **out of band**
+  via a new dependency-free core seam — `BabelQueue.publish_with_headers(urn, data, headers, …)`
+  (produce side) and `babelqueue.headers_from_context()` (consume side, surfaced by the runtime) —
+  so the wire envelope stays **frozen** (`schema_version: 1`, GR-1) and the core stays
+  zero-dependency (OTel remains the optional `[otel]` extra, GR-7). `traceparent` is carried on the
+  **in-memory** (reference), **Redis** (a transport-owned `__bq_frame` JSON frame with bare-value
+  back-compat, so cross-version queues interoperate; degrades to a bare publish in Laravel-compat
+  mode), **RabbitMQ** (native AMQP header table, beside the contract `x-*` headers) and **SQS**
+  (native `MessageAttributes`, beside the contract `bq-*` attributes) transports; where a transport
+  can't carry headers, propagation degrades cleanly to v0.1 `trace_id` correlation with no error.
+  A plain `publish` is byte-identical to before. Unit-tested without a broker (frame round-trip +
+  bare back-compat, header merge/extract per transport, and an in-memory producer→consumer
+  parent-child end-to-end with the OTel SDK's `InMemorySpanExporter`); broker-gated integration
+  tests assert a published `traceparent` arrives on the consumed message's headers beside the
+  unchanged body. The envelope is unchanged; this is purely additive. Ships as a MINOR.
+
 ## [1.6.0] - 2026-06-14
 
 ### Added

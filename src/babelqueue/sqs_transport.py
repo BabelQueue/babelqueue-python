@@ -11,6 +11,13 @@ visibility-timeout reservation model (``receive_message`` -> process ->
 ``delete_message``); the authoritative attempt count is the broker's
 ``ApproximateReceiveCount``, reconciled onto the envelope as ``attempts = count - 1``.
 
+Out-of-band transport headers (e.g. a W3C ``traceparent`` for cross-hop span linkage, ADR-0028)
+ride the native SQS ``MessageAttributes`` (String) beside the contract ``bq-*`` attributes (the
+contract keys win a collision, and the merge is bounded by SQS's 10-attribute limit);
+:meth:`~SqsTransport.pop` already requests ``MessageAttributeNames: ["All"]`` and maps the
+non-``bq-`` attributes back onto :attr:`~babelqueue.transport.ReceivedMessage.headers`. The frozen
+envelope is untouched (GR-1).
+
 This implements §3 of the broker-bindings contract. The envelope is unchanged
 (``schema_version`` stays 1); SQS is purely additive.
 
@@ -121,6 +128,27 @@ class SqsTransport(Transport):
         return attrs
 
     @staticmethod
+    def _merge_attributes(
+        contract: Dict[str, Dict[str, str]], headers: Optional[Dict[str, str]]
+    ) -> Dict[str, Dict[str, str]]:
+        """Merge out-of-band ``headers`` (as String attributes) onto the contract attributes.
+
+        Contract ``bq-*`` attributes win a key collision; blank keys/values are dropped. SQS allows
+        at most 10 message attributes, so once the table is full further headers are skipped (the
+        contract attributes are always kept). Returns a fresh dict.
+        """
+        merged: Dict[str, Dict[str, str]] = dict(contract)
+        for key, value in (headers or {}).items():
+            if not key or value is None or value == "":
+                continue
+            if key in merged:  # contract attribute wins
+                continue
+            if len(merged) >= 10:  # SQS hard cap on MessageAttributes
+                break
+            merged[str(key)] = {"DataType": "String", "StringValue": str(value)}
+        return merged
+
+    @staticmethod
     def _reconcile(body: str, receive_count: Any) -> str:
         """Set attempts to max(current, ApproximateReceiveCount - 1): a first delivery
         reads 0, a natively-redelivered message reflects its true count, and a
@@ -143,8 +171,17 @@ class SqsTransport(Transport):
     # -- Transport ----------------------------------------------------------
 
     def publish(self, queue: str, body: str) -> None:
+        self._send(queue, body, None)
+
+    def publish_with_headers(self, queue: str, body: str, headers: Dict[str, str]) -> None:
+        """Send ``body`` with out-of-band ``headers`` projected onto SQS ``MessageAttributes``
+        beside the contract ``bq-*`` attributes (:class:`HeaderPublisher`, ADR-0028). The contract
+        attributes win a key collision and the merge is capped at SQS's 10-attribute limit."""
+        self._send(queue, body, headers)
+
+    def _send(self, queue: str, body: str, headers: Optional[Dict[str, str]]) -> None:
         params: Dict[str, Any] = {"QueueUrl": self._resolve_url(queue), "MessageBody": body}
-        attrs = self._attributes(body)
+        attrs = self._merge_attributes(self._attributes(body), headers)
         if attrs:
             params["MessageAttributes"] = attrs
         if self._fifo:
@@ -179,7 +216,10 @@ class SqsTransport(Transport):
         receive_count = (msg.get("Attributes") or {}).get("ApproximateReceiveCount")
         if receive_count is not None:
             body = self._reconcile(body, receive_count)
-        return ReceivedMessage(body=body, queue=queue, handle=msg.get("ReceiptHandle"))
+        headers = _message_attribute_headers(msg.get("MessageAttributes"))
+        return ReceivedMessage(
+            body=body, queue=queue, handle=msg.get("ReceiptHandle"), headers=headers
+        )
 
     def ack(self, message: ReceivedMessage) -> None:
         if not message.handle:
@@ -187,6 +227,24 @@ class SqsTransport(Transport):
         self._sqs.delete_message(
             QueueUrl=self._resolve_url(message.queue), ReceiptHandle=message.handle
         )
+
+
+def _message_attribute_headers(attributes: Any) -> Dict[str, str]:
+    """Map an SQS message's ``MessageAttributes`` onto ``Dict[str, str]`` (String values), so
+    out-of-band metadata (e.g. a ``traceparent``) surfaces on the received message. Mirrors the Go
+    SQS transport, which maps all returned attributes onto ``ReceivedMessage.Headers``. Returns
+    ``{}`` when the message carried no attributes."""
+    if not isinstance(attributes, dict):
+        return {}
+    out: Dict[str, str] = {}
+    for key, spec in attributes.items():
+        if not isinstance(spec, dict):
+            continue
+        value = spec.get("StringValue")
+        if value is None:
+            continue
+        out[str(key)] = str(value)
+    return out
 
 
 def _q1(q: Dict[str, list], key: str) -> Optional[str]:

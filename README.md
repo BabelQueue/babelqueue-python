@@ -182,6 +182,42 @@ def on_created(data, meta): ...
 python manage.py babelqueue_worker --queue orders          # run the consumer
 ```
 
+## OpenTelemetry tracing (optional)
+
+`pip install "babelqueue[otel]"` adds the optional `babelqueue.otel` module — the core never
+imports OpenTelemetry, so it stays zero-dependency. It emits a PRODUCER span per publish and a
+CONSUMER span per handled message, correlated across every hop and SDK, at two layered levels:
+
+- **`trace_id` correlation** (v0.1): the envelope's `trace_id` maps 1:1 to an OTel trace id, so
+  every hop that shares a `trace_id` shares one trace — with **zero** wire/transport change.
+- **W3C `traceparent` span linkage** (v0.2): the producer also injects its active span context as
+  a `traceparent` **transport header** (beside the frozen envelope, never in it), so the consumer
+  starts its span as a true **child** of the producer span — real cross-hop parent-child linkage.
+  With no `traceparent` present it falls back to the v0.1 `trace_id` behaviour, so enabling it is a
+  strict, backward-compatible upgrade.
+
+```python
+from opentelemetry import trace
+from babelqueue import BabelQueue, otel
+
+tracer = trace.get_tracer("orders")
+app = BabelQueue("redis://localhost:6379/0", queue="orders")
+
+# consumer: wrap_handler starts a CONSUMER span (child of the producer span when a
+# traceparent rode along; else in the trace_id-derived trace)
+app.register("urn:babel:orders:created", otel.wrap_handler(tracer, on_order_created))
+
+# producer: otel.publish starts a PRODUCER span and carries traceparent + trace_id
+otel.publish(tracer, app, "urn:babel:orders:created", {"order_id": 1042})
+```
+
+The `traceparent` rides the out-of-band transport-header seam (`publish_with_headers` /
+`headers_from_context`) — the same seam the replay-bypass marker uses — so the envelope stays
+frozen (`schema_version: 1`). It is carried on the in-memory, Redis (a transport-owned JSON frame,
+with bare-value back-compat), RabbitMQ (AMQP header table) and SQS (`MessageAttributes`)
+transports; where a transport can't carry it, propagation degrades cleanly to v0.1 `trace_id`
+correlation with no error.
+
 ## What's here
 
 The codec/contracts/dead-letter (zero-dep core), the `BabelQueue` runtime

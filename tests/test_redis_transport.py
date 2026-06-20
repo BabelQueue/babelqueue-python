@@ -18,8 +18,14 @@ import unittest
 import uuid
 
 from babelqueue import BabelQueue, EnvelopeCodec
-from babelqueue.redis_transport import RedisTransport, _pop_result, _qint
-from babelqueue.transport import ReceivedMessage
+from babelqueue.redis_transport import (
+    RedisTransport,
+    _frame_value,
+    _pop_result,
+    _qint,
+    _unframe,
+)
+from babelqueue.transport import HeaderPublisher, ReceivedMessage
 
 
 class FakeRedis:
@@ -308,6 +314,86 @@ class RedisLaravelCompatTest(unittest.TestCase):
         self.assertEqual(fake.zcard("queues:orders:reserved"), 0)
 
 
+class RedisHeaderFrameTest(unittest.TestCase):
+    """ADR-0028: the transport-owned ``__bq_frame`` carrier + bare-value back-compat."""
+
+    def _tr(self):
+        fake = FakeRedis()
+        return RedisTransport("redis://", client=fake), fake
+
+    def test_transport_is_a_header_publisher(self):
+        tr, _ = self._tr()
+        self.assertIsInstance(tr, HeaderPublisher)
+
+    def test_frame_round_trip_recovers_headers_and_verbatim_body(self):
+        body = '{"job":"u","trace_id":"t","data":{},"meta":{"schema_version":1},"attempts":0}'
+        framed = _frame_value(body, {"traceparent": "00-abc"})
+        self.assertIn('"__bq_frame"', framed)
+        unframed, headers = _unframe(framed)
+        self.assertEqual(unframed, body)  # the wire envelope is recovered byte-for-byte
+        self.assertEqual(headers, {"traceparent": "00-abc"})
+
+    def test_no_usable_headers_stays_bare_byte_for_byte(self):
+        body = '{"job":"u","trace_id":"t","data":{},"meta":{"schema_version":1}}'
+        self.assertEqual(_frame_value(body, None), body)
+        self.assertEqual(_frame_value(body, {}), body)
+        self.assertEqual(_frame_value(body, {"": "x", "drop": ""}), body)  # all blank -> bare
+
+    def test_unframe_bare_values_back_compat(self):
+        # a bare envelope, a non-JSON value, and JSON without the sentinel all unframe to (value, {})
+        for value in (
+            '{"job":"u","trace_id":"t","data":{},"meta":{"schema_version":1}}',
+            "not-json",
+            '{"some":"json","no":"sentinel"}',
+            "",
+        ):
+            body, headers = _unframe(value)
+            self.assertEqual(body, value)
+            self.assertEqual(headers, {})
+
+    def test_publish_with_headers_stores_frame_and_pop_unframes(self):
+        tr, fake = self._tr()
+        body = EnvelopeCodec.encode(
+            EnvelopeCodec.make("urn:babel:orders:created", {"x": 1}, queue="orders")
+        )
+        tr.publish_with_headers("orders", body, {"traceparent": "00-deadbeef"})
+        # the stored list value is a frame (the ack handle), the body is unframed on pop
+        stored = fake.lists["orders"][0]
+        self.assertIn('"__bq_frame"', stored)
+        msg = tr.pop("orders", timeout=0)
+        self.assertEqual(msg.body, body)  # consumer sees the bare wire envelope
+        self.assertEqual(msg.headers.get("traceparent"), "00-deadbeef")
+        # the ack handle is the stored frame, so LREM still matches
+        self.assertEqual(msg.handle, stored)
+        tr.ack(msg)
+        self.assertEqual(fake.lists["orders:processing"], [])
+
+    def test_plain_publish_then_pop_has_no_headers(self):
+        tr, _ = self._tr()
+        body = '{"job":"u","trace_id":"t","data":{},"meta":{"schema_version":1}}'
+        tr.publish("orders", body)
+        msg = tr.pop("orders", timeout=0)
+        self.assertEqual(msg.body, body)
+        self.assertEqual(msg.headers, {})  # bare value consumes with no headers
+
+    def test_publish_with_headers_no_headers_stays_bare(self):
+        tr, fake = self._tr()
+        body = '{"job":"u","trace_id":"t","data":{},"meta":{"schema_version":1}}'
+        tr.publish_with_headers("orders", body, {})
+        self.assertEqual(fake.lists["orders"], [body])  # byte-identical bare value, no frame
+
+    def test_laravel_compat_degrades_to_bare_publish(self):
+        fake = FakeRedis()
+        tr = RedisTransport("redis://", client=fake, laravel_compat=True)
+        env = EnvelopeCodec.make("urn:babel:orders:created", {"x": 1}, queue="orders")
+        body = EnvelopeCodec.encode(env)
+        tr.publish_with_headers("orders", body, {"traceparent": "00-x"})
+        # stored bare on the Laravel ready list (no frame — the reservation Lua decodes the job)
+        self.assertEqual(fake.lists["queues:orders"], [body])
+        for value in fake.lists["queues:orders"]:
+            self.assertNotIn("__bq_frame", value)
+
+
 # ---------------------------------------------------------------------------
 # Integration: skipped unless a real Redis is reachable (CI runs it).
 # ---------------------------------------------------------------------------
@@ -374,6 +460,28 @@ class RedisTransportIntegrationTest(unittest.TestCase):
         self.assertEqual(len(dlq), 1)
         env = EnvelopeCodec.decode(dlq[0])
         self.assertEqual(env["dead_letter"]["reason"], "failed")
+
+    def test_traceparent_header_round_trips_on_real_redis(self) -> None:
+        """ADR-0028: a published traceparent arrives on the consumed message's headers, and the
+        body (the frozen wire envelope) is unchanged. A bare publish consumes with no headers."""
+        tr = RedisTransport(REDIS_URL)
+        body = EnvelopeCodec.encode(
+            EnvelopeCodec.make("urn:babel:orders:created", {"order_id": 7}, queue=self.queue)
+        )
+        tr.publish_with_headers(self.queue, body, {"traceparent": "00-feedface"})
+        msg = tr.pop(self.queue, timeout=2)
+        self.assertIsNotNone(msg)
+        self.assertEqual(msg.body, body)  # body unchanged
+        self.assertEqual(msg.headers.get("traceparent"), "00-feedface")
+        tr.ack(msg)
+
+        # a bare publish consumes with no headers (back-compat)
+        tr.publish(self.queue, body)
+        bare = tr.pop(self.queue, timeout=2)
+        self.assertIsNotNone(bare)
+        self.assertEqual(bare.body, body)
+        self.assertEqual(bare.headers, {})
+        tr.ack(bare)
 
     def test_laravel_compat_reserved_set_round_trip(self) -> None:
         """Against a real Redis: a Laravel-compatible worker reserves into the

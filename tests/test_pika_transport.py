@@ -18,8 +18,69 @@ except ImportError:  # pragma: no cover
     _pika = None
 
 from babelqueue import BabelQueue, EnvelopeCodec
+from babelqueue.pika_transport import PikaTransport, _delivery_headers
+from babelqueue.transport import HeaderPublisher
 
 AMQP_URL = os.environ.get("BABELQUEUE_TEST_AMQP", "amqp://guest:guest@localhost:5672/")
+
+
+class _FakeBasicProperties:
+    """Records the kwargs ``BasicProperties`` is built with — no pika, no broker."""
+
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+class _FakePika:
+    BasicProperties = _FakeBasicProperties
+
+
+class PikaHeaderUnitTest(unittest.TestCase):
+    """ADR-0028: the AMQP header-table carrier logic, exercised without pika or a broker."""
+
+    def _tr(self) -> PikaTransport:
+        # Build a transport without running __init__ (which imports pika); inject a fake pika so
+        # _properties can construct BasicProperties. This keeps the unit test broker-free.
+        tr = PikaTransport.__new__(PikaTransport)
+        tr._pika = _FakePika()
+        return tr
+
+    def test_transport_type_is_a_header_publisher(self):
+        # The class structurally satisfies the HeaderPublisher protocol (publish_with_headers).
+        self.assertTrue(hasattr(PikaTransport, "publish_with_headers"))
+        self.assertIsInstance(self._tr(), HeaderPublisher)
+
+    def test_properties_merge_traceparent_beside_contract_headers(self):
+        tr = self._tr()
+        env = EnvelopeCodec.make("urn:babel:orders:created", {"x": 1}, queue="orders")
+        body = EnvelopeCodec.encode(env)
+        props = tr._properties(body, {"traceparent": "00-abc"})
+        self.assertEqual(props.headers["traceparent"], "00-abc")
+        self.assertEqual(props.headers["x-source-lang"], "python")  # contract header still there
+        self.assertEqual(props.type, env["job"])
+
+    def test_contract_header_wins_a_collision(self):
+        tr = self._tr()
+        env = EnvelopeCodec.make("urn:babel:orders:created", {"x": 1}, queue="orders")
+        body = EnvelopeCodec.encode(env)
+        props = tr._properties(body, {"x-source-lang": "evil"})
+        self.assertEqual(props.headers["x-source-lang"], "python")  # contract wins
+
+    def test_properties_without_headers_is_unchanged(self):
+        tr = self._tr()
+        env = EnvelopeCodec.make("urn:babel:orders:created", {"x": 1}, queue="orders")
+        props = tr._properties(EnvelopeCodec.encode(env), None)
+        self.assertNotIn("traceparent", props.headers)
+        self.assertEqual(props.headers["x-schema-version"], 1)
+
+    def test_delivery_headers_extract_stringifies_and_handles_missing(self):
+        # bytes/ints stringified; a delivery with no header table -> {}
+        self.assertEqual(
+            _delivery_headers(_FakeBasicProperties(headers={"traceparent": b"00-abc", "n": 3})),
+            {"traceparent": "00-abc", "n": "3"},
+        )
+        self.assertEqual(_delivery_headers(_FakeBasicProperties(headers=None)), {})
+        self.assertEqual(_delivery_headers(_FakeBasicProperties()), {})
 
 
 def _amqp_available() -> bool:
@@ -105,6 +166,29 @@ class PikaTransportTest(unittest.TestCase):
         _m, _p, body = self._get(f"{self.queue}.dlq")
         env = EnvelopeCodec.decode(body.decode("utf-8"))
         self.assertEqual(env["dead_letter"]["reason"], "failed")
+
+    def test_traceparent_header_round_trips(self) -> None:
+        """ADR-0028: a published traceparent arrives on the consumed message's headers via the
+        native AMQP header table, body unchanged."""
+        from babelqueue.pika_transport import PikaTransport
+
+        tr = PikaTransport(AMQP_URL)
+        body = EnvelopeCodec.encode(
+            EnvelopeCodec.make("urn:babel:orders:created", {"order_id": 5}, queue=self.queue)
+        )
+        tr.publish_with_headers(self.queue, body, {"traceparent": "00-rabbit"})
+
+        msg = None
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            msg = tr.pop(self.queue, timeout=1)
+            if msg is not None:
+                break
+        self.assertIsNotNone(msg)
+        self.assertEqual(msg.body, body)  # body unchanged
+        self.assertEqual(msg.headers.get("traceparent"), "00-rabbit")
+        tr.ack(msg)
+        tr.close()
 
 
 if __name__ == "__main__":

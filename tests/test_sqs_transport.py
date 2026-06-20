@@ -13,7 +13,7 @@ import uuid
 
 from babelqueue import BabelQueue, EnvelopeCodec
 from babelqueue.sqs_transport import SqsTransport
-from babelqueue.transport import ReceivedMessage, make_transport
+from babelqueue.transport import HeaderPublisher, ReceivedMessage, make_transport
 
 
 class FakeSQS:
@@ -225,6 +225,55 @@ class SqsTransportUnitTest(unittest.TestCase):
         self.assertEqual(seen["meta"]["id"], msg_id)
         self.assertEqual(len(fake.deleted), 1)  # acked/deleted
 
+    # -- ADR-0028: traceparent on MessageAttributes ------------------------
+
+    def test_transport_is_a_header_publisher(self):
+        tr, _ = self._tr()
+        self.assertIsInstance(tr, HeaderPublisher)
+
+    def test_publish_with_headers_projects_traceparent_attribute(self):
+        tr, fake = self._tr()
+        env = EnvelopeCodec.make("urn:babel:orders:created", {"x": 1}, queue="orders")
+        body = EnvelopeCodec.encode(env)
+        tr.publish_with_headers("orders", body, {"traceparent": "00-abc"})
+        sent = fake.sent[0]
+        self.assertEqual(sent["MessageBody"], body)  # body unchanged
+        self.assertEqual(_attr(sent, "traceparent"), "00-abc")
+        self.assertEqual(sent["MessageAttributes"]["traceparent"]["DataType"], "String")
+        # contract attributes still present beside the header
+        self.assertEqual(_attr(sent, "bq-job"), env["job"])
+
+    def test_contract_attribute_wins_a_collision(self):
+        tr, fake = self._tr()
+        env = EnvelopeCodec.make("urn:babel:orders:created", {"x": 1}, queue="orders")
+        # a header that collides with a contract key must not clobber it
+        tr.publish_with_headers("orders", EnvelopeCodec.encode(env), {"bq-job": "evil"})
+        self.assertEqual(_attr(fake.sent[0], "bq-job"), env["job"])
+
+    def test_header_merge_respects_ten_attribute_cap(self):
+        tr, fake = self._tr()
+        env = EnvelopeCodec.make("urn:babel:orders:created", {"x": 1}, queue="orders")
+        # 6 contract attrs are projected; only 4 more headers fit under the SQS cap of 10
+        headers = {f"h{i}": str(i) for i in range(8)}
+        tr.publish_with_headers("orders", EnvelopeCodec.encode(env), headers)
+        self.assertEqual(len(fake.sent[0]["MessageAttributes"]), 10)
+
+    def test_pop_surfaces_message_attributes_as_headers(self):
+        tr, fake = self._tr()
+        env = EnvelopeCodec.make("urn:babel:orders:created", {"x": 1}, queue="orders")
+        tr.publish_with_headers("orders", EnvelopeCodec.encode(env), {"traceparent": "00-xyz"})
+        msg = tr.pop("orders", timeout=0)
+        self.assertIsNotNone(msg)
+        self.assertEqual(msg.headers.get("traceparent"), "00-xyz")
+
+    def test_plain_publish_then_pop_has_no_extra_headers(self):
+        tr, fake = self._tr()
+        env = EnvelopeCodec.make("urn:babel:orders:created", {"x": 1}, queue="orders")
+        tr.publish("orders", EnvelopeCodec.encode(env))
+        msg = tr.pop("orders", timeout=0)
+        # only the contract bq-* attributes surface; there is no traceparent
+        self.assertNotIn("traceparent", msg.headers)
+
     def test_make_transport_routes_sqs_scheme(self):
         # The scheme dispatches to SqsTransport; without boto3 it surfaces a clear
         # install hint (covers the make_transport branch). With boto3 present this
@@ -293,6 +342,25 @@ class SqsLocalStackIntegrationTest(unittest.TestCase):
                 break
         self.assertEqual(processed, 1)
         self.assertEqual(seen.get("order_id"), 1042)
+
+    def test_traceparent_round_trips_on_message_attributes(self):
+        """ADR-0028: a published traceparent arrives on the consumed message's headers via SQS
+        MessageAttributes, body unchanged."""
+        url = f"sqs://{self.region}?endpoint={self.endpoint}"
+        tr = SqsTransport(url)
+        body = EnvelopeCodec.encode(
+            EnvelopeCodec.make("urn:babel:orders:created", {"order_id": 1}, queue=self.queue)
+        )
+        tr.publish_with_headers(self.queue, body, {"traceparent": "00-localstack"})
+        msg = None
+        for _ in range(30):
+            msg = tr.pop(self.queue, timeout=1)
+            if msg is not None:
+                break
+        self.assertIsNotNone(msg)
+        self.assertEqual(msg.body, body)
+        self.assertEqual(msg.headers.get("traceparent"), "00-localstack")
+        tr.ack(msg)
 
 
 if __name__ == "__main__":  # pragma: no cover
