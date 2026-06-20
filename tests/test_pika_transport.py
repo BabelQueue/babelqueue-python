@@ -8,6 +8,7 @@ against a RabbitMQ service; locally they skip cleanly.
 from __future__ import annotations
 
 import os
+import time
 import unittest
 import uuid
 
@@ -51,6 +52,18 @@ class PikaTransportTest(unittest.TestCase):
         method = self.ctl.queue_declare(queue=queue, durable=True, passive=True)
         return method.method.message_count
 
+    def _get(self, queue: str, timeout: float = 5.0):
+        """basic_get with a short poll. A message published on a separate
+        channel is not always retrievable on the very next get, so wait
+        briefly for it rather than asserting on a single immediate poll —
+        otherwise this races and flakes under CI load."""
+        deadline = time.monotonic() + timeout
+        while True:
+            frame = self.ctl.basic_get(queue=queue, auto_ack=True)
+            if frame[0] is not None or time.monotonic() >= deadline:
+                return frame
+            time.sleep(0.05)
+
     def test_publish_consume_round_trip_and_ack(self) -> None:
         app = BabelQueue(AMQP_URL, queue=self.queue)
         seen = {}
@@ -70,7 +83,7 @@ class PikaTransportTest(unittest.TestCase):
         app = BabelQueue(AMQP_URL, queue=self.queue)
         app.publish("urn:babel:orders:created", {"order_id": 1}, trace_id="trace-amqp")
 
-        method, props, body = self.ctl.basic_get(queue=self.queue, auto_ack=True)
+        method, props, body = self._get(self.queue)
         self.assertIsNotNone(method)
         self.assertEqual(props.type, "urn:babel:orders:created")     # route on properties.type
         self.assertEqual(props.correlation_id, "trace-amqp")         # trace_id
@@ -89,7 +102,7 @@ class PikaTransportTest(unittest.TestCase):
         app.consume(max_messages=2, timeout=3)
 
         self.assertEqual(self._depth(f"{self.queue}.dlq"), 1)
-        _m, _p, body = self.ctl.basic_get(queue=f"{self.queue}.dlq", auto_ack=True)
+        _m, _p, body = self._get(f"{self.queue}.dlq")
         env = EnvelopeCodec.decode(body.decode("utf-8"))
         self.assertEqual(env["dead_letter"]["reason"], "failed")
 
