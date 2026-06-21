@@ -11,18 +11,26 @@ and dead-letter helpers. Framework adapters (Celery, Django, ...) build on this.
 
 from __future__ import annotations
 
-from . import dead_letter, headers, idempotency, redrive, replay
+from . import dead_letter, headers, idempotency, outbox, redrive, replay
 from .app import BabelQueue
 from .codec import SCHEMA_VERSION, SOURCE_LANG, EnvelopeCodec
 from .contracts import HasTraceId, PolyglotMessage
 from .headers import headers_from_context
 from .idempotency import IdempotencyStore, InMemoryStore
+from .outbox import (
+    InMemoryOutboxStore,
+    Outbox,
+    OutboxRecord,
+    OutboxRelay,
+    OutboxRelayResult,
+    OutboxStore,
+)
 from .exceptions import BabelQueueError, UnknownUrnError
 from .replay import HEADER_REPLAY_BYPASS, bypass_external_effects, is_replay
 from .routing import UnknownUrnStrategy
 from .transport import HeaderPublisher, InMemoryTransport, ReceivedMessage, Transport
 
-__version__ = "1.11.0"
+__version__ = "1.12.0"
 
 __all__ = [
     "BabelQueue",
@@ -41,6 +49,13 @@ __all__ = [
     "dead_letter",
     "headers",
     "idempotency",
+    "outbox",
+    "Outbox",
+    "OutboxStore",
+    "OutboxRecord",
+    "OutboxRelay",
+    "OutboxRelayResult",
+    "InMemoryOutboxStore",
     "redrive",
     "replay",
     "is_replay",

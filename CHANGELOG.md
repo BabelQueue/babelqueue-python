@@ -9,6 +9,31 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-06-21
+
+### Added
+- **Transactional outbox helper** (ADR-0029) — the optional `babelqueue.outbox` module ports the
+  PHP `BabelQueue\Outbox` helper to Python, removing the producer **dual write**: the message is
+  persisted **into your database, in the same transaction** as the business data (so it commits or
+  rolls back atomically with it), and a separate **relay** publishes the durable rows afterwards.
+  No distributed transaction; exactly-once *handoff* into the broker, then at-least-once on the wire
+  (the consumer dedupes on `meta.id` via the idempotency helper, the consumer-side mirror, ADR-0022).
+  The core stays **stdlib-only** (GR-7): `OutboxStore` is an abstract `typing.Protocol` the caller
+  binds to their own DB — the module ships only the in-memory `InMemoryOutboxStore` reference and
+  pulls in **no** DB driver. `Outbox.write(envelope)` encodes via the frozen `EnvelopeCodec` and
+  delegates to `OutboxStore.save` **inside the transaction the caller already opened** — it does not
+  begin/commit anything (the caller owns the transaction boundary). `OutboxRelay.flush()` publishes
+  one batch through the existing publish-only `Transport`, marking each row published **only after**
+  the transport accepts it, or failed (caught → `mark_failed`, row left pending, with a bounded
+  linear backoff via an injectable sleeper) so one poison row never blocks the batch;
+  `OutboxRelay.drain()` loops while a pass makes progress, with a safety ceiling. The relay
+  publishes the **stored bytes verbatim** — it never decodes, rebuilds or re-encodes the envelope —
+  so `trace_id` is preserved end-to-end and the body is byte-compatible across SDKs (GR-1/GR-4/GR-5).
+  Unit-tested without a broker (write stores the encoded envelope byte-identical; relay publishes via
+  a fake `Transport` + marks published; a raising publish → `mark_failed`, row still pending, batch
+  continues; `drain` loops to empty and stops on no-progress; backoff grows linearly and caps via the
+  injected sleeper). The envelope is unchanged (`schema_version: 1`); this is purely additive.
+
 ## [1.11.0] - 2026-06-21
 
 ### Added

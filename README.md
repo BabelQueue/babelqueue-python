@@ -182,6 +182,47 @@ def on_created(data, meta): ...
 python manage.py babelqueue_worker --queue orders          # run the consumer
 ```
 
+## Transactional outbox (optional)
+
+The `babelqueue.outbox` helper (ADR-0029) removes the producer **dual write**: "commit the
+business row" and "publish to the broker" are two systems that can disagree on a crash. Instead the
+message is persisted **into your database, in the same transaction** as the business data — so it
+commits or rolls back atomically with it — and a separate **relay** publishes the durable rows
+afterwards. No distributed transaction; exactly-once *handoff* into the broker, then at-least-once
+on the wire (the consumer dedupes on `meta.id` — see the idempotency helper, the mirror of this).
+
+The core stays **stdlib-only**: `OutboxStore` is an abstract `Protocol` you bind to **your own DB**
+(the core ships no driver). The stored value is the `EnvelopeCodec`-encoded envelope **byte-for-byte
+unchanged** (frozen, `schema_version: 1`); the relay publishes those exact bytes — it never decodes,
+rebuilds or re-encodes — so `trace_id` is preserved end-to-end.
+
+```python
+from babelqueue import BabelQueue, EnvelopeCodec
+from babelqueue.outbox import Outbox, OutboxRelay, InMemoryOutboxStore
+
+store = InMemoryOutboxStore()          # production: your own OutboxStore adapter, DB-backed
+outbox = Outbox(store)
+
+# write side — YOU own the transaction boundary (this is the whole point):
+with db.transaction():                 # your own open transaction
+    db.insert_order(order)             # the business write
+    envelope = EnvelopeCodec.make("urn:babel:orders:created", {"order_id": 1042}, queue="orders")
+    outbox.write(envelope)             # same connection, same tx — both, or neither
+
+# read/publish side — run on a short interval, after the business tx commits:
+app = BabelQueue("redis://localhost:6379/0", queue="orders")
+relay = OutboxRelay(app.transport, store)
+relay.drain()                          # publish all pending rows; flush() does one batch
+```
+
+`Outbox.write` only encodes and calls `OutboxStore.save` — it does **not** begin or commit anything.
+A `save` runs inside the transaction you already opened; you commit both together. `OutboxRelay`
+marks a row published only **after** the transport accepts it; a publish that raises is recorded via
+`mark_failed` (with a bounded, injectable-sleeper backoff) and left pending for a later pass, so one
+poison row never blocks the batch. Implement `OutboxStore` over your DB (claim rows oldest-first,
+ideally with `SELECT … FOR UPDATE SKIP LOCKED` so two relays don't double-publish); `InMemoryOutboxStore`
+is the reference for tests and single-process demos (no real transaction).
+
 ## OpenTelemetry tracing (optional)
 
 `pip install "babelqueue[otel]"` adds the optional `babelqueue.otel` module — the core never
