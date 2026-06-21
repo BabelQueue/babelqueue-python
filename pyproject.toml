@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "babelqueue"
-version = "1.12.0"
+version = "1.13.0"
 description = "Polyglot Queues, Simplified — the Python core: the canonical BabelQueue wire-envelope codec, contracts and dead-letter helpers."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -37,6 +37,9 @@ pulsar = ["pulsar-client>=3.4"]
 kafka = ["confluent-kafka>=2.3"]
 artemis = ["python-qpid-proton>=0.39"]
 otel = ["opentelemetry-api>=1.20"]
+# Only for the documented bring-your-own AES-256-GCM reference cipher (ADR-0030). The core never
+# imports it; protect/unprotect take a caller-provided Cipher Protocol, so this is NOT a core dep.
+gdpr = ["cryptography>=42"]
 celery = ["celery>=5"]
 django = ["django>=4.2"]
 dev = ["pytest>=7", "pytest-cov>=4", "mypy>=1.8", "ruff>=0.5"]

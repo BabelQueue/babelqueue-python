@@ -35,7 +35,7 @@ import functools
 import json
 import os
 import threading
-from typing import Any, Callable, Mapping, Optional, Protocol, runtime_checkable
+from typing import Any, Callable, List, Mapping, NamedTuple, Optional, Protocol, runtime_checkable
 
 from .exceptions import InvalidPayloadError
 
@@ -259,3 +259,61 @@ def _violation(path: str, reason: str) -> str:
 
 def _join(path: str, key: str) -> str:
     return key if path == "" else f"{path}.{key}"
+
+
+class SensitivePath(NamedTuple):
+    """One property a schema marked ``x-gdpr-sensitive`` (ADR-0030), located by its dotted path
+    from the schema root. Array elements use the ``field[]`` segment the validator and registry
+    ``compat`` linter use (e.g. ``addresses[].line``). ``category`` is the optional
+    ``"x-gdpr-sensitive": "<category>"`` string, or ``""`` when the keyword was the boolean
+    ``true``. A mark on the root schema itself is reported with ``path == ""``."""
+
+    path: str
+    category: str
+
+
+def _gdpr_mark(schema: Mapping[str, Any]) -> Optional[str]:
+    """Read the ``x-gdpr-sensitive`` extension keyword (ADR-0030) from one schema node.
+
+    Returns the category string for a marked node (``""`` when the keyword was the boolean
+    ``true``, a non-empty category when it was a non-empty string), or ``None`` when the node is
+    not marked. The keyword is **validation-neutral**: it never makes a value valid or invalid, so
+    annotating a schema is never a breaking change (GR-1). Any other shape — ``false``, ``""``, a
+    number — leaves the node unmarked. Mirrors the Go ``fromMap`` and the registry's parser.
+    """
+    mark = schema.get("x-gdpr-sensitive")
+    if mark is True:
+        return ""
+    if isinstance(mark, str) and mark != "":
+        return mark
+    return None
+
+
+def sensitive_paths(schema: Mapping[str, Any]) -> List[SensitivePath]:
+    """Every property a schema marked ``x-gdpr-sensitive``, in sorted path order (ADR-0030).
+
+    Descends nested objects (dotted paths like ``profile.full_name``) and array item schemas
+    (``addresses[].line``); a mark on the root schema itself is reported with ``path == ""``. It is
+    the value-level counterpart to the registry's inventory: :mod:`babelqueue.gdpr` uses these paths
+    to locate the leaves it encrypts on produce and decrypts on consume. The Python mirror of the
+    Go ``Schema.SensitivePaths``. Non-mapping / malformed nodes are skipped, never raised on.
+    """
+    out: List[SensitivePath] = []
+    _collect_sensitive(schema, "", out)
+    out.sort(key=lambda sp: sp.path)
+    return out
+
+
+def _collect_sensitive(schema: Any, path: str, out: List[SensitivePath]) -> None:
+    if not isinstance(schema, Mapping):
+        return
+    category = _gdpr_mark(schema)
+    if category is not None:
+        out.append(SensitivePath(path, category))
+    properties = schema.get("properties")
+    if isinstance(properties, Mapping):
+        for name, sub in properties.items():
+            _collect_sensitive(sub, _join(path, str(name)), out)
+    items = schema.get("items")
+    if isinstance(items, Mapping):
+        _collect_sensitive(items, path + "[]", out)

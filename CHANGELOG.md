@@ -9,6 +9,37 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.13.0] - 2026-06-21
+
+### Added
+- **Runtime GDPR field encryption** (ADR-0030) — the optional `babelqueue.gdpr` module ports the Go
+  reference to Python: the SDK-enforcement half of governed PII. The babelqueue-registry only
+  **declares** and **audits** `x-gdpr-sensitive` fields (and can **mask** them for safe logging);
+  this module **enforces** them on the wire — a producer encrypts each marked leaf before publish, a
+  consumer decrypts it after decode. Strictly **opt-in**: a producer/consumer that never calls
+  `protect`/`unprotect` is unchanged. The **envelope stays frozen** (GR-1): only **values inside
+  `data`** change — a sensitive leaf's value becomes a ciphertext **string** — so `data` stays pure
+  JSON (an SDK without the key still carries the envelope), `meta.schema_version` stays `1`, and
+  `trace_id` is untouched (GR-4). The core stays **stdlib-only** (GR-7): Python's standard library
+  has **no AES-GCM**, so the module ships **no** concrete cipher and pulls **no** crypto dependency
+  — `Cipher` is a caller-provided `typing.Protocol` (`encrypt(bytes) -> str` / `decrypt(str) ->
+  bytes`) bound to a KMS / Vault / HSM / tokenisation service, or to a local AES-256-GCM via the
+  optional `cryptography` library (new `babelqueue[gdpr]` extra, documented in the README — still
+  **not** a core dependency). `protect(data, schema, cipher)` canonically JSON-encodes each marked
+  leaf and replaces it with the cipher's ciphertext string **in place**; `unprotect(...)` is the
+  exact inverse, restoring `data` **byte-for-byte**. The marked paths come from the **same per-URN
+  schema** the validator already loads — `babelqueue.schema.sensitive_paths` walks nested objects
+  (`profile.full_name`), array items (`addresses[].line`), container, and root marks, and the
+  `x-gdpr-sensitive` keyword is **validation-neutral** (annotating a schema is never breaking). An
+  absent marked field is skipped (not an error); a re-run `unprotect` on already-cleartext data is a
+  no-op (non-string leaves are left alone); a wrong key / tampered / non-ciphertext value raises the
+  new `babelqueue.DecryptError` so the consumer fails the message (retry / dead-letter) rather than
+  handle unreadable PII. Validate cleartext **before** `protect` / **after** `unprotect`, since a
+  schema constraining a sensitive field would reject the ciphertext string. Unit-tested without any
+  crypto dependency (a stdlib-only authenticated fake cipher) for round-trip exactness across
+  nested/array/container/root marks, skips, idempotent re-runs, frozen-envelope decode/validate, and
+  wrong-key failure. The envelope is unchanged (`schema_version: 1`); this is purely additive.
+
 ## [1.12.0] - 2026-06-21
 
 ### Added

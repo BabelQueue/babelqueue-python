@@ -259,6 +259,65 @@ with bare-value back-compat), RabbitMQ (AMQP header table) and SQS (`MessageAttr
 transports; where a transport can't carry it, propagation degrades cleanly to v0.1 `trace_id`
 correlation with no error.
 
+## GDPR field encryption (optional)
+
+The optional `babelqueue.gdpr` module is the runtime, SDK-enforcement half of ADR-0030: it
+encrypts the `data` fields a registry declared `x-gdpr-sensitive`. The babelqueue-registry only
+**declares** and **audits** sensitivity (and can **mask** for safe logging); this module
+**enforces** it on the wire — a producer encrypts each marked leaf before publish, a consumer
+decrypts it after decode. It is strictly **opt-in**: if you never call `protect`/`unprotect`,
+nothing changes.
+
+The envelope stays **frozen** (`schema_version: 1`): only the **values inside `data`** change — a
+sensitive leaf's value becomes a ciphertext **string**. `data` stays pure JSON, so an SDK without
+the key still carries the envelope (it just can't read the protected fields), and `trace_id` is
+never touched. Which fields are sensitive lives in the **schema**, not the message.
+
+Because Python's standard library has **no AES-GCM**, the core ships **no** cipher and pulls **no**
+crypto dependency (GR-7). `Cipher` is a caller-provided `Protocol` you bind to a KMS / Vault / HSM /
+tokenisation service, or to a local AES-256-GCM via the optional `cryptography` library
+(`pip install "babelqueue[gdpr]"` — still **not** a core dependency):
+
+```python
+import base64, os
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+class AesGcmCipher:
+    def __init__(self, key: bytes) -> None:       # 16/24/32-byte key — the CALLER's
+        self._aead = AESGCM(key)
+
+    def encrypt(self, plaintext: bytes) -> str:
+        nonce = os.urandom(12)
+        return base64.b64encode(nonce + self._aead.encrypt(nonce, plaintext, None)).decode("ascii")
+
+    def decrypt(self, ciphertext: str) -> bytes:
+        raw = base64.b64decode(ciphertext)
+        return self._aead.decrypt(raw[:12], raw[12:], None)   # raises on wrong key / tamper
+```
+
+Wire it around the codec — validate **cleartext** (before `protect`, after `unprotect`), since a
+schema that constrains a sensitive field would reject the ciphertext string:
+
+```python
+from babelqueue import EnvelopeCodec
+from babelqueue.gdpr import protect, unprotect
+
+# producer: encrypt marked leaves in place, then encode
+protect(data, schema, cipher)
+body = EnvelopeCodec.encode(EnvelopeCodec.make("urn:babel:orders:created", data, queue="orders"))
+
+# consumer: decode, then decrypt marked leaves in place before the handler reads data
+envelope = EnvelopeCodec.decode(body)
+unprotect(envelope["data"], schema, cipher)
+```
+
+`schema` is the same per-URN JSON Schema the validator uses; `babelqueue.schema.sensitive_paths`
+locates every `x-gdpr-sensitive` leaf (nested objects, `addresses[].line` array items, container or
+root marks). An absent marked field is skipped; a re-run `unprotect` on cleartext is a no-op
+(non-string leaves are left alone); a wrong key / tampered ciphertext raises
+`babelqueue.DecryptError` so the consumer fails the message (retry / dead-letter) rather than
+process unreadable PII. The round-trip restores `data` **byte-for-byte**.
+
 ## What's here
 
 The codec/contracts/dead-letter (zero-dep core), the `BabelQueue` runtime
