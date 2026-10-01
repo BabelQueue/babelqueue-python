@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from .codec import EnvelopeCodec
+from .codec import EnvelopeCodec, parse_envelope
 from .transport import ReceivedMessage, Transport
 
 Headers = List[Tuple[str, bytes]]
@@ -94,7 +94,7 @@ class KafkaTransport(Transport):
     def _projection(body: str) -> Headers:
         """Native Kafka record headers (UTF-8 byte values) — a redundant, routable view of the
         body: bq-job/bq-trace-id/bq-message-id + bq-schema-version/lang/attempts. §6.3."""
-        env = EnvelopeCodec.decode(body)
+        env = parse_envelope(body)
         if not env:
             return []
         meta = env.get("meta") or {}
@@ -145,7 +145,7 @@ class KafkaTransport(Transport):
     # -- Transport ----------------------------------------------------------
 
     def publish(self, queue: str, body: str) -> None:
-        env = EnvelopeCodec.decode(body)
+        env = parse_envelope(body)
         meta = env.get("meta") or {}
         producer = self._producer_()
         kwargs: Dict[str, Any] = {"value": body.encode("utf-8"), "headers": self._projection(body)}

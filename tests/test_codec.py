@@ -100,6 +100,33 @@ class EnvelopeCodecTest(unittest.TestCase):
     def test_decode_of_malformed_json_is_empty(self) -> None:
         self.assertEqual(EnvelopeCodec.decode("not-json"), {})
 
+    def test_encode_never_emits_forbidden_keys_and_does_not_mutate_input(self) -> None:
+        p = EnvelopeCodec.make("urn:babel:orders:created", {"order_id": 1})
+        p["timestamp"] = 1
+        p["meta"]["attempts"] = 3
+        p["meta"]["ts"] = 2
+        body = json.loads(EnvelopeCodec.encode(p))
+        self.assertNotIn("timestamp", body)
+        self.assertNotIn("attempts", body["meta"])
+        self.assertNotIn("ts", body["meta"])
+        self.assertEqual(body["attempts"], 0)
+        # the caller's envelope is untouched
+        self.assertEqual(p["timestamp"], 1)
+        self.assertEqual(p["meta"]["attempts"], 3)
+
+    def test_decode_drops_forbidden_keys_with_a_warning(self) -> None:
+        p = EnvelopeCodec.make("urn:babel:orders:created", {"order_id": 1})
+        raw = json.loads(EnvelopeCodec.encode(p))
+        raw["meta"]["max_retries"] = 5
+        raw["meta"]["source"] = "php"
+        with self.assertLogs("babelqueue.codec", level="WARNING") as logs:
+            decoded = EnvelopeCodec.decode(json.dumps(raw))
+        self.assertNotIn("max_retries", decoded["meta"])
+        self.assertNotIn("source", decoded["meta"])
+        self.assertTrue(EnvelopeCodec.accepts(decoded))
+        self.assertEqual(len(logs.output), 2)
+        self.assertTrue(any("/meta/max_retries" in line for line in logs.output))
+
     def test_consumes_a_php_produced_envelope(self) -> None:
         """Cross-SDK parity: decode the golden fixture produced by the PHP SDK."""
         raw = (FIXTURES / "order-created.json").read_text(encoding="utf-8")

@@ -32,6 +32,21 @@ def body(attempts: int = 0) -> str:
     return EnvelopeCodec.encode(env)
 
 
+def _with_forbidden_key(raw: str) -> str:
+    """``raw`` plus a forbidden top-level key (message-envelope.md §10), as a legacy producer sends."""
+    return raw[:-1] + ',"timestamp":1}'
+
+
+def _assert_no_codec_warnings(case: unittest.TestCase, fn) -> None:
+    """Run ``fn`` and assert the codec logged nothing (``assertNoLogs`` needs Python 3.10+)."""
+    import logging
+
+    with case.assertLogs("babelqueue.codec", level="WARNING") as cm:
+        fn()
+        logging.getLogger("babelqueue.codec").warning("sentinel")
+    case.assertEqual(cm.output, ["WARNING:babelqueue.codec:sentinel"])
+
+
 class Timeout(Exception):
     """Duck-typed stand-in for ``pulsar.Timeout`` (matched by class name)."""
 
@@ -143,6 +158,16 @@ class PulsarPublishTest(unittest.TestCase):
         self.assertEqual(props["bq-job"], URN)
         self.assertEqual(props["bq-message-id"], env["meta"]["id"])
         self.assertEqual(EnvelopeCodec.urn(EnvelopeCodec.decode(content.decode("utf-8"))), URN)
+
+    def test_projection_does_not_log_a_forbidden_key_drop(self):
+        # The payload is sent unchanged, so the property projection must not claim a drop.
+        raw = _with_forbidden_key(body())
+        producer = FakeProducer()
+        tr = PulsarTransport(client=FakeClient(producer=producer))
+        _assert_no_codec_warnings(self, lambda: tr.publish("orders", raw))
+        content, props = producer.sent[0]
+        self.assertEqual(content, raw.encode("utf-8"))
+        self.assertEqual(props["bq-job"], URN)
 
 
 class PulsarConsumeTest(unittest.TestCase):

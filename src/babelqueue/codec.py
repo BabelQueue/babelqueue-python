@@ -11,14 +11,81 @@ Full spec: https://babelqueue.com
 from __future__ import annotations
 
 import json
+import logging
 import time
 import uuid
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from .exceptions import BabelQueueError
 
 SCHEMA_VERSION = 1
 SOURCE_LANG = "python"
+
+#: Non-canonical keys (message-envelope.md §10), as ``(container, key)`` pairs where the
+#: container is ``None`` for the top level or ``"meta"``. Policy K-15: decode WARNS and drops
+#: them (old producers keep working); encode NEVER emits them. Encode currently drops them with
+#: a warning; K-15 (a) / R1-E0 will turn that into a rejection (an error) in a future MINOR.
+FORBIDDEN_KEYS: Tuple[Tuple[Optional[str], str], ...] = (
+    (None, "timestamp"),
+    ("meta", "max_retries"),
+    ("meta", "attempts"),
+    ("meta", "source"),
+    ("meta", "ts"),
+)
+
+#: Logger every forbidden-key warning is reported through (one record per dropped key).
+logger = logging.getLogger("babelqueue.codec")
+
+
+def strip_forbidden_keys(envelope: Dict[str, Any]) -> List[str]:
+    """Remove the non-canonical keys of message-envelope.md §10 from ``envelope`` in place.
+
+    Returns the RFC 6901 pointers of the keys that were dropped (e.g. ``"/meta/max_retries"``),
+    in a stable order, and logs one ``WARNING`` on :data:`logger` per dropped key naming its
+    pointer. Unknown keys that are not forbidden are left untouched (forward compatibility).
+    """
+    dropped: List[str] = []
+    for container, key in FORBIDDEN_KEYS:
+        target = envelope if container is None else envelope.get(container)
+        if not isinstance(target, dict) or key not in target:
+            continue
+        del target[key]
+        pointer = "/" + key if container is None else f"/{container}/{key}"
+        dropped.append(pointer)
+        logger.warning(
+            "Dropped forbidden envelope key %s from the envelope "
+            "(non-canonical, message-envelope.md §10).",
+            pointer,
+        )
+    return dropped
+
+
+def parse_envelope(raw: Any) -> Dict[str, Any]:
+    """Parse a raw JSON body into a dict **as-is** — no forbidden-key drop, no warning.
+
+    For read-only projections of a body that is forwarded unchanged (e.g. a transport
+    deriving broker attributes from it): logging a "dropped" key there would be false,
+    because the bytes on the wire keep it. Returns ``{}`` for malformed/non-object input.
+    Consumers that act on the envelope use :meth:`EnvelopeCodec.decode` instead.
+    """
+    try:
+        decoded = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def has_forbidden_keys(envelope: Mapping[str, Any]) -> bool:
+    """Whether ``envelope`` carries any of the non-canonical keys of message-envelope.md §10."""
+    return _has_forbidden_keys(envelope)
+
+
+def _has_forbidden_keys(envelope: Mapping[str, Any]) -> bool:
+    for container, key in FORBIDDEN_KEYS:
+        target = envelope if container is None else envelope.get(container)
+        if isinstance(target, Mapping) and key in target:
+            return True
+    return False
 
 
 class EnvelopeCodec:
@@ -83,17 +150,35 @@ class EnvelopeCodec:
 
     @staticmethod
     def encode(envelope: Mapping[str, Any]) -> str:
-        """Encode the envelope as compact UTF-8 JSON (unescaped unicode/slashes)."""
+        """Encode the envelope as compact UTF-8 JSON (unescaped unicode/slashes).
+
+        Forbidden keys (message-envelope.md §10) are never emitted: if the mapping carries any,
+        they are dropped (with a warning) from a copy — the caller's mapping is not mutated.
+
+        Transitional: K-15 (a) asks encode to *reject* forbidden keys. Dropping is the interim
+        behaviour until R1-E0, when this call will raise instead — do not rely on encode to
+        clean an envelope; strip it yourself (:func:`strip_forbidden_keys`) if you build one
+        from a legacy source.
+        """
+        if _has_forbidden_keys(envelope):
+            copy = dict(envelope)
+            if isinstance(copy.get("meta"), Mapping):
+                copy["meta"] = dict(copy["meta"])
+            strip_forbidden_keys(copy)
+            envelope = copy
         return json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
 
     @staticmethod
     def decode(raw: str) -> Dict[str, Any]:
-        """Decode a raw JSON body; returns ``{}`` for malformed/non-object input."""
-        try:
-            decoded = json.loads(raw)
-        except (ValueError, TypeError):
-            return {}
-        return decoded if isinstance(decoded, dict) else {}
+        """Decode a raw JSON body; returns ``{}`` for malformed/non-object input.
+
+        Unknown keys are kept as-is (forward compatibility). Forbidden keys
+        (message-envelope.md §10) are dropped and reported as warnings on :data:`logger`
+        (policy K-15: warn, never reject), so re-encoding never re-emits them.
+        """
+        decoded = parse_envelope(raw)
+        strip_forbidden_keys(decoded)
+        return decoded
 
     @staticmethod
     def urn(envelope: Mapping[str, Any]) -> str:

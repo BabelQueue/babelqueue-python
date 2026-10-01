@@ -31,6 +31,21 @@ def body(attempts: int = 0) -> str:
     return EnvelopeCodec.encode(env)
 
 
+def _with_forbidden_key(raw: str) -> str:
+    """``raw`` plus a forbidden top-level key (message-envelope.md §10), as a legacy producer sends."""
+    return raw[:-1] + ',"timestamp":1}'
+
+
+def _assert_no_codec_warnings(case: unittest.TestCase, fn) -> None:
+    """Run ``fn`` and assert the codec logged nothing (``assertNoLogs`` needs Python 3.10+)."""
+    import logging
+
+    with case.assertLogs("babelqueue.codec", level="WARNING") as cm:
+        fn()
+        logging.getLogger("babelqueue.codec").warning("sentinel")
+    case.assertEqual(cm.output, ["WARNING:babelqueue.codec:sentinel"])
+
+
 class FakeReceived:
     """Duck-typed ServiceBusReceivedMessage (the real one has no public constructor)."""
 
@@ -108,6 +123,13 @@ class AsbProjectionTest(unittest.TestCase):
         # so a higher body count must win over a lower native one.
         raw = body(5)
         self.assertEqual(int(EnvelopeCodec.decode(AsbTransport._reconcile(raw, 2))["attempts"]), 5)
+
+    def test_projection_does_not_log_a_forbidden_key_drop(self):
+        # The body is sent unchanged, so the native-field projection must not claim a drop.
+        raw = _with_forbidden_key(body())
+        out: dict = {}
+        _assert_no_codec_warnings(self, lambda: out.update(AsbTransport._projection(raw)))
+        self.assertEqual(out["subject"], URN)
 
 
 class AsbConsumeTest(unittest.TestCase):

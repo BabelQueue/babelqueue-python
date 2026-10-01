@@ -26,7 +26,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 from urllib.parse import urlsplit
 
-from .codec import EnvelopeCodec
+from .codec import EnvelopeCodec, parse_envelope
 from .transport import ReceivedMessage, Transport
 
 
@@ -98,7 +98,7 @@ class AsbTransport(Transport):
         """Native ServiceBusMessage kwargs — Subject/CorrelationId/MessageId + the bq-
         application properties (a redundant, routable view of the body). §4.2–§4.3."""
         try:
-            env: Dict[str, Any] = EnvelopeCodec.decode(body)
+            env: Dict[str, Any] = parse_envelope(body)
         except (ValueError, TypeError):  # pragma: no cover - defensive
             return {"content_type": "application/json"}
         meta = env.get("meta") or {}

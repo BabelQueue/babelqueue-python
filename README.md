@@ -120,6 +120,27 @@ app.run()                               # consume forever (Ctrl-C to stop)
   and `memory://` (in-process, great for tests/local). Bring your own by passing
   `transport=...`.
 
+- **Graceful shutdown:** SIGTERM/SIGINT finish the in-flight handler, or release
+  the message unchanged once `shutdown_timeout` expires. Delivery is
+  **at-least-once** — keep handlers idempotent (see the idempotency helper).
+
+### SQS release and poison messages
+
+On a handler failure, unknown-URN `release` or shutdown release, the SQS
+transport **always** releases with `ChangeMessageVisibility` (broker-bindings
+§3.5) — it never re-sends a copy. The broker's `ApproximateReceiveCount` is the
+attempt counter, so a shutdown release also consumes an attempt. The default
+delay is **0 s** (`retry_backoff` / `unknown_urn_release_delay`), i.e. the
+message is visible again immediately; delays outside 0..43200 s are clamped with
+a warning.
+
+**Poison-loop risk:** a message that always fails is redelivered at once until
+`max_attempts` is reached. If the receive count is unavailable the SDK cannot
+advance attempts at all. **Configure a native `RedrivePolicy`**
+(`maxReceiveCount` ≥ `max_attempts`, pointing at `<queue>.dlq`) on every SQS
+queue as the broker-side backstop, and set a non-zero `retry_backoff` if the
+handler's dependencies need time to recover.
+
 ### Sharing a Redis queue with Laravel
 
 By default the Redis transport owns its queue end-to-end (`RPUSH` to produce;

@@ -57,6 +57,25 @@ class HeaderPublisher(Protocol):
         ...
 
 
+@runtime_checkable
+class Redeliverer(Protocol):
+    """Optional :class:`Transport` capability: give a received message back to the broker
+    for redelivery after ``delay`` seconds instead of deleting it and publishing a copy
+    (e.g. SQS ``ChangeMessageVisibility`` — broker-bindings.md §3.5).
+
+    ``body`` is the envelope the runtime would republish (``attempts`` already advanced);
+    a releaser that keeps the original message (and lets the broker count deliveries)
+    ignores it, while a releaser that must fall back to send-then-delete uses it. A
+    transport that does not implement it gets the default publish-then-ack release.
+
+    The method is deliberately not named ``release``: some transports already expose a
+    ``release`` with a different, transport-specific signature."""
+
+    def redeliver(self, message: ReceivedMessage, body: str, delay: float) -> None:
+        """Hand ``message`` back to the broker, visible again after ``delay`` seconds."""
+        ...
+
+
 class InMemoryTransport(Transport):
     """In-process transport for tests and broker-free local runs (``memory://``)."""
 

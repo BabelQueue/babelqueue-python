@@ -31,6 +31,21 @@ def body(attempts: int = 0, trace_id: str = "trace-1") -> str:
     return EnvelopeCodec.encode(env)
 
 
+def _with_forbidden_key(raw: str) -> str:
+    """``raw`` plus a forbidden top-level key (message-envelope.md §10), as a legacy producer sends."""
+    return raw[:-1] + ',"timestamp":1}'
+
+
+def _assert_no_codec_warnings(case: unittest.TestCase, fn) -> None:
+    """Run ``fn`` and assert the codec logged nothing (``assertNoLogs`` needs Python 3.10+)."""
+    import logging
+
+    with case.assertLogs("babelqueue.codec", level="WARNING") as cm:
+        fn()
+        logging.getLogger("babelqueue.codec").warning("sentinel")
+    case.assertEqual(cm.output, ["WARNING:babelqueue.codec:sentinel"])
+
+
 class FakeMessage:
     """Duck-typed proton Message for the consume path (no proton needed)."""
 
@@ -106,6 +121,18 @@ class ArtemisProjectionTest(unittest.TestCase):
         self.assertEqual("", ArtemisTransport._jms_type("not-json"))
         self.assertEqual("", ArtemisTransport._correlation_id("not-json"))
         self.assertIsNone(ArtemisTransport._creation_seconds("not-json"))
+
+    def test_projection_helpers_do_not_log_a_forbidden_key_drop(self) -> None:
+        # The body is sent unchanged, so a read-only projection must not claim a "dropped" key.
+        raw = _with_forbidden_key(body(trace_id="trace-1"))
+
+        def project() -> None:
+            self.assertEqual("1", ArtemisTransport._projection(raw)["bq_schema_version"])
+            self.assertEqual(URN, ArtemisTransport._jms_type(raw))
+            self.assertEqual("trace-1", ArtemisTransport._correlation_id(raw))
+            self.assertIsNotNone(ArtemisTransport._creation_seconds(raw))
+
+        _assert_no_codec_warnings(self, project)
 
 
 class ArtemisReconcileTest(unittest.TestCase):

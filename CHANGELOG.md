@@ -9,6 +9,55 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.14.0] - 2026-10-01
+
+### Added
+- **Graceful shutdown** of `BabelQueue.consume()`: on SIGTERM/SIGINT the loop sets a stop flag,
+  takes no new message, lets the in-flight handler finish (or releases the message unchanged once
+  the new `shutdown_timeout` — default 30 s — expires), restores the previous signal handlers and
+  closes the transport. Handlers are installed only on the main thread (`handle_signals=False`
+  opts out); a second signal forces an immediate exit with the message released. A plain
+  `KeyboardInterrupt` keeps its previous behaviour. New `BabelQueue.stop()` ends the loop from any
+  thread after the in-flight message.
+- `Redeliverer` protocol (`redeliver(message, body, delay)`) — a transport's native
+  release; the runtime uses it for retries, unknown-URN `RELEASE` and shutdown releases, and
+  falls back to publish + ack otherwise. New `retry_backoff` / `unknown_urn_release_delay`
+  settings feed its delay.
+- Conformance runners for the `roundtrip`, `data_shape`, `forbidden_keys` and
+  `payload_schema_unicode` sections (none skipped).
+- `.github/dependabot.yml` (pip + GitHub Actions, weekly).
+
+### Changed
+- **SQS release** (broker-bindings §3.5): retries, unknown-URN `RELEASE` and shutdown releases
+  **always** call `ChangeMessageVisibility` instead of re-sending, so the broker's
+  `ApproximateReceiveCount` carries the attempt count. There is no send + delete fallback. The
+  default delay for `retry_backoff` and `unknown_urn_release_delay` is **0 s** (immediate
+  redelivery); a delay outside 0..43200 s (including `inf`/`nan`) is clamped with a warning on the
+  `babelqueue.sqs` logger. A message without a receipt handle is not released (warning); one
+  without a receive count is released but its attempts cannot advance (warning).
+  **Poison-loop risk:** a message that always fails is redelivered immediately until
+  `max_attempts` — configure a native SQS `RedrivePolicy` (`maxReceiveCount` ≥ `max_attempts`) as
+  the backstop and a non-zero `retry_backoff` where needed. A shutdown release also counts as a
+  receive on SQS, so keep `shutdown_timeout` above the longest handler time.
+- Delivery semantics are documented as **at-least-once**: a handler that finishes right as the
+  shutdown deadline fires may be released and run again.
+- The SQS, Kafka, Pulsar, Azure Service Bus and Artemis transports' header/property projections
+  read the envelope without logging a false forbidden-key drop (the body is sent unchanged).
+
+### Fixed
+- The five forbidden envelope keys (`timestamp`, `meta.max_retries`, `meta.attempts`,
+  `meta.source`, `meta.ts` — message-envelope §10) are dropped on decode with a warning on the
+  `babelqueue.codec` logger, and never written on encode. **Transitional:** encode currently drops
+  them with a warning; a future MINOR (K-15 / R1-E0) will reject them instead. A raw-body release
+  republish now strips them too (a clean body is re-sent byte for byte); DLQ redrive still restores
+  the original bytes unchanged.
+- `BabelQueue.stop()` called before `consume()` starts is now honoured instead of being cleared.
+- A failed acknowledgement of an already-processed message (e.g. SQS `DeleteMessage` after a
+  successful handler, an unknown-URN `DELETE`, or a dead-letter publish) is no longer treated as a
+  handler failure: the message is **not** released or retried; the failure is logged at `ERROR`
+  on the new `babelqueue.app` logger and the broker redelivers it on its own (SQS: after the
+  visibility timeout). The consume loop keeps running.
+
 ## [1.13.0] - 2026-06-21
 
 ### Added

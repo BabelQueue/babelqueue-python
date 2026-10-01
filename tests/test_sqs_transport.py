@@ -7,13 +7,15 @@ unless ``boto3`` + a reachable endpoint are present (CI runs it).
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import os
 import unittest
 import uuid
 
-from babelqueue import BabelQueue, EnvelopeCodec
+from babelqueue import BabelQueue, EnvelopeCodec, UnknownUrnStrategy
 from babelqueue.sqs_transport import SqsTransport
-from babelqueue.transport import HeaderPublisher, ReceivedMessage, make_transport
+from babelqueue.transport import HeaderPublisher, ReceivedMessage, Redeliverer, make_transport
 
 
 class FakeSQS:
@@ -23,6 +25,8 @@ class FakeSQS:
         self.visible: dict[str, list[dict]] = {}
         self.sent: list[dict] = []
         self.deleted: list[str] = []
+        self.visibility_changes: list[dict] = []
+        self.inflight: dict[str, tuple[str, dict]] = {}
         self.get_url_calls = 0
         self.last_receive: dict | None = None
         self.err = err
@@ -57,12 +61,27 @@ class FakeSQS:
         q = self.visible.get(kw["QueueUrl"], [])
         if not q:
             return {}
-        return {"Messages": [q.pop(0)]}
+        msg = q.pop(0)
+        self.inflight[msg["ReceiptHandle"]] = (kw["QueueUrl"], msg)
+        return {"Messages": [msg]}
+
+    def change_message_visibility(self, **kw):
+        """Make an in-flight message visible again (timing is not simulated); like SQS, the
+        redelivery bumps ApproximateReceiveCount and the body is untouched."""
+        if self.err:
+            raise self.err
+        self.visibility_changes.append(kw)
+        url, msg = self.inflight.pop(kw["ReceiptHandle"])
+        count = int((msg.get("Attributes") or {}).get("ApproximateReceiveCount", "1"))
+        redelivered = dict(msg, Attributes={"ApproximateReceiveCount": str(count + 1)})
+        self.visible.setdefault(url, []).append(redelivered)
+        return {}
 
     def delete_message(self, **kw):
         if self.err:
             raise self.err
         self.deleted.append(kw["ReceiptHandle"])
+        self.inflight.pop(kw["ReceiptHandle"], None)
         return {}
 
     def seed(self, url: str, body: str, receive_count: int) -> None:
@@ -74,6 +93,28 @@ class FakeSQS:
                 "Attributes": {"ApproximateReceiveCount": str(receive_count)},
             }
         )
+
+
+class FailingDeleteSQS(FakeSQS):
+    """FakeSQS whose ``DeleteMessage`` fails (e.g. an expired receipt handle / missing IAM grant)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.delete_attempts = 0
+
+    def delete_message(self, **kw):
+        self.delete_attempts += 1
+        raise RuntimeError("DeleteMessage denied")
+
+
+@contextlib.contextmanager
+def _no_warnings(case: unittest.TestCase, name: str):
+    """``assertNoLogs`` for Python 3.9 (it only exists from 3.10): a sentinel record keeps
+    ``assertLogs`` from failing, and must be the only one captured."""
+    with case.assertLogs(name, level="WARNING") as cm:
+        yield
+        logging.getLogger(name).warning("sentinel")
+    case.assertEqual(cm.output, [f"WARNING:{name}:sentinel"])
 
 
 def _attr(sent: dict, key: str) -> str:
@@ -224,6 +265,207 @@ class SqsTransportUnitTest(unittest.TestCase):
         self.assertEqual(seen["data"]["order_id"], 7)
         self.assertEqual(seen["meta"]["id"], msg_id)
         self.assertEqual(len(fake.deleted), 1)  # acked/deleted
+
+    # -- R0-C4(a): release via ChangeMessageVisibility (§3.5) ---------------
+
+    def test_transport_is_a_redeliverer(self):
+        tr, _ = self._tr()
+        self.assertIsInstance(tr, Redeliverer)
+
+    def test_redeliver_changes_visibility_and_keeps_message(self):
+        tr, fake = self._tr()
+        tr.publish("orders", EnvelopeCodec.encode(EnvelopeCodec.make("urn:babel:o:c", {"a": 1})))
+        msg = tr.pop("orders", timeout=0)
+        assert msg is not None
+        tr.redeliver(msg, "ignored-body", 45)
+
+        self.assertEqual(
+            fake.visibility_changes,
+            [{"QueueUrl": "http://fake/orders", "ReceiptHandle": msg.handle, "VisibilityTimeout": 45}],
+        )
+        self.assertEqual(fake.deleted, [])  # never deleted
+        self.assertEqual(len(fake.sent), 1)  # no copy sent
+        again = tr.pop("orders", timeout=0)
+        assert again is not None
+        self.assertEqual(EnvelopeCodec.decode(again.body)["attempts"], 1)  # broker-counted
+
+    def test_redeliver_clamps_visibility_timeout(self):
+        tr, fake = self._tr()
+        for delay in (-5, 99999, 2.9):
+            fake.seed("http://fake/orders", '{"job":"u","attempts":0}', 1)
+            msg = tr.pop("orders", timeout=0)
+            assert msg is not None
+            tr.redeliver(msg, msg.body, delay)
+            tr.pop("orders", timeout=0)  # drain the redelivered copy
+        self.assertEqual([c["VisibilityTimeout"] for c in fake.visibility_changes], [0, 43200, 2])
+
+    def test_redeliver_clamps_out_of_range_delays_with_a_warning(self):
+        tr, fake = self._tr()
+        cases = [(float("inf"), 43200), (float("-inf"), 0), (float("nan"), 0), (-1, 0), (50000, 43200)]
+        for delay, expected in cases:
+            with self.subTest(delay=delay):
+                fake.seed("http://fake/orders", '{"job":"u","attempts":0}', 1)
+                msg = tr.pop("orders", timeout=0)
+                assert msg is not None
+                with self.assertLogs("babelqueue.sqs", level="WARNING"):
+                    tr.redeliver(msg, msg.body, delay)  # never raises (no OverflowError)
+                self.assertEqual(fake.visibility_changes[-1]["VisibilityTimeout"], expected)
+                tr.pop("orders", timeout=0)
+
+    def test_redeliver_in_range_delay_does_not_warn(self):
+        tr, fake = self._tr()
+        fake.seed("http://fake/orders", '{"job":"u","attempts":0}', 1)
+        msg = tr.pop("orders", timeout=0)
+        assert msg is not None
+        with _no_warnings(self, "babelqueue.sqs"):
+            tr.redeliver(msg, msg.body, 3600)
+        self.assertEqual(fake.visibility_changes[-1]["VisibilityTimeout"], 3600)
+
+    def test_redeliver_without_receive_count_still_changes_visibility(self):
+        tr, fake = self._tr()
+        fake.visible["http://fake/orders"] = [{"Body": "orig", "ReceiptHandle": "rh-x"}]
+        msg = tr.pop("orders", timeout=0)
+        assert msg is not None
+        with self.assertLogs("babelqueue.sqs", level="WARNING") as logs:
+            tr.redeliver(msg, "advanced-copy", 3600)
+
+        self.assertIn("ApproximateReceiveCount", logs.output[0])
+        self.assertEqual(fake.visibility_changes[-1]["VisibilityTimeout"], 3600)
+        self.assertEqual(fake.sent, [])  # never re-sent
+        self.assertEqual(fake.deleted, [])  # never deleted
+
+    def test_redeliver_on_fifo_changes_visibility_no_copy(self):
+        tr, fake = self._tr(fifo=True)
+        fake.seed("http://fake/orders.fifo", '{"job":"u","attempts":0}', 1)
+        msg = tr.pop("orders.fifo", timeout=0)
+        assert msg is not None
+        tr.redeliver(msg, "advanced-copy", 30)
+        self.assertEqual(fake.visibility_changes[-1]["VisibilityTimeout"], 30)
+        self.assertEqual(fake.sent, [])  # no dedup-id copy that SQS could swallow
+        self.assertEqual(fake.deleted, [])
+
+    def test_redeliver_without_receipt_handle_sends_nothing(self):
+        tr, fake = self._tr()
+        msg = ReceivedMessage(body="b", queue="orders", handle=None)
+        with self.assertLogs("babelqueue.sqs", level="WARNING"):
+            tr.redeliver(msg, "advanced-copy", 0)
+        self.assertEqual((fake.sent, fake.deleted, fake.visibility_changes), ([], [], []))
+
+    def test_projection_does_not_log_forbidden_key_drop(self):
+        """The body is sent unchanged, so the attribute/dedup projection must not claim to
+        have dropped a forbidden key."""
+        tr, fake = self._tr(fifo=True)
+        env = EnvelopeCodec.make("urn:babel:o:c", {})
+        raw = EnvelopeCodec.encode(env)[:-1] + ',"timestamp":1}'
+        with _no_warnings(self, "babelqueue.codec"):
+            tr.publish("orders.fifo", raw)
+        self.assertEqual(fake.sent[-1]["MessageBody"], raw)
+        self.assertEqual(fake.sent[-1]["MessageDeduplicationId"], env["meta"]["id"])
+
+    def test_app_retry_defaults_to_immediate_visibility_release(self):
+        fake = FakeSQS()
+        tr = SqsTransport("sqs://", client=fake, queue_url_prefix="http://fake")
+        app = BabelQueue(transport=tr, queue="orders", max_attempts=2)
+
+        @app.handler("urn:babel:orders:created")
+        def _on(data, meta):
+            raise RuntimeError("always")
+
+        app.publish("urn:babel:orders:created", {"order_id": 1})
+        app.consume("orders", max_messages=2, timeout=0)
+
+        self.assertEqual([c["VisibilityTimeout"] for c in fake.visibility_changes], [0])
+        self.assertEqual(len(fake.sent), 1)  # never re-sent; 2nd failure exhausts -> ack
+
+    def test_app_retry_releases_with_backoff_not_republish(self):
+        fake = FakeSQS()
+        tr = SqsTransport("sqs://", client=fake, queue_url_prefix="http://fake")
+        app = BabelQueue(transport=tr, queue="orders", max_attempts=3, retry_backoff=30)
+        calls: list[int] = []
+
+        @app.handler("urn:babel:orders:created")
+        def _on(data, meta, envelope):
+            calls.append(envelope["attempts"])
+            if len(calls) < 2:
+                raise RuntimeError("transient")
+
+        app.publish("urn:babel:orders:created", {"order_id": 1})
+        app.consume("orders", max_messages=2, timeout=0)
+
+        self.assertEqual(calls, [0, 1])  # second delivery counted by the broker
+        self.assertEqual(len(fake.sent), 1)  # the retry did not publish a copy
+        self.assertEqual(len(fake.visibility_changes), 1)
+        self.assertEqual(fake.visibility_changes[0]["VisibilityTimeout"], 30)
+        self.assertEqual(fake.deleted, [fake.visibility_changes[0]["ReceiptHandle"]])
+
+    def test_app_unknown_urn_release_uses_visibility(self):
+        fake = FakeSQS()
+        tr = SqsTransport("sqs://", client=fake, queue_url_prefix="http://fake")
+        app = BabelQueue(
+            transport=tr,
+            queue="orders",
+            on_unknown_urn=UnknownUrnStrategy.RELEASE,
+            unknown_urn_release_delay=120,
+        )
+        app.publish("urn:babel:nobody:listens", {})
+        app.consume("orders", max_messages=1, timeout=0)
+
+        self.assertEqual(len(fake.sent), 1)  # no re-publish
+        self.assertEqual(fake.deleted, [])
+        self.assertEqual(fake.visibility_changes[0]["VisibilityTimeout"], 120)
+        self.assertEqual(len(fake.visible["http://fake/orders"]), 1)  # still on the queue
+
+
+    # -- A failed DeleteMessage after success is not a handler failure ------
+
+    def _failing_delete_app(self, **kw):
+        fake = FailingDeleteSQS()
+        tr = SqsTransport("sqs://", client=fake, queue_url_prefix="http://fake")
+        return BabelQueue(transport=tr, queue="orders", **kw), fake
+
+    def test_app_failed_delete_after_success_is_not_released(self):
+        app, fake = self._failing_delete_app(max_attempts=3)
+        calls: list[int] = []
+
+        @app.handler("urn:babel:orders:created")
+        def _on(data, meta):
+            calls.append(1)
+
+        app.publish("urn:babel:orders:created", {"order_id": 1})
+        with self.assertLogs("babelqueue.app", level="ERROR") as cm:
+            processed = app.consume("orders", max_messages=1, timeout=0)
+
+        self.assertEqual(processed, 1)  # the loop survives
+        self.assertEqual(calls, [1])  # handled once, not retried
+        self.assertEqual(fake.delete_attempts, 1)
+        self.assertEqual(fake.visibility_changes, [])  # NOT released (no immediate redelivery)
+        self.assertEqual(len(fake.sent), 1)  # NOT re-published / dead-lettered
+        self.assertEqual(len(cm.records), 1)
+        self.assertIn("Failed to acknowledge a processed message", cm.output[0])
+        self.assertIsNotNone(cm.records[0].exc_info)  # the broker error is attached
+
+    def test_app_failed_delete_on_unknown_urn_delete_is_not_released(self):
+        app, fake = self._failing_delete_app(on_unknown_urn=UnknownUrnStrategy.DELETE)
+        app.publish("urn:babel:nobody:listens", {})
+        with self.assertLogs("babelqueue.app", level="ERROR"):
+            app.consume("orders", max_messages=1, timeout=0)
+        self.assertEqual(fake.delete_attempts, 1)
+        self.assertEqual(fake.visibility_changes, [])
+        self.assertEqual(len(fake.sent), 1)
+
+    def test_app_failed_delete_after_dead_letter_is_not_released(self):
+        app, fake = self._failing_delete_app(max_attempts=1, dead_letter=True)
+
+        @app.handler("urn:babel:orders:created")
+        def _on(data, meta):
+            raise RuntimeError("always")
+
+        app.publish("urn:babel:orders:created", {"order_id": 1})
+        with self.assertLogs("babelqueue.app", level="ERROR"):
+            app.consume("orders", max_messages=1, timeout=0)
+        dlq = [m for m in fake.sent if m["QueueUrl"].endswith("orders.dlq")]
+        self.assertEqual(len(dlq), 1)  # dead-lettered exactly once
+        self.assertEqual(fake.visibility_changes, [])  # and not released on top of that
 
     # -- ADR-0028: traceparent on MessageAttributes ------------------------
 

@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .codec import EnvelopeCodec
+from .codec import EnvelopeCodec, parse_envelope
 from .transport import ReceivedMessage, Transport
 
 JMS_TYPE_ANNOTATION = "x-opt-jms-type"
@@ -105,7 +105,7 @@ class ArtemisTransport(Transport):
         by the x-opt-jms-type annotation, trace_id by correlation-id). The names use UNDERSCORES,
         not hyphens: a JMS property name must be a valid Java identifier, and every Artemis SDK
         uses the same JMS-legal form for cross-protocol parity."""
-        env = EnvelopeCodec.decode(body)
+        env = parse_envelope(body)
         if not env:
             return {}
         meta = env.get("meta") or {}
@@ -121,18 +121,18 @@ class ArtemisTransport(Transport):
 
     @staticmethod
     def _jms_type(body: str) -> str:
-        env = EnvelopeCodec.decode(body)
+        env = parse_envelope(body)
         return str(env["job"]) if env and env.get("job") else ""
 
     @staticmethod
     def _correlation_id(body: str) -> str:
-        env = EnvelopeCodec.decode(body)
+        env = parse_envelope(body)
         return str(env["trace_id"]) if env and env.get("trace_id") else ""
 
     @staticmethod
     def _creation_seconds(body: str) -> Optional[float]:
         """proton's creation_time is float seconds; the contract's created_at is epoch ms."""
-        env = EnvelopeCodec.decode(body)
+        env = parse_envelope(body)
         meta = (env or {}).get("meta") or {}
         created_at = meta.get("created_at")
         if created_at is None:

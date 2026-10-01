@@ -29,9 +29,9 @@ from .outbox import (
 from .exceptions import BabelQueueError, DecryptError, UnknownUrnError
 from .replay import HEADER_REPLAY_BYPASS, bypass_external_effects, is_replay
 from .routing import UnknownUrnStrategy
-from .transport import HeaderPublisher, InMemoryTransport, ReceivedMessage, Transport
+from .transport import HeaderPublisher, InMemoryTransport, ReceivedMessage, Redeliverer, Transport
 
-__version__ = "1.13.0"
+__version__ = "1.14.0"
 
 __all__ = [
     "BabelQueue",
@@ -45,6 +45,7 @@ __all__ = [
     "InMemoryTransport",
     "ReceivedMessage",
     "HeaderPublisher",
+    "Redeliverer",
     "BabelQueueError",
     "UnknownUrnError",
     "DecryptError",

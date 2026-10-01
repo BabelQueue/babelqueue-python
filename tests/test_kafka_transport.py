@@ -29,6 +29,21 @@ def header_map(headers):
     return {k: (v.decode("utf-8") if isinstance(v, (bytes, bytearray)) else v) for k, v in headers}
 
 
+def _with_forbidden_key(raw: str) -> str:
+    """``raw`` plus a forbidden top-level key (message-envelope.md §10), as a legacy producer sends."""
+    return raw[:-1] + ',"timestamp":1}'
+
+
+def _assert_no_codec_warnings(case: unittest.TestCase, fn) -> None:
+    """Run ``fn`` and assert the codec logged nothing (``assertNoLogs`` needs Python 3.10+)."""
+    import logging
+
+    with case.assertLogs("babelqueue.codec", level="WARNING") as cm:
+        fn()
+        logging.getLogger("babelqueue.codec").warning("sentinel")
+    case.assertEqual(cm.output, ["WARNING:babelqueue.codec:sentinel"])
+
+
 class FakeMessage:
     def __init__(self, value, headers=None, err=None) -> None:
         self._value = value
@@ -126,6 +141,14 @@ class KafkaPublishTest(unittest.TestCase):
         self.assertEqual(rec["value"], raw.encode("utf-8"))
         self.assertEqual(rec["timestamp"], env["meta"]["created_at"])
         self.assertEqual(header_map(rec["headers"])["bq-job"], URN)
+
+    def test_publish_does_not_log_a_forbidden_key_drop(self):
+        # The value is sent unchanged, so the header/timestamp projection must not claim a drop.
+        raw = _with_forbidden_key(body())
+        producer = FakeProducer()
+        _assert_no_codec_warnings(self, lambda: transport(producer=producer).publish("orders", raw))
+        self.assertEqual(producer.produced[0]["value"], raw.encode("utf-8"))
+        self.assertEqual(header_map(producer.produced[0]["headers"])["bq-job"], URN)
 
 
 class KafkaConsumeTest(unittest.TestCase):

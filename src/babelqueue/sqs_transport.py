@@ -10,6 +10,13 @@ and correlate on ``bq-trace-id`` without parsing the body. Consuming uses the
 visibility-timeout reservation model (``receive_message`` -> process ->
 ``delete_message``); the authoritative attempt count is the broker's
 ``ApproximateReceiveCount``, reconciled onto the envelope as ``attempts = count - 1``.
+Releasing a message for retry (handler failure, unknown-URN ``release``, graceful shutdown)
+always uses ``ChangeMessageVisibility(VisibilityTimeout=backoff)`` on the received message — it
+is never deleted and never re-sent, and the broker keeps counting deliveries (§3.5). The default
+backoff is 0 s (immediate redelivery). Because every release bumps ``ApproximateReceiveCount``, a
+message that always fails loops until the SDK's ``max_attempts`` dead-letters it; configure a
+native ``RedrivePolicy`` (``maxReceiveCount``) on the queue as the broker-side backstop against
+poison-message loops. A shutdown release counts as a delivery too.
 
 Out-of-band transport headers (e.g. a W3C ``traceparent`` for cross-hop span linkage, ADR-0028)
 ride the native SQS ``MessageAttributes`` (String) beside the contract ``bq-*`` attributes (the
@@ -29,11 +36,39 @@ transport directly and pass it via ``BabelQueue(transport=...)``.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+import logging
+from typing import Any, Dict, Optional, Set
 from urllib.parse import parse_qs, urlsplit
 
-from .codec import EnvelopeCodec
+from .codec import EnvelopeCodec, parse_envelope
 from .transport import ReceivedMessage, Transport
+
+#: SQS's upper bound for ``ChangeMessageVisibility`` (12 hours).
+MAX_VISIBILITY_TIMEOUT = 43200
+
+logger = logging.getLogger("babelqueue.sqs")
+
+
+def _visibility_seconds(delay: float) -> int:
+    """Clamp a backoff in seconds onto SQS's 0..43200 integer visibility range.
+
+    A value above 43200 (including ``inf``) is clamped to 43200, a negative one (including
+    ``-inf``) to 0, and a non-numeric one or ``nan`` to 0 — each with a ``WARNING``, so an
+    out-of-range release delay is never silently altered. Fractions are truncated."""
+    try:
+        seconds = int(delay)
+    except OverflowError:  # +/-inf
+        seconds = MAX_VISIBILITY_TIMEOUT if delay > 0 else 0
+    except (ValueError, TypeError):  # nan, garbage
+        logger.warning("Invalid SQS release delay %r; using 0 s.", delay)
+        return 0
+    clamped = max(0, min(seconds, MAX_VISIBILITY_TIMEOUT))
+    if delay < 0 or delay > MAX_VISIBILITY_TIMEOUT:
+        logger.warning(
+            "SQS release delay %r s is outside 0..%d; clamped to %d s.",
+            delay, MAX_VISIBILITY_TIMEOUT, clamped,
+        )
+    return clamped
 
 
 class SqsTransport(Transport):
@@ -65,6 +100,9 @@ class SqsTransport(Transport):
         self._message_group_id = message_group_id or _q1(q, "group_id")
         self._content_dedup = content_dedup or _qbool(q, "content_dedup")
         self._urls: Dict[str, str] = {}
+        # Receipt handles whose delivery did NOT report ApproximateReceiveCount: their release
+        # still uses ChangeMessageVisibility, but attempts cannot advance — warned on release.
+        self._uncounted_handles: Set[str] = set()
 
         if client is not None:
             self._sqs = client
@@ -100,10 +138,9 @@ class SqsTransport(Transport):
     def _attributes(body: str) -> Dict[str, Dict[str, str]]:
         """Project the envelope's contract fields onto SQS MessageAttributes — a
         redundant, routable view of the body (the body stays authoritative)."""
-        try:
-            env: Dict[str, Any] = EnvelopeCodec.decode(body)
-        except (ValueError, TypeError):  # pragma: no cover - decode is defensive
-            return {}
+        # A read-only projection: parse without the forbidden-key drop/warning (the body is
+        # sent unchanged, so logging a "dropped" key here would be false).
+        env: Dict[str, Any] = parse_envelope(body)
         meta = env.get("meta") or {}
 
         def s(v: Any) -> Dict[str, str]:
@@ -159,7 +196,7 @@ class SqsTransport(Transport):
             return body
         if rc <= 1:
             return body
-        env = EnvelopeCodec.decode(body)
+        env = parse_envelope(body)
         if not env:
             return body
         native = rc - 1
@@ -187,7 +224,7 @@ class SqsTransport(Transport):
         if self._fifo:
             params["MessageGroupId"] = self._message_group_id or queue
             if not self._content_dedup:
-                msg_id = (EnvelopeCodec.decode(body).get("meta") or {}).get("id")
+                msg_id = (parse_envelope(body).get("meta") or {}).get("id")
                 if msg_id:
                     params["MessageDeduplicationId"] = msg_id
         self._sqs.send_message(**params)
@@ -217,15 +254,54 @@ class SqsTransport(Transport):
         if receive_count is not None:
             body = self._reconcile(body, receive_count)
         headers = _message_attribute_headers(msg.get("MessageAttributes"))
-        return ReceivedMessage(
-            body=body, queue=queue, handle=msg.get("ReceiptHandle"), headers=headers
-        )
+        handle = msg.get("ReceiptHandle")
+        if handle and receive_count is None:
+            self._uncounted_handles.add(handle)
+        return ReceivedMessage(body=body, queue=queue, handle=handle, headers=headers)
 
     def ack(self, message: ReceivedMessage) -> None:
         if not message.handle:
             return
+        self._uncounted_handles.discard(message.handle)
         self._sqs.delete_message(
             QueueUrl=self._resolve_url(message.queue), ReceiptHandle=message.handle
+        )
+
+    def redeliver(self, message: ReceivedMessage, body: str, delay: float) -> None:
+        """Release ``message`` for redelivery after ``delay`` seconds (broker-bindings.md §3.5;
+        :class:`~babelqueue.transport.Redeliverer`).
+
+        Always ``ChangeMessageVisibility(VisibilityTimeout=delay)`` on the received message —
+        clamped to SQS's 0..43200 s with a ``WARNING`` when the delay had to change — and the
+        message is NOT deleted and ``body`` is NOT sent: SQS's ``ApproximateReceiveCount`` is the
+        attempt counter. Every release therefore counts as a delivery, including a graceful
+        shutdown release; pair the SDK's ``max_attempts`` with a queue ``RedrivePolicy``
+        (``maxReceiveCount``) to bound poison-message loops.
+
+        If the delivery did not report ``ApproximateReceiveCount`` the release still happens, but
+        ``attempts`` cannot advance (a ``WARNING`` says so). A message without a receipt handle
+        cannot be released at all: nothing is sent (a copy would duplicate it, since the original
+        cannot be deleted either) and it reappears once the queue's visibility timeout expires.
+        """
+        handle = message.handle
+        if not handle:
+            logger.warning(
+                "SQS message on %r has no receipt handle; it cannot be released and will "
+                "reappear after the queue's visibility timeout.",
+                message.queue,
+            )
+            return
+        if handle in self._uncounted_handles:
+            self._uncounted_handles.discard(handle)
+            logger.warning(
+                "SQS delivery on %r did not report ApproximateReceiveCount; the release cannot "
+                "advance attempts — rely on the queue's RedrivePolicy to stop a poison loop.",
+                message.queue,
+            )
+        self._sqs.change_message_visibility(
+            QueueUrl=self._resolve_url(message.queue),
+            ReceiptHandle=handle,
+            VisibilityTimeout=_visibility_seconds(delay),
         )
 
 

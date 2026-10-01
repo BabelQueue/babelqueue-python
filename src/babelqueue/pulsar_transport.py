@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .codec import EnvelopeCodec
+from .codec import EnvelopeCodec, parse_envelope
 from .transport import ReceivedMessage, Transport
 
 
@@ -108,7 +108,7 @@ class PulsarTransport(Transport):
     def _projection(body: str) -> Dict[str, str]:
         """Native Pulsar message properties (string->string) — a redundant, routable view of
         the body: bq-job/bq-trace-id/bq-message-id + bq-schema-version/lang/attempts. §5.2."""
-        env = EnvelopeCodec.decode(body)
+        env = parse_envelope(body)
         if not env:
             return {}
         meta = env.get("meta") or {}
