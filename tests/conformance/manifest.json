@@ -68,6 +68,80 @@
       "reason": "no 'job' or 'urn' — the message has no identity"
     }
   ],
+  "idempotency": {
+    "description": "Consumer idempotency conformance (ADR-0022). Broker-free: locks the seen-set dedupe contract every SDK's optional idempotency helper (Go idempotency.Wrap, PHP Idempotent::wrap, Python idempotency.wrap, Node Wrap, Java Idempotent.wrap) MUST honour over the frozen schema_version-1 envelope, independent of any transport. The helper does NOT touch the wire envelope — the cases above stay byte-identical; this block governs the consume-side decision (run the handler, or skip-and-ack) keyed on meta.id.",
+    "dedup_key": {
+      "description": "The dedupe key is meta.id verbatim — the canonical per-message identity (distinct from trace_id, which spans a causal chain). A consumer MUST key its seen-set on exactly fixtures/order-created.json's meta.id; two deliveries with the same meta.id are the SAME message (a redelivery), even byte-for-byte identical, and dedupe to one effect. trace_id is NOT the key: messages sharing a trace_id but with distinct meta.id are distinct effects.",
+      "envelope_file": "fixtures/order-created.json",
+      "key_field": "meta.id",
+      "expected_key": "f1e2d3c4-b5a6-4789-90ab-cdef01234567"
+    },
+    "sequences": {
+      "description": "Each sequence drives ONE handler wrapped by the SDK's idempotency helper, backed by ONE seen-set store, through an ordered list of deliveries. For each delivery the SDK MUST derive the effect: 'run' = the wrapped handler is invoked (the side-effect fires) and, on its outcome 'ok', the id is remembered; 'skip' = an already-remembered id is recognised, the handler is NOT invoked, and the delivery is acked (the runtime stops redelivering). 'outcome' is the handler's result for a 'run' delivery: 'ok' = returns/acks (remembered), 'throw' = raises/errors (the id is left UNMARKED so a later redelivery runs it again — retry/DLQ still apply). After replaying the whole sequence, total 'run'+'ok' invocations MUST equal expected_effects. This is at-least-once delivery collapsed to an exactly-once EFFECT by the consumer; it is seen-set post-success dedupe, NOT exactly-once delivery and NOT an in-flight concurrency lock.",
+      "cases": [
+        {
+          "name": "duplicate-delivery-runs-once",
+          "description": "The same meta.id delivered twice (a textbook at-least-once redelivery): first runs the effect, second is skipped. One effect.",
+          "deliveries": [
+            { "meta_id": "id-A", "expect_effect": "run",  "outcome": "ok" },
+            { "meta_id": "id-A", "expect_effect": "skip" }
+          ],
+          "expected_effects": 1
+        },
+        {
+          "name": "at-least-once-redelivery-is-noop",
+          "description": "Three redeliveries of one id (a flaky broker / worker-crash-before-ack storm): the effect fires once; every subsequent redelivery is a no-op skip.",
+          "deliveries": [
+            { "meta_id": "id-A", "expect_effect": "run",  "outcome": "ok" },
+            { "meta_id": "id-A", "expect_effect": "skip" },
+            { "meta_id": "id-A", "expect_effect": "skip" },
+            { "meta_id": "id-A", "expect_effect": "skip" }
+          ],
+          "expected_effects": 1
+        },
+        {
+          "name": "distinct-ids-each-run",
+          "description": "Different meta.ids are different messages — each runs once. Dedupe is per-id, never collapses unrelated messages.",
+          "deliveries": [
+            { "meta_id": "id-A", "expect_effect": "run", "outcome": "ok" },
+            { "meta_id": "id-B", "expect_effect": "run", "outcome": "ok" },
+            { "meta_id": "id-C", "expect_effect": "run", "outcome": "ok" }
+          ],
+          "expected_effects": 3
+        },
+        {
+          "name": "throw-leaves-id-unmarked",
+          "description": "A handler that throws does NOT remember the id, so the next redelivery runs it again (retry semantics survive the guard). The third delivery succeeds and is then deduped on a fourth.",
+          "deliveries": [
+            { "meta_id": "id-A", "expect_effect": "run",  "outcome": "throw" },
+            { "meta_id": "id-A", "expect_effect": "run",  "outcome": "throw" },
+            { "meta_id": "id-A", "expect_effect": "run",  "outcome": "ok" },
+            { "meta_id": "id-A", "expect_effect": "skip" }
+          ],
+          "expected_effects": 3
+        },
+        {
+          "name": "missing-id-fails-open",
+          "description": "A message with no usable meta.id (empty/absent) CANNOT be deduped, so the helper fails open: every delivery runs the handler. The guard never silently drops work it cannot identify.",
+          "deliveries": [
+            { "meta_id": "", "expect_effect": "run", "outcome": "ok" },
+            { "meta_id": "", "expect_effect": "run", "outcome": "ok" }
+          ],
+          "expected_effects": 2
+        },
+        {
+          "name": "forget-allows-rerun",
+          "description": "forget(id) evicts an id from the seen-set, so a later delivery of that id runs again (manual replay / TTL expiry). Locks the third Store method.",
+          "deliveries": [
+            { "meta_id": "id-A", "expect_effect": "run",  "outcome": "ok" },
+            { "meta_id": "id-A", "expect_effect": "skip" },
+            { "meta_id": "id-A", "forget_before": true, "expect_effect": "run", "outcome": "ok" }
+          ],
+          "expected_effects": 2
+        }
+      ]
+    }
+  },
   "sqs": {
     "description": "Amazon SQS binding conformance (broker-bindings.md §3). Every SDK that ships an SQS transport must satisfy these. The envelope body stays byte-identical (the 'cases' above); these lock the native projection + reconciliation the binding adds. Per-message values reuse fixtures/order-created.json so the expected attributes are deterministic.",
     "attribute_projection": {
@@ -248,6 +322,188 @@
       { "name": "invalid-additional-property", "valid": false, "data": { "order_id": 1, "extra": true } },
       { "name": "invalid-enum", "valid": false, "data": { "order_id": 1, "currency": "GBP" } },
       { "name": "invalid-below-minimum", "valid": false, "data": { "order_id": 0 } }
+    ]
+  },
+  "roundtrip": {
+    "description": "Forward-compatible re-emit (message-envelope.md §4/§8: consumers MUST ignore unknown keys; GR-5). Each case is a decode -> attempts+1 -> encode chain, i.e. what every SDK does on retry/redrive/relay. Decode `file` with the SDK core (it MUST be accepted), increment `attempts` by one, re-encode, then parse the output JSON and assert: `attempts` == `expect_attempts`, and for every entry of `expect_preserved` the value at that RFC 6901 JSON pointer is deep-equal to the given value (same JSON type — an object is never an array). Unknown keys MUST NOT be dropped, renamed or retyped. Key order and whitespace are NOT asserted. `producer_schema_valid: false` marks a consumer-tolerance fixture that intentionally does not pass the producer JSON Schema (like urn-alias); the SDK MUST still accept and re-emit it.",
+    "cases": [
+      {
+        "name": "unknown-meta-roundtrip",
+        "file": "fixtures/unknown-meta-roundtrip.json",
+        "description": "Unknown meta keys (a scalar and a nested object) survive decode -> attempts+1 -> encode with the same values.",
+        "expect_attempts": 1,
+        "expect_preserved": {
+          "/meta/vendor_flag": true,
+          "/meta/vendor_ctx": {
+            "region": "eu-west-1",
+            "hops": [
+              1,
+              2
+            ]
+          },
+          "/meta/lang": "php"
+        }
+      },
+      {
+        "name": "unknown-toplevel-roundtrip",
+        "file": "fixtures/unknown-toplevel-roundtrip.json",
+        "description": "An unknown top-level key survives decode -> attempts+1 -> encode with the same value.",
+        "expect_attempts": 2,
+        "expect_preserved": {
+          "/extra_top": 1
+        }
+      },
+      {
+        "name": "unknown-lang",
+        "file": "fixtures/unknown-lang.json",
+        "description": "A meta.lang outside the known language list (a future/community SDK) is decoded without error and re-emitted unchanged — a consumer MUST NOT reject or rewrite it.",
+        "producer_schema_valid": false,
+        "expect_attempts": 1,
+        "expect_preserved": {
+          "/meta/lang": "cobol"
+        }
+      },
+      {
+        "name": "empty-data-roundtrip",
+        "file": "fixtures/empty-data-roundtrip.json",
+        "description": "An empty-object data survives the round-trip as an object ({}), never as an array ([]).",
+        "expect_attempts": 1,
+        "expect_preserved": {
+          "/data": {}
+        }
+      }
+    ]
+  },
+  "data_shape": {
+    "description": "The `data` block is always a JSON object (message-envelope.md §3, GR-3). `mode: encode` cases build a new envelope with the SDK's producer API from `urn` + `queue` + `data`, then assert the raw JSON text of the emitted `data` value, with insignificant whitespace removed, equals `expect_encoded_data_json` (an empty map MUST encode as {} — never []). `mode: decode` cases decode `file` and assert the SDK's verdict equals `valid` (`valid: false` = the core rejects it: accepts()/decode fails).",
+    "cases": [
+      {
+        "name": "empty-data",
+        "mode": "encode",
+        "urn": "urn:babel:orders:created",
+        "queue": "orders",
+        "data": {},
+        "expect_encoded_data_json": "{}"
+      },
+      {
+        "name": "data-array-rejected",
+        "mode": "decode",
+        "file": "fixtures/data-array-rejected.json",
+        "valid": false,
+        "reason": "data is a JSON array, not an object"
+      }
+    ]
+  },
+  "forbidden_keys": {
+    "description": "Non-canonical keys (message-envelope.md §10). Policy K-15 for R0: decode WARNS, it does not reject (old producers keep working); encode NEVER emits them. For each case: decode `file` — it MUST succeed (`expect: warn`) AND the SDK MUST surface at least one warning (via its logger / warning hook) naming `forbidden_key`. The forbidden key MUST NOT be captured into the unknown-key extras, so re-encoding the decoded message (no other change) MUST NOT contain any pointer in `expect_absent_after_reencode`. All other fields round-trip as usual.",
+    "cases": [
+      {
+        "name": "forbidden-key-timestamp",
+        "file": "fixtures/forbidden-key-timestamp.json",
+        "forbidden_key": "/timestamp",
+        "expect": "warn",
+        "expect_absent_after_reencode": [
+          "/timestamp"
+        ]
+      },
+      {
+        "name": "forbidden-key-meta-max-retries",
+        "file": "fixtures/forbidden-key-meta-max-retries.json",
+        "forbidden_key": "/meta/max_retries",
+        "expect": "warn",
+        "expect_absent_after_reencode": [
+          "/meta/max_retries"
+        ]
+      },
+      {
+        "name": "forbidden-key-meta-attempts",
+        "file": "fixtures/forbidden-key-meta-attempts.json",
+        "forbidden_key": "/meta/attempts",
+        "expect": "warn",
+        "expect_absent_after_reencode": [
+          "/meta/attempts"
+        ]
+      },
+      {
+        "name": "forbidden-key-meta-source",
+        "file": "fixtures/forbidden-key-meta-source.json",
+        "forbidden_key": "/meta/source",
+        "expect": "warn",
+        "expect_absent_after_reencode": [
+          "/meta/source"
+        ]
+      },
+      {
+        "name": "forbidden-key-meta-ts",
+        "file": "fixtures/forbidden-key-meta-ts.json",
+        "forbidden_key": "/meta/ts",
+        "expect": "warn",
+        "expect_absent_after_reencode": [
+          "/meta/ts"
+        ]
+      }
+    ]
+  },
+  "payload_schema_unicode": {
+    "description": "Unicode string length for minLength (ADR-0024, GR-5). Same shape as payload_schema: validate each case's `data` against `schema`; every SDK's payload validator MUST agree on `valid`. Length is the number of Unicode CODE POINTS — not UTF-8 bytes, not UTF-16 code units, not grapheme clusters. maxLength is intentionally absent: no SDK supports it yet (arrives with K-17 in R1).",
+    "schema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "min3": {
+          "type": "string",
+          "minLength": 3
+        },
+        "min2": {
+          "type": "string",
+          "minLength": 2
+        }
+      },
+      "additionalProperties": false
+    },
+    "cases": [
+      {
+        "name": "ascii-3cp-min3",
+        "valid": true,
+        "data": {
+          "min3": "abc"
+        }
+      },
+      {
+        "name": "turkish-2cp-min3",
+        "valid": false,
+        "data": {
+          "min3": "ğü"
+        }
+      },
+      {
+        "name": "turkish-3cp-min3-boundary",
+        "valid": true,
+        "data": {
+          "min3": "ğüş"
+        }
+      },
+      {
+        "name": "emoji-1cp-min2",
+        "valid": false,
+        "data": {
+          "min2": "😀"
+        }
+      },
+      {
+        "name": "emoji-plus-ascii-2cp-min3",
+        "valid": false,
+        "data": {
+          "min3": "😀a"
+        }
+      },
+      {
+        "name": "combining-2cp-min2",
+        "valid": true,
+        "data": {
+          "min2": "e\u0301"
+        }
+      }
     ]
   }
 }
