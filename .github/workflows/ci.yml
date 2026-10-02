@@ -118,7 +118,8 @@ jobs:
       - uses: actions/checkout@v5
       - name: Verify vendored conformance matches the canonical suite
         run: |
-          git clone --depth 1 https://github.com/BabelQueue/conformance.git "$RUNNER_TEMP/conformance"
+          git clone --depth 1 --branch v1.0.0 https://github.com/BabelQueue/conformance.git "$RUNNER_TEMP/conformance"
+          diff -u "$RUNNER_TEMP/conformance/CONFORMANCE_VERSION" "tests/conformance/CONFORMANCE_VERSION"
           diff -ru "$RUNNER_TEMP/conformance/manifest.json" "tests/conformance/manifest.json"
           diff -ru "$RUNNER_TEMP/conformance/fixtures"      "tests/conformance/fixtures"
           diff -ru "$RUNNER_TEMP/conformance/schema"        "tests/conformance/schema"
