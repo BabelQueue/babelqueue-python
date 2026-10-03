@@ -42,7 +42,7 @@ otel = ["opentelemetry-api>=1.20"]
 gdpr = ["cryptography>=42"]
 celery = ["celery>=5"]
 django = ["django>=4.2"]
-dev = ["pytest>=7", "pytest-cov>=4", "mypy>=1.8", "ruff>=0.5,<0.16"]
+dev = ["pytest>=7", "pytest-cov>=4", "mypy>=1.8", "ruff>=0.5,<0.17"]
 
 [project.urls]
 Homepage = "https://babelqueue.com"
