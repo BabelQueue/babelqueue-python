@@ -9,7 +9,7 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
-## [1.14.0] - 2026-10-01
+## [1.14.0] - 2026-10-03
 
 ### Added
 - **Graceful shutdown** of `BabelQueue.consume()`: on SIGTERM/SIGINT the loop sets a stop flag,
