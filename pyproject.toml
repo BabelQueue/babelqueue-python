@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 license-files = ["LICENSE"]
-authors = [{ name = "Muhammet Şafak", email = "info@muhammetsafak.com.tr" }]
+authors = [{ name = "Muhammet Şafak", email = "info@muhammetsafak.com" }]
 keywords = ["queue", "polyglot", "microservices", "json", "envelope", "messaging"]
 classifiers = [
     "Development Status :: 4 - Beta",
