@@ -179,11 +179,11 @@ class PulsarTransport(Transport):
         gate = _parse_gate_route(route_urn)
         env = parse_envelope(body)
         if gate is not None:
-            props = PulsarTransport._projection(body) if env else {}
-            props["bq-schema-version"] = gate[0]
+            gate_props: Dict[str, str] = PulsarTransport._projection(body) if env else {}
+            gate_props["bq-schema-version"] = gate[0]
             if gate[1] is not None:
-                props["bq-job"] = gate[1]
-            return props
+                gate_props["bq-job"] = gate[1]
+            return gate_props
         if not env:
             return {}
         meta = env.get("meta") or {}
@@ -268,7 +268,7 @@ class PulsarTransport(Transport):
 
         current = env.get("attempts")
         has_int_attempts = isinstance(current, int) and not isinstance(current, bool)
-        attempts = current if has_int_attempts else 0
+        attempts: int = current if isinstance(current, int) and has_int_attempts else 0
         from_property = PulsarTransport._parse_attempts(properties.get("bq-attempts"))
         if from_property is not None:
             attempts = from_property
