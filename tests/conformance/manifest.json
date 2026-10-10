@@ -329,7 +329,7 @@
       ]
     },
     "schema_version_gate": {
-      "description": "Consumer-side schema-version gate (broker-bindings.md §6.7). The consumer MUST read the Kafka record header `bq-schema-version` BEFORE decoding the body. Blank means the empty string or only ASCII whitespace (space, \\t, \\n, \\v, \\f, \\r) - the same set in every SDK (GR-5): an absent or blank value falls through to the normal decode path (the body meta.schema_version check still applies afterwards). Otherwise the value is compared as-is, never trimmed: exactly \"1\" decodes, and anything else is rejected WITHOUT decoding (poison/DLQ path) - including \"2\", \"01\", \"x\", values padded with whitespace (\" 1\", \"1 \"), and values made of non-ASCII whitespace (NBSP U+00A0, U+0085, U+3000) or a BOM (U+FEFF), which are NOT blank. A unicode-aware blank check or a trim() before comparing fails these cases. Each case supplies the property 'value' (or 'absent': true) and the 'expect'ed verdict; the message body is always the valid envelope in 'fixture', so a 'reject' verdict can only come from the property gate.",
+      "description": "Consumer-side schema-version gate (broker-bindings.md §6.7). The consumer MUST read the Kafka record header `bq-schema-version` BEFORE decoding the body. Blank means the empty string or only ASCII whitespace (space, \\t, \\n, \\v, \\f, \\r) - the same set in every SDK (GR-5): an absent or blank value falls through to the normal decode path (the body meta.schema_version check still applies afterwards). Otherwise the value is compared as-is, never trimmed: exactly \"1\" decodes, and anything else is rejected WITHOUT decoding (poison/DLQ path) - including \"2\", \"01\", \"x\", values padded with whitespace (\" 1\", \"1 \"), and values made of non-ASCII whitespace (NBSP U+00A0, U+0085, U+3000) or a BOM (U+FEFF), which are NOT blank. A unicode-aware blank check or a trim() before comparing fails these cases. Each case supplies the property 'value' (or 'absent': true) and the 'expect'ed verdict; the message body is always the valid envelope in 'fixture', so a 'reject' verdict can only come from the property gate. A JSON null 'value' stands for a present-but-null Kafka record header (Kafka allows a null header value): it is treated exactly like an absent one (the header carries no version) and decodes, so the runner MUST put the header key into the record with a null value rather than omit it, and an SDK MUST NOT stringify the null (a header whose value became the text \"null\" would be rejected).",
       "property": "bq-schema-version",
       "fixture": "fixtures/order-created.json",
       "cases": [
@@ -350,7 +350,8 @@
         { "value": "\u3000",       "expect": "reject" },
         { "value": "\ufeff",       "expect": "reject" },
         { "value": "\u00a01",      "expect": "reject" },
-        { "value": "1\u3000",      "expect": "reject" }
+        { "value": "1\u3000",      "expect": "reject" },
+        { "value": null,            "expect": "decode" }
       ]
     }
   },
@@ -381,7 +382,7 @@
       ]
     },
     "schema_version_gate": {
-      "description": "Consumer-side schema-version gate (broker-bindings.md §7.7). The consumer MUST read the Artemis application property `bq_schema_version` (underscores, ADR-0017) BEFORE decoding the body. Blank means the empty string or only ASCII whitespace (space, \\t, \\n, \\v, \\f, \\r) - the same set in every SDK (GR-5): an absent or blank value falls through to the normal decode path (the body meta.schema_version check still applies afterwards). Otherwise the value is compared as-is, never trimmed: exactly \"1\" decodes, and anything else is rejected WITHOUT decoding (poison/DLQ path) - including \"2\", \"01\", \"x\", values padded with whitespace (\" 1\", \"1 \"), and values made of non-ASCII whitespace (NBSP U+00A0, U+0085, U+3000) or a BOM (U+FEFF), which are NOT blank. A unicode-aware blank check or a trim() before comparing fails these cases. Each case supplies the property 'value' (or 'absent': true) and the 'expect'ed verdict; the message body is always the valid envelope in 'fixture', so a 'reject' verdict can only come from the property gate.",
+      "description": "Consumer-side schema-version gate (broker-bindings.md §7.7). The consumer MUST read the Artemis application property `bq_schema_version` (underscores, ADR-0017) BEFORE decoding the body. Blank means the empty string or only ASCII whitespace (space, \\t, \\n, \\v, \\f, \\r) - the same set in every SDK (GR-5): an absent or blank value falls through to the normal decode path (the body meta.schema_version check still applies afterwards). Otherwise the value is compared as-is, never trimmed: exactly \"1\" decodes, and anything else is rejected WITHOUT decoding (poison/DLQ path) - including \"2\", \"01\", \"x\", values padded with whitespace (\" 1\", \"1 \"), and values made of non-ASCII whitespace (NBSP U+00A0, U+0085, U+3000) or a BOM (U+FEFF), which are NOT blank. A unicode-aware blank check or a trim() before comparing fails these cases. Each case supplies the property 'value' (or 'absent': true) and the 'expect'ed verdict; the message body is always the valid envelope in 'fixture', so a 'reject' verdict can only come from the property gate. A JSON null 'value' stands for a present-but-null application property: it is treated exactly like an absent one (the property carries no version) and decodes, so the runner MUST put the property key into the message with a null value rather than omit it. A reader whose message API cannot carry a null application property MUST skip this case explicitly (and assert that it skips) rather than silently drop it.",
       "property": "bq_schema_version",
       "fixture": "fixtures/order-created.json",
       "cases": [
@@ -402,7 +403,8 @@
         { "value": "\u3000",       "expect": "reject" },
         { "value": "\ufeff",       "expect": "reject" },
         { "value": "\u00a01",      "expect": "reject" },
-        { "value": "1\u3000",      "expect": "reject" }
+        { "value": "1\u3000",      "expect": "reject" },
+        { "value": null,            "expect": "decode" }
       ]
     }
   },

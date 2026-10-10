@@ -52,6 +52,8 @@ class KafkaConformanceTest(unittest.TestCase):
     def _gate_carrier(self, case: dict):
         if "absent" in case:
             return []
+        if case["value"] is None:  # JSON null: header present with a null value == absent (§6.7)
+            return [(self.gate["property"], None)]
         return [(self.gate["property"], case["value"].encode("utf-8"))]
 
     def test_schema_version_gate(self) -> None:
