@@ -17,10 +17,10 @@ jobs:
       matrix:
         python: ['3.9', '3.10', '3.11', '3.12', '3.13']
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
 
@@ -36,9 +36,9 @@ jobs:
     name: Static analysis (ruff + mypy)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Install (dev + all adapters for type context)
@@ -79,10 +79,10 @@ jobs:
         ports:
           - 9324:9324
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -115,7 +115,7 @@ jobs:
     name: Conformance suite in sync
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Verify vendored conformance matches the canonical suite
         run: |
           git clone --depth 1 --branch v1.0.0 https://github.com/BabelQueue/conformance.git "$RUNNER_TEMP/conformance"
