@@ -166,6 +166,31 @@
         { "name": "garbage-count-ignored", "body_attempts": 4, "approximate_receive_count": "not-a-number", "expected_attempts": 4 },
         { "name": "absent-count",          "body_attempts": 3, "approximate_receive_count": null,           "expected_attempts": 3 }
       ]
+    },
+    "schema_version_gate": {
+      "description": "Consumer-side schema-version gate (broker-bindings.md §3.7). The consumer MUST read the SQS message attribute `bq-schema-version` BEFORE decoding the body. Blank means the empty string or only ASCII whitespace (space, \\t, \\n, \\v, \\f, \\r) - the same set in every SDK (GR-5): an absent or blank value falls through to the normal decode path (the body meta.schema_version check still applies afterwards). Otherwise the value is compared as-is, never trimmed: exactly \"1\" decodes, and anything else is rejected WITHOUT decoding (poison/DLQ path) - including \"2\", \"01\", \"x\", values padded with whitespace (\" 1\", \"1 \"), and values made of non-ASCII whitespace (NBSP U+00A0, U+0085, U+3000) or a BOM (U+FEFF), which are NOT blank. A unicode-aware blank check or a trim() before comparing fails these cases. Each case supplies the property 'value' (or 'absent': true) and the 'expect'ed verdict; the message body is always the valid envelope in 'fixture', so a 'reject' verdict can only come from the property gate.",
+      "property": "bq-schema-version",
+      "fixture": "fixtures/order-created.json",
+      "cases": [
+        { "value": "1",             "expect": "decode" },
+        { "value": "",              "expect": "decode" },
+        { "value": " \t",          "expect": "decode" },
+        { "value": " ",             "expect": "decode" },
+        { "value": "\n\u000b\f\r", "expect": "decode" },
+        { "absent": true,          "expect": "decode" },
+        { "value": "2",             "expect": "reject" },
+        { "value": "01",            "expect": "reject" },
+        { "value": "x",             "expect": "reject" },
+        { "value": " 1",            "expect": "reject" },
+        { "value": "1 ",            "expect": "reject" },
+        { "value": "\t1\n",        "expect": "reject" },
+        { "value": "\u00a0",       "expect": "reject" },
+        { "value": "\u0085",       "expect": "reject" },
+        { "value": "\u3000",       "expect": "reject" },
+        { "value": "\ufeff",       "expect": "reject" },
+        { "value": "\u00a01",      "expect": "reject" },
+        { "value": "1\u3000",      "expect": "reject" }
+      ]
     }
   },
   "asb": {
@@ -195,6 +220,35 @@
         { "name": "first-delivery-keeps-body", "body_attempts": 4, "delivery_count": 1, "expected_attempts": 4 },
         { "name": "zero-count-keeps-body",     "body_attempts": 3, "delivery_count": 0, "expected_attempts": 3 }
       ]
+    },
+    "schema_version_gate": {
+      "description": "Consumer-side schema-version gate (broker-bindings.md §4.7). The consumer MUST read the ASB ApplicationProperties entry `bq-schema-version` BEFORE decoding the body. Blank means the empty string or only ASCII whitespace (space, \\t, \\n, \\v, \\f, \\r) - the same set in every SDK (GR-5): an absent or blank value falls through to the normal decode path (the body meta.schema_version check still applies afterwards). Otherwise the value is compared as-is, never trimmed: exactly \"1\" decodes, and anything else is rejected WITHOUT decoding (poison/DLQ path) - including \"2\", \"01\", \"x\", values padded with whitespace (\" 1\", \"1 \"), and values made of non-ASCII whitespace (NBSP U+00A0, U+0085, U+3000) or a BOM (U+FEFF), which are NOT blank. A unicode-aware blank check or a trim() before comparing fails these cases. Each case supplies the property 'value' (or 'absent': true) and the 'expect'ed verdict; the message body is always the valid envelope in 'fixture', so a 'reject' verdict can only come from the property gate. ASB application properties are AMQP-typed, so the JSON-number cases (a number, not a string) stand for a native AMQP number: any AMQP integral type (byte/short/int/long, signed or unsigned) with value 1 decodes; any other numeric value (2, 0, non-integral 1.5) and any other type rejects. JSON numbers carry no width, so a runner MUST exercise integral 1 and 2 at both int32 and int64 width. A floating-point 1.0 is unspecified and not tested.",
+      "property": "bq-schema-version",
+      "fixture": "fixtures/order-created.json",
+      "cases": [
+        { "value": "1",             "expect": "decode" },
+        { "value": "",              "expect": "decode" },
+        { "value": " \t",          "expect": "decode" },
+        { "value": " ",             "expect": "decode" },
+        { "value": "\n\u000b\f\r", "expect": "decode" },
+        { "absent": true,          "expect": "decode" },
+        { "value": "2",             "expect": "reject" },
+        { "value": "01",            "expect": "reject" },
+        { "value": "x",             "expect": "reject" },
+        { "value": " 1",            "expect": "reject" },
+        { "value": "1 ",            "expect": "reject" },
+        { "value": "\t1\n",        "expect": "reject" },
+        { "value": "\u00a0",       "expect": "reject" },
+        { "value": "\u0085",       "expect": "reject" },
+        { "value": "\u3000",       "expect": "reject" },
+        { "value": "\ufeff",       "expect": "reject" },
+        { "value": "\u00a01",      "expect": "reject" },
+        { "value": "1\u3000",      "expect": "reject" },
+        { "value": 1,               "expect": "decode" },
+        { "value": 2,               "expect": "reject" },
+        { "value": 0,               "expect": "reject" },
+        { "value": 1.5,             "expect": "reject" }
+      ]
     }
   },
   "pulsar": {
@@ -221,6 +275,31 @@
         { "name": "first-delivery-keeps-body", "body_attempts": 4, "redelivery_count": 0, "expected_attempts": 4 },
         { "name": "native-equals-body",        "body_attempts": 3, "redelivery_count": 3, "expected_attempts": 3 }
       ]
+    },
+    "schema_version_gate": {
+      "description": "Consumer-side schema-version gate (broker-bindings.md §5.7). The consumer MUST read the Pulsar message property `bq-schema-version` BEFORE decoding the body. Blank means the empty string or only ASCII whitespace (space, \\t, \\n, \\v, \\f, \\r) - the same set in every SDK (GR-5): an absent or blank value falls through to the normal decode path (the body meta.schema_version check still applies afterwards). Otherwise the value is compared as-is, never trimmed: exactly \"1\" decodes, and anything else is rejected WITHOUT decoding (poison/DLQ path) - including \"2\", \"01\", \"x\", values padded with whitespace (\" 1\", \"1 \"), and values made of non-ASCII whitespace (NBSP U+00A0, U+0085, U+3000) or a BOM (U+FEFF), which are NOT blank. A unicode-aware blank check or a trim() before comparing fails these cases. Each case supplies the property 'value' (or 'absent': true) and the 'expect'ed verdict; the message body is always the valid envelope in 'fixture', so a 'reject' verdict can only come from the property gate.",
+      "property": "bq-schema-version",
+      "fixture": "fixtures/order-created.json",
+      "cases": [
+        { "value": "1",             "expect": "decode" },
+        { "value": "",              "expect": "decode" },
+        { "value": " \t",          "expect": "decode" },
+        { "value": " ",             "expect": "decode" },
+        { "value": "\n\u000b\f\r", "expect": "decode" },
+        { "absent": true,          "expect": "decode" },
+        { "value": "2",             "expect": "reject" },
+        { "value": "01",            "expect": "reject" },
+        { "value": "x",             "expect": "reject" },
+        { "value": " 1",            "expect": "reject" },
+        { "value": "1 ",            "expect": "reject" },
+        { "value": "\t1\n",        "expect": "reject" },
+        { "value": "\u00a0",       "expect": "reject" },
+        { "value": "\u0085",       "expect": "reject" },
+        { "value": "\u3000",       "expect": "reject" },
+        { "value": "\ufeff",       "expect": "reject" },
+        { "value": "\u00a01",      "expect": "reject" },
+        { "value": "1\u3000",      "expect": "reject" }
+      ]
     }
   },
   "kafka": {
@@ -245,6 +324,31 @@
         { "name": "header-absent-falls-back",       "body_attempts": 3, "header_attempts": null, "expected_attempts": 3 },
         { "name": "header-authoritative-overrides", "body_attempts": 5, "header_attempts": 1,    "expected_attempts": 1 },
         { "name": "header-higher-than-body",        "body_attempts": 1, "header_attempts": 4,    "expected_attempts": 4 }
+      ]
+    },
+    "schema_version_gate": {
+      "description": "Consumer-side schema-version gate (broker-bindings.md §6.7). The consumer MUST read the Kafka record header `bq-schema-version` BEFORE decoding the body. Blank means the empty string or only ASCII whitespace (space, \\t, \\n, \\v, \\f, \\r) - the same set in every SDK (GR-5): an absent or blank value falls through to the normal decode path (the body meta.schema_version check still applies afterwards). Otherwise the value is compared as-is, never trimmed: exactly \"1\" decodes, and anything else is rejected WITHOUT decoding (poison/DLQ path) - including \"2\", \"01\", \"x\", values padded with whitespace (\" 1\", \"1 \"), and values made of non-ASCII whitespace (NBSP U+00A0, U+0085, U+3000) or a BOM (U+FEFF), which are NOT blank. A unicode-aware blank check or a trim() before comparing fails these cases. Each case supplies the property 'value' (or 'absent': true) and the 'expect'ed verdict; the message body is always the valid envelope in 'fixture', so a 'reject' verdict can only come from the property gate.",
+      "property": "bq-schema-version",
+      "fixture": "fixtures/order-created.json",
+      "cases": [
+        { "value": "1",             "expect": "decode" },
+        { "value": "",              "expect": "decode" },
+        { "value": " \t",          "expect": "decode" },
+        { "value": " ",             "expect": "decode" },
+        { "value": "\n\u000b\f\r", "expect": "decode" },
+        { "absent": true,          "expect": "decode" },
+        { "value": "2",             "expect": "reject" },
+        { "value": "01",            "expect": "reject" },
+        { "value": "x",             "expect": "reject" },
+        { "value": " 1",            "expect": "reject" },
+        { "value": "1 ",            "expect": "reject" },
+        { "value": "\t1\n",        "expect": "reject" },
+        { "value": "\u00a0",       "expect": "reject" },
+        { "value": "\u0085",       "expect": "reject" },
+        { "value": "\u3000",       "expect": "reject" },
+        { "value": "\ufeff",       "expect": "reject" },
+        { "value": "\u00a01",      "expect": "reject" },
+        { "value": "1\u3000",      "expect": "reject" }
       ]
     }
   },
@@ -272,6 +376,31 @@
         { "name": "never-lower-runtime",       "body_attempts": 5, "delivery_count": 1, "expected_attempts": 5 },
         { "name": "first-delivery-keeps-body", "body_attempts": 4, "delivery_count": 0, "expected_attempts": 4 },
         { "name": "native-equals-body",        "body_attempts": 3, "delivery_count": 3, "expected_attempts": 3 }
+      ]
+    },
+    "schema_version_gate": {
+      "description": "Consumer-side schema-version gate (broker-bindings.md §7.7). The consumer MUST read the Artemis application property `bq_schema_version` (underscores, ADR-0017) BEFORE decoding the body. Blank means the empty string or only ASCII whitespace (space, \\t, \\n, \\v, \\f, \\r) - the same set in every SDK (GR-5): an absent or blank value falls through to the normal decode path (the body meta.schema_version check still applies afterwards). Otherwise the value is compared as-is, never trimmed: exactly \"1\" decodes, and anything else is rejected WITHOUT decoding (poison/DLQ path) - including \"2\", \"01\", \"x\", values padded with whitespace (\" 1\", \"1 \"), and values made of non-ASCII whitespace (NBSP U+00A0, U+0085, U+3000) or a BOM (U+FEFF), which are NOT blank. A unicode-aware blank check or a trim() before comparing fails these cases. Each case supplies the property 'value' (or 'absent': true) and the 'expect'ed verdict; the message body is always the valid envelope in 'fixture', so a 'reject' verdict can only come from the property gate.",
+      "property": "bq_schema_version",
+      "fixture": "fixtures/order-created.json",
+      "cases": [
+        { "value": "1",             "expect": "decode" },
+        { "value": "",              "expect": "decode" },
+        { "value": " \t",          "expect": "decode" },
+        { "value": " ",             "expect": "decode" },
+        { "value": "\n\u000b\f\r", "expect": "decode" },
+        { "absent": true,          "expect": "decode" },
+        { "value": "2",             "expect": "reject" },
+        { "value": "01",            "expect": "reject" },
+        { "value": "x",             "expect": "reject" },
+        { "value": " 1",            "expect": "reject" },
+        { "value": "1 ",            "expect": "reject" },
+        { "value": "\t1\n",        "expect": "reject" },
+        { "value": "\u00a0",       "expect": "reject" },
+        { "value": "\u0085",       "expect": "reject" },
+        { "value": "\u3000",       "expect": "reject" },
+        { "value": "\ufeff",       "expect": "reject" },
+        { "value": "\u00a01",      "expect": "reject" },
+        { "value": "1\u3000",      "expect": "reject" }
       ]
     }
   },
