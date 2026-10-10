@@ -9,6 +9,15 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Fixed
+- **Kafka: a record whose settlement raised was silently lost on a consume-loop restart.** When a
+  retry / release / dead-letter `publish` failed (or the loop was otherwise interrupted before
+  `ack`), `consume()` ended with the record neither acked nor rewound while `poll` had already
+  advanced the position; the restarted loop received the *next* record and acking it committed
+  past the unsettled one (Kafka offsets are cumulative). `KafkaTransport` now remembers the
+  record `pop` handed out and re-seeks it on the next `pop` unless it was acked or rewound.
+  No API or wire change.
+
 ## [1.16.0] - 2026-10-10
 
 ### Added

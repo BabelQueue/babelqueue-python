@@ -8,7 +8,9 @@ envelope fields onto native Kafka record headers (UTF-8 byte strings): ``bq-job`
 ``bq-source-lang`` / ``bq-attempts`` — so a Java/.NET/... peer can route on ``bq-job``
 without parsing the body — with the record timestamp mirroring ``meta.created_at``.
 Consuming is process-then-commit: ``poll`` reserves a record (``enable.auto.commit=false``)
-and ``ack`` commits the offset only after the handler returns (at-least-once). Kafka has no
+and ``ack`` commits the offset only after the handler returns (at-least-once). A record that is
+neither acked nor rewound (its settlement raised) is re-sought by the next ``pop``, so a
+restarted consume loop redelivers it instead of committing past it. Kafka has no
 native delivery count, so the ``bq-attempts`` header is the authoritative retry counter (the
 body's ``attempts`` is the fallback for non-BabelQueue producers); the runtime owns retry by
 republishing with attempts+1 and dead-letters to ``<queue>.dlq``.
@@ -66,6 +68,8 @@ class KafkaTransport(Transport):
         self._producer = producer
         self._consumer_factory = consumer_factory
         self._consumers: Dict[str, Any] = {}
+        # Per queue: the record handed out by ``pop`` that has been neither acked nor rewound yet.
+        self._pending: Dict[str, Any] = {}
 
     # -- helpers ------------------------------------------------------------
 
@@ -197,6 +201,7 @@ class KafkaTransport(Transport):
 
     def pop(self, queue: str, timeout: float = 1.0) -> Optional[ReceivedMessage]:
         wait = timeout if timeout and timeout > 0 else 1.0
+        self._rewind_abandoned(queue)
         message = self._consumer(queue).poll(wait)
         if message is None or message.error() is not None:
             return None
@@ -215,18 +220,27 @@ class KafkaTransport(Transport):
                 unsupported,
                 SCHEMA_VERSION,
             )
-            return ReceivedMessage(
+            received = ReceivedMessage(
                 body=self._payload(message),
                 queue=queue,
                 handle=message,
                 route_urn=UNSUPPORTED_SCHEMA_ROUTE_PREFIX + quote(unsupported, safe=""),
             )
+            self._pending[queue] = message
+            return received
         body = self._reconcile(self._payload(message), headers)
-        return ReceivedMessage(body=body, queue=queue, handle=message)
+        received = ReceivedMessage(body=body, queue=queue, handle=message)
+        # Track the record as in flight only once ``pop`` has built it. A decode error above
+        # escapes before this point and must not leave the record pending: the next ``pop`` would
+        # seek back to it and fail identically, wedging the partition forever.
+        self._pending[queue] = message
+        return received
 
     def ack(self, message: ReceivedMessage) -> None:
         if message.handle is None:
             return
+        # Settled: from here on the record is no longer "in flight", whatever the commit does.
+        self._pending.pop(message.queue, None)
         self._consumer(message.queue).commit(message=message.handle, asynchronous=False)
 
     def rewind(self, message: ReceivedMessage) -> None:
@@ -236,6 +250,31 @@ class KafkaTransport(Transport):
         handle = message.handle
         if handle is None:
             return
+        self._seek_back(message.queue, handle)
+        if self._pending.get(message.queue) is handle:
+            del self._pending[message.queue]
+
+    def _rewind_abandoned(self, queue: str) -> None:
+        """Re-seek a record that ``pop`` handed out but that was never acked or rewound.
+
+        That happens when the runtime's settlement raised (a failed retry / DLQ / release
+        ``publish``): ``poll`` has already advanced the in-memory position, so without this the
+        next ``pop`` (a restarted consume loop) would return the *following* record, and acking it
+        would commit past the unsettled one — losing it. Seeking back makes it redeliver instead.
+        """
+        handle = self._pending.get(queue)
+        if handle is None:
+            return
+        try:
+            self._seek_back(queue, handle)
+        except Exception:  # noqa: BLE001 - already logged, naming the record
+            # A seek can only fail here for a partition that is no longer assigned (rebalance); the
+            # group then resets the position to the committed offset, which is that record. Do not
+            # wedge the consumer on it.
+            pass
+        self._pending.pop(queue, None)
+
+    def _seek_back(self, queue: str, handle: Any) -> None:
         try:
             from confluent_kafka import TopicPartition
         except ImportError:  # only reachable with an injected consumer
@@ -244,7 +283,7 @@ class KafkaTransport(Transport):
             TopicPartition = namedtuple("TopicPartition", "topic partition offset")  # type: ignore[misc]
         topic, partition, offset = handle.topic(), handle.partition(), handle.offset()
         try:
-            self._consumer(message.queue).seek(TopicPartition(topic, partition, offset))
+            self._consumer(queue).seek(TopicPartition(topic, partition, offset))
         except Exception:
             # Name the record so an operator can recover it by hand: if the seek fails the
             # commit of a later record on this partition may skip it.

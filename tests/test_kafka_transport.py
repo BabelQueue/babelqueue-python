@@ -427,6 +427,159 @@ class KafkaSchemaVersionGateTest(unittest.TestCase):
         self.assertEqual(got.route_urn, self.PREFIX + "9" * 64 + "...")
 
 
+class KafkaRestartRedeliveryTest(unittest.TestCase):
+    """A record whose settlement raised (a failed retry / DLQ / release ``publish``) must be
+    redelivered by a restarted consume loop — never skipped by committing the record after it."""
+
+    @staticmethod
+    def _down_producer(failures=1):
+        """A producer whose next ``failures`` writes (to any topic) are refused."""
+
+        class DownProducer(FakeProducer):
+            remaining = failures
+
+            def produce(self, topic, value=None, headers=None, timestamp=None, **kw) -> None:
+                if self.remaining > 0:
+                    self.remaining -= 1
+                    raise RuntimeError("broker refused the write")
+                super().produce(topic, value=value, headers=headers, timestamp=timestamp, **kw)
+
+        return DownProducer()
+
+    @staticmethod
+    def _log(*records):
+        consumer = OffsetConsumer(records)
+        return consumer
+
+    def _app(self, producer, consumer, max_attempts=3, **kw):
+        app = BabelQueue(transport=transport(producer, consumer), max_attempts=max_attempts, **kw)
+        app._rewind_pause = 0.0  # noqa: SLF001
+        return app
+
+    def test_failed_retry_publish_is_redelivered_not_skipped_by_the_next_commit(self):
+        first = OffsetMessage(body().encode("utf-8"), [], offset=0)
+        second = OffsetMessage(body().encode("utf-8"), [], offset=1)
+        consumer = self._log(first, second)
+        producer = self._down_producer(failures=1)
+        app = self._app(producer, consumer, dead_letter=True)
+        seen: list = []
+
+        @app.handler(URN)
+        def _on(data, meta):
+            seen.append(meta.get("id"))
+            if len(seen) == 1:
+                raise RuntimeError("handler failure")
+
+        # The retry copy cannot be published: the failure escapes and the loop dies.
+        with self.assertRaises(RuntimeError):
+            app.consume(queue="orders", max_messages=1)
+        self.assertEqual(consumer.commits, [])
+        self.assertEqual(consumer.committed_offset, 0)
+
+        # The loop is restarted on the same consumer: record 0 comes back before record 1.
+        app.consume(queue="orders", max_messages=2)
+        self.assertEqual(consumer.commits, [0, 1])
+        self.assertEqual(len(seen), 3)  # record 0 handled twice, record 1 once
+        self.assertEqual(consumer.seeks, [("orders", 0, 0)])
+
+    def test_undecodable_record_does_not_wedge_the_partition(self):
+        bad = OffsetMessage(b"\xff\xfe bad", [], offset=0)
+        good = OffsetMessage(body().encode("utf-8"), [], offset=1)
+        consumer = self._log(bad, good)
+        kafka = transport(FakeProducer(), consumer)
+
+        # The decode error escapes ``pop`` (as it always has) but must not leave the record
+        # pending, or every later ``pop`` would seek back to it and fail again.
+        with self.assertRaises(UnicodeDecodeError):
+            kafka.pop("orders")
+        message = kafka.pop("orders")
+
+        self.assertIsNotNone(message)
+        self.assertEqual(message.handle.offset(), 1)
+        self.assertEqual(consumer.seeks, [])
+
+    def test_failed_dead_letter_write_is_redelivered_after_restart(self):
+        first = OffsetMessage(b"not json at all", [], offset=0)
+        second = OffsetMessage(body().encode("utf-8"), [], offset=1)
+        consumer = self._log(first, second)
+        producer = self._down_producer(failures=1)
+        app = self._app(producer, consumer, max_attempts=1, dead_letter=True)
+        seen: list = []
+
+        @app.handler(URN)
+        def _on(data, meta):
+            seen.append(data)
+
+        with self.assertRaises(RuntimeError):
+            app.consume(queue="orders", max_messages=1)
+        self.assertEqual(consumer.commits, [])
+
+        app.consume(queue="orders", max_messages=2)  # the DLQ is back
+        self.assertEqual([m["topic"] for m in producer.produced], ["orders.dlq"])
+        dead = EnvelopeCodec.decode(producer.produced[0]["value"].decode("utf-8"))
+        self.assertIn("dead_letter", dead)
+        self.assertEqual(consumer.commits, [0, 1])
+        self.assertEqual(len(seen), 1)
+
+    def test_failed_unknown_urn_dead_letter_is_redelivered_after_restart(self):
+        first = OffsetMessage(body().encode("utf-8"), [], offset=0)
+        consumer = self._log(first)
+        # The strategy's dead-letter write fails, then the generic fallback's write fails too.
+        producer = self._down_producer(failures=2)
+        app = self._app(  # no handler: unknown URN, dead-lettered by strategy
+            producer, consumer, max_attempts=1, dead_letter=True, on_unknown_urn="dead_letter"
+        )
+
+        with self.assertRaises(RuntimeError):
+            app.consume(queue="orders", max_messages=1)
+        self.assertEqual(consumer.commits, [])
+
+        app.consume(queue="orders", max_messages=1)
+        self.assertEqual([m["topic"] for m in producer.produced], ["orders.dlq"])
+        self.assertEqual(consumer.commits, [0])
+
+    def test_acked_record_is_not_rewound_by_the_next_pop(self):
+        consumer = self._log(
+            OffsetMessage(body().encode("utf-8"), [], offset=0),
+            OffsetMessage(body().encode("utf-8"), [], offset=1),
+        )
+        kafka = transport(consumer=consumer)
+        got = kafka.pop("orders")
+        kafka.ack(got)
+        self.assertEqual(kafka.pop("orders").handle.offset(), 1)
+        self.assertEqual(consumer.seeks, [])
+
+    def test_rewound_record_is_not_rewound_a_second_time(self):
+        consumer = self._log(OffsetMessage(body().encode("utf-8"), [], offset=0))
+        kafka = transport(consumer=consumer)
+        kafka.rewind(kafka.pop("orders"))
+        kafka.pop("orders")
+        self.assertEqual(consumer.seeks, [("orders", 0, 0)])
+
+    def test_abandoned_record_is_rewound_on_the_next_pop(self):
+        consumer = self._log(
+            OffsetMessage(body().encode("utf-8"), [], offset=0),
+            OffsetMessage(body().encode("utf-8"), [], offset=1),
+        )
+        kafka = transport(consumer=consumer)
+        kafka.pop("orders")  # neither acked nor rewound: the settlement raised
+        again = kafka.pop("orders")
+        self.assertEqual(again.handle.offset(), 0)
+        self.assertEqual(consumer.seeks, [("orders", 0, 0)])
+
+    def test_failing_seek_does_not_wedge_the_next_pop(self):
+        class BrokenSeek(OffsetConsumer):
+            def seek(self, partition) -> None:
+                raise RuntimeError("partition no longer assigned")
+
+        consumer = BrokenSeek([OffsetMessage(body().encode("utf-8"), [], offset=0)])
+        kafka = transport(consumer=consumer)
+        kafka.pop("orders")
+        with self.assertLogs("babelqueue.kafka", level="ERROR") as logs:
+            self.assertIsNone(kafka.pop("orders"))
+        self.assertIn("orders[0]@0", logs.output[0])
+
+
 class KafkaSchemeTest(unittest.TestCase):
     def test_make_transport_routes_kafka_scheme_lazily(self):
         # Construction is lazy (no client built), so it succeeds with no confluent-kafka.
