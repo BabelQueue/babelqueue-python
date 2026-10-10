@@ -11,7 +11,9 @@ import contextlib
 import logging
 import os
 import unittest
+from urllib.parse import quote
 import uuid
+from unittest import mock
 
 from babelqueue import BabelQueue, EnvelopeCodec, UnknownUrnStrategy
 from babelqueue.sqs_transport import SqsTransport
@@ -526,6 +528,165 @@ class SqsTransportUnitTest(unittest.TestCase):
         except ImportError:
             with self.assertRaises(ImportError):
                 make_transport("sqs://")
+
+
+class SqsSchemaVersionGateTest(unittest.TestCase):
+    """The ``bq-schema-version`` pre-decode gate (broker-bindings.md §3.7 step 3)."""
+
+    URN = "urn:babel:orders:created"
+    QUEUE_URL = "http://fake/orders"
+
+    def _tr(self) -> tuple[SqsTransport, FakeSQS]:
+        fake = FakeSQS()
+        return SqsTransport("sqs://", client=fake, queue_url_prefix="http://fake"), fake
+
+    def _enqueue(self, fake: FakeSQS, raw: str, version=None, receive_count="1") -> None:
+        attributes = None
+        if version is not None:
+            attributes = {"bq-schema-version": {"DataType": "Number", "StringValue": version}}
+        msg = {"Body": raw, "ReceiptHandle": "rh-gate", "MessageAttributes": attributes}
+        if receive_count is not None:
+            msg["Attributes"] = {"ApproximateReceiveCount": receive_count}
+        fake.visible.setdefault(self.QUEUE_URL, []).append(msg)
+
+    def _body(self) -> str:
+        return EnvelopeCodec.encode(EnvelopeCodec.make(self.URN, {"order_id": 1}, queue="orders"))
+
+    def test_missing_or_blank_version_decodes_normally(self):
+        # blank = empty or only ASCII whitespace (space, \t, \n, \v, \f, \r), identical in every SDK
+        for version in (None, "", "  ", "\u000b", "\f", " \t\n\u000b\f\r"):
+            with self.subTest(version=version):
+                tr, fake = self._tr()
+                self._enqueue(fake, self._body(), version, receive_count="3")
+                got = tr.pop("orders", timeout=0)
+                self.assertEqual(got.route_urn, "")
+                self.assertEqual(EnvelopeCodec.decode(got.body)["attempts"], 2)  # reconciled
+
+    def test_message_without_attributes_decodes_normally(self):
+        tr, fake = self._tr()
+        fake.seed(self.QUEUE_URL, self._body(), 1)
+        self.assertEqual(tr.pop("orders", timeout=0).route_urn, "")
+
+    def test_supported_version_is_delivered(self):
+        tr, fake = self._tr()
+        self._enqueue(fake, self._body(), "1", receive_count="2")
+        got = tr.pop("orders", timeout=0)
+        self.assertEqual(got.route_urn, "")
+        self.assertEqual(EnvelopeCodec.decode(got.body)["attempts"], 1)
+
+    def test_unsupported_version_returns_the_route_without_decoding(self):
+        # A body that is not JSON still yields the gate route: a decode error would leave
+        # route_urn empty. The payload reaches the runtime untouched.
+        garbage = "{not json"
+        # NBSP, U+001C, U+0085, U+FEFF and U+3000 are not ASCII whitespace, hence not blank
+        for value in ("2", "x", "01", " 1", "1.0", "-1", "\u00a0", "\u001c", "\u0085", "\ufeff", "\u3000"):
+            with self.subTest(value=value):
+                tr, fake = self._tr()
+                self._enqueue(fake, garbage, value)
+                with mock.patch.object(
+                    EnvelopeCodec, "decode", side_effect=AssertionError("decode must not run")
+                ) as decode:
+                    got = tr.pop("orders", timeout=0)
+                decode.assert_not_called()
+                self.assertEqual(
+                    got.route_urn, "babelqueue:unsupported-schema-version:" + quote(value, safe="")
+                )
+                self.assertEqual(got.body, garbage)
+                self.assertEqual(got.handle, "rh-gate")
+                self.assertEqual(got.queue, "orders")
+
+    def test_long_rejected_version_is_truncated_in_the_route(self):
+        tr, fake = self._tr()
+        self._enqueue(fake, "{not json", "9" * 100)
+        got = tr.pop("orders", timeout=0)
+        self.assertEqual(got.route_urn, "babelqueue:unsupported-schema-version:" + "9" * 64 + "...")
+
+    def test_route_percent_escapes_the_rejected_version(self):
+        tr, fake = self._tr()
+        self._enqueue(fake, "{not json", "2&x=?bq-job=%")
+        got = tr.pop("orders", timeout=0)
+        self.assertEqual(
+            got.route_urn, "babelqueue:unsupported-schema-version:2%26x%3D%3Fbq-job%3D%25"
+        )
+
+    def test_gate_does_not_decode_a_valid_body_either(self):
+        tr, fake = self._tr()
+        raw = self._body()
+        self._enqueue(fake, raw, "2", receive_count="5")  # the attempts reconcile would decode
+        with mock.patch.object(
+            EnvelopeCodec, "decode", side_effect=AssertionError("decode must not run")
+        ):
+            got = tr.pop("orders", timeout=0)
+        self.assertEqual(got.body, raw)  # not reconciled, byte-identical
+        self.assertEqual(got.route_urn, "babelqueue:unsupported-schema-version:2")
+
+    def test_gate_logs_a_warning_naming_the_version_and_queue(self):
+        tr, fake = self._tr()
+        self._enqueue(fake, "{not json", "2")
+        with self.assertLogs("babelqueue.sqs", level="WARNING") as logs:
+            tr.pop("orders", timeout=0)
+        self.assertIn("'2'", logs.output[0])
+        self.assertIn("'orders'", logs.output[0])
+
+    def test_supported_version_does_not_log(self):
+        tr, fake = self._tr()
+        self._enqueue(fake, self._body(), "1")
+        with _no_warnings(self, "babelqueue.sqs"):
+            tr.pop("orders", timeout=0)
+
+    def test_app_dead_letters_unsupported_version_once_attempts_are_exhausted(self):
+        # max_attempts > 1: a gated message is dead-lettered directly, never retried
+        for value in ("2", "x", "2&x=%"):
+            with self.subTest(value=value):
+                tr, fake = self._tr()
+                app = BabelQueue(transport=tr, queue="orders", max_attempts=5, dead_letter=True)
+                seen: list = []
+
+                @app.handler(self.URN)
+                def _on(data, meta):
+                    seen.append(data)
+
+                self._enqueue(fake, self._body(), value)
+                app.consume("orders", max_messages=1, timeout=0)
+
+                self.assertEqual(seen, [])  # never reaches the handler
+                self.assertEqual(fake.deleted, ["rh-gate"])
+                self.assertEqual(fake.visibility_changes, [])  # not released for a retry
+                self.assertEqual(len(fake.sent), 1)
+                self.assertEqual(fake.sent[0]["QueueUrl"], "http://fake/orders.dlq")
+                dead = EnvelopeCodec.decode(fake.sent[0]["MessageBody"])
+                self.assertEqual(dead["job"], self.URN)  # the producer's body, annotated
+                self.assertEqual(dead["dead_letter"]["reason"], "unknown_urn")
+                self.assertIn(
+                    "babelqueue:unsupported-schema-version:" + quote(value, safe=""),
+                    dead["dead_letter"]["error"],
+                )
+
+    def test_app_without_dead_letter_drops_unsupported_version_without_retry(self):
+        tr, fake = self._tr()
+        app = BabelQueue(transport=tr, queue="orders", max_attempts=3, retry_backoff=30)
+        seen: list = []
+
+        @app.handler(self.URN)
+        def _on(data, meta):
+            seen.append(data)
+
+        self._enqueue(fake, self._body(), "2")
+        app.consume("orders", max_messages=1, timeout=0)
+
+        self.assertEqual(seen, [])
+        self.assertEqual(fake.sent, [])
+        self.assertEqual(fake.visibility_changes, [])  # no ChangeMessageVisibility retry loop
+        self.assertEqual(fake.deleted, ["rh-gate"])
+
+    def test_gated_message_without_receive_count_is_still_acknowledged_by_its_handle(self):
+        tr, fake = self._tr()
+        self._enqueue(fake, self._body(), "2", receive_count=None)
+        got = tr.pop("orders", timeout=0)
+        self.assertEqual(got.route_urn, "babelqueue:unsupported-schema-version:2")
+        tr.ack(got)
+        self.assertEqual(fake.deleted, ["rh-gate"])
+        self.assertEqual(fake.visibility_changes, [])
 
 
 def _sqs_available() -> bool:

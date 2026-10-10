@@ -230,40 +230,121 @@ class AppTest(unittest.TestCase):
             body = tr._queues[queue].popleft() if tr._queues.get(queue) else None  # noqa: SLF001
         return deliveries
 
-    def test_version_gated_message_is_bounded_under_release(self) -> None:
+    def test_version_gated_prefix_is_the_same_in_every_gating_transport(self) -> None:
+        from babelqueue import (
+            artemis_transport, asb_transport, kafka_transport, pulsar_transport, sqs_transport,
+        )
         from babelqueue.app import _UNSUPPORTED_SCHEMA_ROUTE_PREFIX
-        from babelqueue.pulsar_transport import UNSUPPORTED_SCHEMA_ROUTE_PREFIX
 
-        self.assertEqual(_UNSUPPORTED_SCHEMA_ROUTE_PREFIX, UNSUPPORTED_SCHEMA_ROUTE_PREFIX)
+        for module in (
+            artemis_transport, asb_transport, kafka_transport, pulsar_transport, sqs_transport,
+        ):
+            with self.subTest(module=module.__name__):
+                self.assertEqual(
+                    _UNSUPPORTED_SCHEMA_ROUTE_PREFIX, module.UNSUPPORTED_SCHEMA_ROUTE_PREFIX
+                )
+
+    def test_version_gated_message_is_dead_lettered_directly_without_retry(self) -> None:
+        from babelqueue.app import _UNSUPPORTED_SCHEMA_ROUTE_PREFIX
+
         route = _UNSUPPORTED_SCHEMA_ROUTE_PREFIX + "2"
         decodable = EnvelopeCodec.encode(EnvelopeCodec.make("urn:babel:orders:created", {}, queue="orders"))
-        for name, body in (("decodable", decodable), ("undecodable", "{not json")):
-            with self.subTest(body=name):
+        for strategy in (UnknownUrnStrategy.RELEASE, UnknownUrnStrategy.FAIL, UnknownUrnStrategy.DEAD_LETTER):
+            for name, body in (("decodable", decodable), ("undecodable", "{not json")):
+                with self.subTest(strategy=strategy, body=name):
+                    app = BabelQueue(
+                        "memory://", queue="orders", max_attempts=5, dead_letter=True,
+                        on_unknown_urn=strategy,
+                    )
+                    seen = []
+                    app.handler("urn:babel:orders:created")(lambda d, m: seen.append(d))
+
+                    deliveries = self._redeliver_until_settled(app, "orders", route, body)
+
+                    self.assertEqual(deliveries, 1)  # one delivery, max_attempts notwithstanding
+                    self.assertEqual(seen, [])  # never reaches the handler
+                    self.assertEqual(app.transport.size("orders"), 0)
+                    self.assertEqual(app.transport.size("orders.dlq"), 1)
+                    dead = EnvelopeCodec.decode(app.transport._queues["orders.dlq"][0])  # noqa: SLF001
+                    self.assertEqual(dead["dead_letter"]["reason"], "unknown_urn")
+                    self.assertIn(route, dead["dead_letter"]["error"])
+
+    def test_version_gated_message_whose_dead_letter_write_fails_is_not_retried(self) -> None:
+        from babelqueue.app import _UNSUPPORTED_SCHEMA_ROUTE_PREFIX
+
+        class FailingDlq(InMemoryTransport):
+            def __init__(self) -> None:
+                super().__init__()
+                self.acked = 0
+
+            def publish(self, queue, body) -> None:  # noqa: ANN001
+                if queue.endswith(".dlq"):
+                    raise RuntimeError("dlq write refused")
+                super().publish(queue, body)
+
+            def ack(self, received) -> None:  # noqa: ANN001
+                self.acked += 1
+
+        route = _UNSUPPORTED_SCHEMA_ROUTE_PREFIX + "2"
+        body = EnvelopeCodec.encode(EnvelopeCodec.make("urn:babel:orders:created", {}, queue="orders"))
+        for strategy in (UnknownUrnStrategy.RELEASE, UnknownUrnStrategy.FAIL, UnknownUrnStrategy.DEAD_LETTER):
+            with self.subTest(strategy=strategy):
+                tr = FailingDlq()
                 app = BabelQueue(
-                    "memory://", queue="orders", max_attempts=3, dead_letter=True,
-                    on_unknown_urn=UnknownUrnStrategy.RELEASE,
+                    transport=tr, queue="orders", max_attempts=5, dead_letter=True,
+                    on_unknown_urn=strategy,
                 )
                 seen = []
                 app.handler("urn:babel:orders:created")(lambda d, m: seen.append(d))
 
-                deliveries = self._redeliver_until_settled(app, "orders", route, body)
+                for _ in range(3):  # the broker keeps redelivering it
+                    with self.assertLogs("babelqueue.app", level="ERROR"):
+                        app.dispatch(ReceivedMessage(body=body, queue="orders", route_urn=route))
 
-                self.assertEqual(deliveries, 3)  # max_attempts, not an endless release loop
                 self.assertEqual(seen, [])
-                self.assertEqual(app.transport.size("orders"), 0)
-                self.assertEqual(app.transport.size("orders.dlq"), 1)
-                dead = EnvelopeCodec.decode(app.transport._queues["orders.dlq"][0])  # noqa: SLF001
-                self.assertEqual(dead["dead_letter"]["reason"], "unknown_urn")
-                self.assertIn(route, dead["dead_letter"]["error"])
+                self.assertEqual(tr.size("orders"), 0)  # no retry re-publish
+                self.assertEqual(tr.acked, 0)  # left for redelivery
 
-    def test_version_gated_message_without_dead_letter_is_dropped_under_release(self) -> None:
+    def test_failed_gate_dead_letter_write_rewinds_a_rewinder_transport(self) -> None:
+        from babelqueue.app import _UNSUPPORTED_SCHEMA_ROUTE_PREFIX
+
+        class RewindingDlq(InMemoryTransport):
+            def __init__(self, fail_rewind: bool = False) -> None:
+                super().__init__()
+                self.rewound = []
+                self.fail_rewind = fail_rewind
+
+            def publish(self, queue, body) -> None:  # noqa: ANN001
+                if queue.endswith(".dlq"):
+                    raise RuntimeError("dlq write refused")
+                super().publish(queue, body)
+
+            def rewind(self, message) -> None:  # noqa: ANN001
+                self.rewound.append(message)
+                if self.fail_rewind:
+                    raise RuntimeError("seek refused")
+
+        route = _UNSUPPORTED_SCHEMA_ROUTE_PREFIX + "2"
+        body = EnvelopeCodec.encode(EnvelopeCodec.make("urn:babel:orders:created", {}, queue="orders"))
+        for fail_rewind in (False, True):
+            with self.subTest(fail_rewind=fail_rewind):
+                tr = RewindingDlq(fail_rewind=fail_rewind)
+                app = BabelQueue(transport=tr, queue="orders", max_attempts=5, dead_letter=True)
+                app._rewind_pause = 0.0  # noqa: SLF001
+                received = ReceivedMessage(body=body, queue="orders", route_urn=route)
+                with self.assertLogs("babelqueue.app", level="ERROR"):
+                    app.dispatch(received)
+                self.assertEqual(tr.rewound, [received])
+                self.assertEqual(tr.size("orders"), 0)
+
+    def test_version_gated_message_without_dead_letter_is_dropped_without_retry(self) -> None:
         route = "babelqueue:unsupported-schema-version:x"
         body = EnvelopeCodec.encode(EnvelopeCodec.make("urn:babel:orders:created", {}, queue="orders"))
-        app = BabelQueue(
-            "memory://", queue="orders", max_attempts=2, on_unknown_urn=UnknownUrnStrategy.RELEASE
-        )
-        self.assertEqual(self._redeliver_until_settled(app, "orders", route, body), 2)
-        self.assertEqual(app.transport.size("orders"), 0)
+        for strategy in (UnknownUrnStrategy.RELEASE, UnknownUrnStrategy.FAIL):
+            with self.subTest(strategy=strategy):
+                app = BabelQueue("memory://", queue="orders", max_attempts=5, on_unknown_urn=strategy)
+                self.assertEqual(self._redeliver_until_settled(app, "orders", route, body), 1)
+                self.assertEqual(app.transport.size("orders"), 0)
 
     def test_unknown_urn_release_still_releases_verbatim(self) -> None:
         body = EnvelopeCodec.encode(EnvelopeCodec.make("urn:babel:orders:nope", {}, queue="orders"))

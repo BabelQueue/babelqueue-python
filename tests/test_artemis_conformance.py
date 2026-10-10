@@ -21,6 +21,7 @@ class ArtemisConformanceTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         with open(os.path.join(CONFORMANCE, "manifest.json"), encoding="utf-8") as fh:
             cls.artemis = json.load(fh)["artemis"]
+        cls.gate = cls.artemis["schema_version_gate"]
 
     def test_property_projection(self) -> None:
         projection = self.artemis["property_projection"]
@@ -44,6 +45,32 @@ class ArtemisConformanceTest(unittest.TestCase):
                 case["expected_attempts"],
                 case["name"],
             )
+
+
+    def _gate_carrier(self, case: dict):
+        if "absent" in case:
+            return {}
+        return {self.gate["property"]: case["value"]}
+
+    def test_schema_version_gate(self) -> None:
+        """§7.7: the property is read BEFORE decoding; absent/blank decodes, an exact "1"
+        decodes, anything else is rejected without decoding (the body is always the valid fixture)."""
+        gate = self.gate
+        with open(os.path.join(CONFORMANCE, gate["fixture"]), encoding="utf-8") as fh:
+            valid_body = fh.read()
+        self.assertEqual(EnvelopeCodec.decode(valid_body)["job"], "urn:babel:orders:created")
+
+        for case in gate["cases"]:
+            carrier = self._gate_carrier(case)
+            rejected = ArtemisTransport._unsupported_schema_version(carrier)
+            want = "reject" if case["expect"] == "reject" else "decode"
+            self.assertEqual(
+                "reject" if rejected is not None else "decode",
+                want,
+                "schema_version_gate case %r" % (case,),
+            )
+            if rejected is not None:
+                self.assertEqual(rejected, str(case["value"]), "schema_version_gate case %r" % (case,))
 
 
 if __name__ == "__main__":  # pragma: no cover

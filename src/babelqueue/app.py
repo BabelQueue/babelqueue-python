@@ -43,6 +43,7 @@ from .transport import (
     HeaderPublisher,
     ReceivedMessage,
     Redeliverer,
+    Rewinder,
     Transport,
     make_transport,
     publish_keeping_route,
@@ -111,6 +112,7 @@ class BabelQueue:
         self.shutdown_timeout = float(shutdown_timeout)
         self._handlers: Dict[str, Handler] = {}
         self._stop = threading.Event()
+        self._rewind_pause = 1.0  # seconds to wait before a rewound gated message is re-polled
         self._phase = _IDLE
         self._last_phase = _IDLE
         self._signalled = False
@@ -295,6 +297,20 @@ class BabelQueue:
                 self._phase = _SETTLING
             except Exception as exc:  # noqa: BLE001 - one bad message must not kill the loop
                 self._phase = _SETTLING
+                if received.route_urn.startswith(_UNSUPPORTED_SCHEMA_ROUTE_PREFIX):
+                    # A version-gated delivery never takes the generic retry path, even when its
+                    # dead-letter write fails: a retry re-publish may rebuild the version header
+                    # from the (valid) body and walk the message past the gate into a handler.
+                    # It is left unacked; the broker (or a rewind, for cumulative-offset brokers
+                    # such as Kafka) brings it back and the gate rejects it again.
+                    logger.error(
+                        "Dead-lettering a version-gated message on queue %r failed; it was NOT "
+                        "retried or acknowledged; it will come back and the dead-letter write will be retried.",
+                        received.queue,
+                        exc_info=exc,
+                    )
+                    self._rewind_unsettled(received)
+                    return
                 self._retry_or_dead_letter(received, envelope, exc)
             else:
                 # Outside the handler's try: a failed ack is not a handler failure, so it must
@@ -417,6 +433,23 @@ class BabelQueue:
                 exc_info=True,
             )
 
+    def _rewind_unsettled(self, received: ReceivedMessage) -> None:
+        """Make a deliberately unsettled message come back (cumulative-offset brokers such as Kafka
+        would otherwise lose it when a later record on the partition is committed), after a short
+        pause so an unavailable DLQ is not hammered in a hot loop."""
+        if not isinstance(self.transport, Rewinder):
+            return
+        try:
+            self.transport.rewind(received)
+        except Exception:  # noqa: BLE001 - reported, never kills the loop
+            logger.error(
+                "Failed to rewind an unsettled version-gated message on queue %r.",
+                received.queue,
+                exc_info=True,
+            )
+            return
+        self._stop.wait(self._rewind_pause)
+
     def _release_unprocessed(self, received: ReceivedMessage) -> None:
         """Release a message whose handler never completed (shutdown): unchanged body, no
         backoff, and the runtime adds no ``attempts`` increment. A broker that counts
@@ -440,23 +473,35 @@ class BabelQueue:
         if strategy == UnknownUrnStrategy.DELETE:
             self._ack_settled(received)
             return
-        # A transport's version-gated delivery, an undecodable body or a body naming no URN can
-        # never gain a handler, so releasing it unchanged would redeliver it forever. It takes the
-        # bounded FAIL path instead (retry up to max_attempts, then dead-letter or drop); only a
-        # genuinely unknown URN keeps the verbatim release.
-        gated = received.route_urn.startswith(_UNSUPPORTED_SCHEMA_ROUTE_PREFIX)
-        poison = gated or not urn
-        if strategy == UnknownUrnStrategy.RELEASE and not poison:
+        # A transport's version-gated delivery (unsupported ``bq-schema-version``) can never gain
+        # a handler and must not be retried: a retry re-publishes through paths that may rebuild
+        # the version header from the (valid) body, or never advance the attempt counter, so the
+        # gate would be bypassed or the message would loop. It goes straight to the DLQ (or is
+        # dropped when no DLQ is configured).
+        if received.route_urn.startswith(_UNSUPPORTED_SCHEMA_ROUTE_PREFIX):
+            self._settle_version_gated(received, envelope)
+            return
+        # An undecodable body or a body naming no URN can never gain a handler either, so
+        # releasing it unchanged would redeliver it forever. It takes the bounded FAIL path
+        # instead (retry up to max_attempts, then dead-letter or drop); only a genuinely unknown
+        # URN keeps the verbatim release.
+        if strategy == UnknownUrnStrategy.RELEASE and urn:
             self._release(received, received.body, self.unknown_urn_release_delay)
             return
         if strategy == UnknownUrnStrategy.DEAD_LETTER:
             self._dead_letter(received, dict(envelope), "unknown_urn", None)
             return
         # FAIL (and RELEASE of a poison message) — surfaced through the retry/dead-letter path
-        # (never kills the loop). A gated delivery names its reserved route (the rejected version).
-        raise UnknownUrnError(
-            f"No handler mapped for URN [{urn or (received.route_urn if gated else '') or '(empty)'}]."
-        )
+        # (never kills the loop).
+        raise UnknownUrnError(f"No handler mapped for URN [{urn or '(empty)'}].")
+
+    def _settle_version_gated(self, received: ReceivedMessage, envelope: Mapping[str, Any]) -> None:
+        """Dead-letter a version-gated delivery directly (no retry); drop it when no DLQ is set."""
+        if self.dead_letter_enabled or self.on_unknown_urn == UnknownUrnStrategy.DEAD_LETTER:
+            error = UnknownUrnError(f"No handler mapped for URN [{received.route_urn}].")
+            self._dead_letter(received, dict(envelope), "unknown_urn", error)
+            return
+        self._ack_settled(received)
 
     def _retry_or_dead_letter(
         self, received: ReceivedMessage, envelope: Dict[str, Any], exc: BaseException
@@ -500,7 +545,8 @@ class BabelQueue:
 #: Reserved ``ReceivedMessage.route_urn`` prefix a transport uses to hand over a delivery it
 #: version-gated (broker-bindings §5.7 step 3, e.g. the pulsar transport's ``bq-schema-version``
 #: check). Not a ``urn:babel:`` URN, so no handler owns it. Must equal
-#: ``pulsar_transport.UNSUPPORTED_SCHEMA_ROUTE_PREFIX`` (locked by a test); never reaches the wire.
+#: ``UNSUPPORTED_SCHEMA_ROUTE_PREFIX`` of the pulsar, sqs, asb, kafka and artemis transports (locked
+#: by a test); never reaches the wire. A delivery under it is dead-lettered directly, never retried.
 _UNSUPPORTED_SCHEMA_ROUTE_PREFIX = "babelqueue:unsupported-schema-version:"
 
 

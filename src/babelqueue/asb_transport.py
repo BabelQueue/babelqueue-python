@@ -23,11 +23,24 @@ transport directly and pass it via ``BabelQueue(transport=...)`` or
 
 from __future__ import annotations
 
+import logging
+import re
 from typing import Any, Dict, Optional
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
-from .codec import EnvelopeCodec, parse_envelope
-from .transport import ReceivedMessage, Transport
+from .codec import SCHEMA_VERSION, EnvelopeCodec, parse_envelope
+from .transport import ReceivedMessage, Transport, truncate_declared_version
+
+_logger = logging.getLogger("babelqueue.asb")
+
+#: A blank ``bq-schema-version``: empty or only ASCII whitespace (space, \t, \n, \v, \f, \r) — the
+#: same set in every SDK (GR-5). Deliberately not ``str.strip()``, which also strips U+001C-U+001F,
+#: U+0085, U+00A0, U+2028, U+3000 ...
+_BLANK_ASCII_PATTERN = re.compile(r"[ \t\n\x0b\x0c\r]*")
+#: Prefix of the reserved ``route_urn`` a version-gated message is delivered under. It is not a
+#: ``urn:babel:`` URN, so no handler can legitimately own it; the runtime reports it as an
+#: unknown URN, which names the rejected ``bq-schema-version``.
+UNSUPPORTED_SCHEMA_ROUTE_PREFIX = "babelqueue:unsupported-schema-version:"
 
 
 class AsbTransport(Transport):
@@ -141,6 +154,42 @@ class AsbTransport(Transport):
         env["attempts"] = native
         return EnvelopeCodec.encode(env)
 
+    @staticmethod
+    def _unsupported_schema_version(properties: Any) -> Optional[str]:
+        """The §4.7 step-3 gate on the ``bq-schema-version`` application property: the offending
+        raw value as text, or ``None``.
+
+        The AMQP client may hand keys and values over as ``bytes``; both are decoded as UTF-8. A
+        missing property, or a blank string (the empty string or only ASCII whitespace — the same
+        set in every SDK, GR-5, not ``str.strip()``) is not gated: the usual decode path runs. A
+        present value is accepted only when it is exactly the core's supported ``SCHEMA_VERSION``:
+        the string ``"1"`` or the integer ``1`` (a ``bool`` is not an integer here, though it is
+        one in Python). ``"2"``, ``"x"``, ``"01"``, ``" 1"``, ``0``, ``2``, ``1.5``, ``True`` and
+        any other type are rejected."""
+        if not properties:
+            return None
+        raw: Any = None
+        try:
+            items = list(properties.items())
+        except (AttributeError, TypeError):
+            return None
+        for key, value in items:
+            name = key.decode("utf-8", "replace") if isinstance(key, (bytes, bytearray)) else key
+            if name == "bq-schema-version":
+                raw = value
+                break
+        if raw is None:
+            return None
+        if isinstance(raw, (bytes, bytearray)):
+            raw = bytes(raw).decode("utf-8", "replace")
+        if isinstance(raw, str):
+            if _BLANK_ASCII_PATTERN.fullmatch(raw) is not None or raw == str(SCHEMA_VERSION):
+                return None
+            return raw
+        if isinstance(raw, int) and not isinstance(raw, bool) and raw == SCHEMA_VERSION:
+            return None
+        return str(raw)
+
     # -- Transport ----------------------------------------------------------
 
     def publish(self, queue: str, body: str) -> None:
@@ -157,6 +206,27 @@ class AsbTransport(Transport):
         if not messages:
             return None
         message = messages[0]
+        # §4.7 step 3: gate on ``bq-schema-version`` BEFORE any body decode (the attempts reconcile
+        # below decodes the body). A rejected message keeps its raw body and the reserved route.
+        unsupported = truncate_declared_version(
+            self._unsupported_schema_version(
+            getattr(message, "application_properties", None)
+        )
+        )
+        if unsupported is not None:
+            _logger.warning(
+                "Azure Service Bus message on %r carries unsupported bq-schema-version %r "
+                "(supported: %s); not decoding it.",
+                queue,
+                unsupported,
+                SCHEMA_VERSION,
+            )
+            return ReceivedMessage(
+                body=str(message),
+                queue=queue,
+                handle=message,
+                route_urn=UNSUPPORTED_SCHEMA_ROUTE_PREFIX + quote(unsupported, safe=""),
+            )
         body = self._reconcile(str(message), getattr(message, "delivery_count", None))
         return ReceivedMessage(body=body, queue=queue, handle=message)
 

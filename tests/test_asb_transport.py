@@ -8,8 +8,10 @@ which builds a real ``ServiceBusMessage``, is skipped unless ``azure-servicebus`
 from __future__ import annotations
 
 import unittest
+from unittest import mock
+from urllib.parse import quote
 
-from babelqueue import EnvelopeCodec
+from babelqueue import BabelQueue, EnvelopeCodec
 from babelqueue.asb_transport import AsbTransport
 from babelqueue.transport import ReceivedMessage, make_transport
 
@@ -49,9 +51,10 @@ def _assert_no_codec_warnings(case: unittest.TestCase, fn) -> None:
 class FakeReceived:
     """Duck-typed ServiceBusReceivedMessage (the real one has no public constructor)."""
 
-    def __init__(self, raw: str, delivery_count: int = 1) -> None:
+    def __init__(self, raw: str, delivery_count: int = 1, application_properties=None) -> None:
         self._raw = raw
         self.delivery_count = delivery_count
+        self.application_properties = application_properties
 
     def __str__(self) -> str:
         return self._raw
@@ -166,6 +169,139 @@ class AsbConsumeTest(unittest.TestCase):
             self.skipTest("azure installed — building a real client would need credentials")
         with self.assertRaises(ImportError):
             make_transport("sb://ns.servicebus.windows.net")
+
+
+class AsbSchemaVersionGateTest(unittest.TestCase):
+    """The ``bq-schema-version`` pre-decode gate (broker-bindings.md §4.7 step 3)."""
+
+    PREFIX = "babelqueue:unsupported-schema-version:"
+
+    def _pop(self, raw, properties, delivery_count=1):
+        receiver = FakeReceiver([FakeReceived(raw, delivery_count, properties)])
+        return AsbTransport(client=FakeClient(receiver=receiver)).pop("orders")
+
+    def test_missing_or_blank_version_decodes_normally(self):
+        # blank = empty or only ASCII whitespace (space, \t, \n, \v, \f, \r), identical in every SDK
+        blanks = ("", "  ", "\u000b", "\f", " \t\n\u000b\f\r")
+        for properties in (None, {}, {"other": "x"}) + tuple({"bq-schema-version": v} for v in blanks):
+            with self.subTest(properties=properties):
+                got = self._pop(body(), properties, delivery_count=3)
+                self.assertEqual(got.route_urn, "")
+                self.assertEqual(EnvelopeCodec.decode(got.body)["attempts"], 2)  # reconciled
+
+    def test_supported_version_is_delivered(self):
+        # the transport itself publishes the integer 1; other SDKs and the portal send "1"
+        for value in ("1", 1, b"1"):
+            with self.subTest(value=value):
+                got = self._pop(body(), {"bq-schema-version": value}, delivery_count=2)
+                self.assertEqual(got.route_urn, "")
+                self.assertEqual(EnvelopeCodec.decode(got.body)["attempts"], 1)
+
+    def test_bytes_keys_and_values_are_decoded(self):
+        got = self._pop(body(), {b"bq-schema-version": b"1"})
+        self.assertEqual(got.route_urn, "")
+        got = self._pop("{not json", {b"bq-schema-version": b"2"})
+        self.assertEqual(got.route_urn, self.PREFIX + "2")
+
+    def test_long_rejected_version_is_truncated_in_the_route(self):
+        got = self._pop("{not json", {"bq-schema-version": "9" * 100})
+        self.assertEqual(got.route_urn, self.PREFIX + "9" * 64 + "...")
+
+    def test_route_percent_escapes_the_rejected_version(self):
+        got = self._pop("{not json", {"bq-schema-version": "2&x=?bq-job=%"})
+        self.assertEqual(got.route_urn, self.PREFIX + "2%26x%3D%3Fbq-job%3D%25")
+
+    def test_unsupported_version_returns_the_route_without_decoding(self):
+        garbage = "{not json"
+        values = ("2", "x", "01", " 1", "1.0", "-1", "\u00a0", "\u001c", "\u0085", "\ufeff", "\u3000")
+        for value in values:
+            with self.subTest(value=value):
+                with mock.patch.object(
+                    EnvelopeCodec, "decode", side_effect=AssertionError("decode must not run")
+                ) as decode:
+                    got = self._pop(garbage, {"bq-schema-version": value})
+                decode.assert_not_called()
+                self.assertEqual(got.route_urn, self.PREFIX + quote(value, safe=""))
+                self.assertEqual(got.body, garbage)
+                self.assertIsNotNone(got.handle)
+
+    def test_numeric_and_other_typed_values_follow_the_integer_rule(self):
+        # int 1 is the supported version; every other number, a bool (an int in Python) and any
+        # other type is rejected
+        for value, want_route in (
+            (1, None),
+            (2, self.PREFIX + "2"),
+            (0, self.PREFIX + "0"),
+            (-1, self.PREFIX + "-1"),
+            (1.5, self.PREFIX + "1.5"),
+            (1.0, self.PREFIX + "1.0"),
+            (True, self.PREFIX + "True"),
+            (False, self.PREFIX + "False"),
+            ([1], self.PREFIX + "%5B1%5D"),
+        ):
+            with self.subTest(value=value):
+                got = self._pop(body(), {"bq-schema-version": value})
+                self.assertEqual(got.route_urn, want_route or "")
+
+    def test_gate_does_not_decode_a_valid_body_either(self):
+        raw = body()
+        with mock.patch.object(
+            EnvelopeCodec, "decode", side_effect=AssertionError("decode must not run")
+        ):
+            got = self._pop(raw, {"bq-schema-version": "2"}, delivery_count=5)
+        self.assertEqual(got.body, raw)  # not reconciled, byte-identical
+        self.assertEqual(got.route_urn, self.PREFIX + "2")
+
+    def test_gate_logs_a_warning_naming_the_version_and_queue(self):
+        with self.assertLogs("babelqueue.asb", level="WARNING") as logs:
+            self._pop("{not json", {"bq-schema-version": "2"})
+        self.assertIn("'2'", logs.output[0])
+        self.assertIn("'orders'", logs.output[0])
+
+    def test_supported_version_does_not_log(self):
+        from babelqueue import asb_transport
+
+        with mock.patch.object(asb_transport._logger, "warning") as warn:
+            self._pop(body(), {"bq-schema-version": 1})
+            self._pop(body(), None)
+        warn.assert_not_called()
+
+    def test_gated_message_is_completed_through_its_handle(self):
+        receiver = FakeReceiver([FakeReceived(body(), 1, {"bq-schema-version": "2"})])
+        tr = AsbTransport(client=FakeClient(receiver=receiver))
+        got = tr.pop("orders")
+        tr.ack(got)
+        self.assertEqual(receiver.completed, [got.handle])
+
+    def test_app_dead_letters_unsupported_version_without_reaching_a_handler(self):
+        # max_attempts > 1: a gated message is dead-lettered directly, never retried
+        for value in ("2", "x", 2, "2&x=%"):
+            with self.subTest(value=value):
+                receiver = FakeReceiver([FakeReceived(body(), 1, {"bq-schema-version": value})])
+                app = BabelQueue(
+                    transport=AsbTransport(client=FakeClient(receiver=receiver)),
+                    max_attempts=5,
+                    dead_letter=True,
+                )
+                seen: list = []
+
+                @app.handler(URN)
+                def _on(data, meta):
+                    seen.append(data)
+
+                # publish() builds an azure ServiceBusMessage; capture it so no SDK is needed
+                with mock.patch.object(AsbTransport, "publish") as publish:
+                    app.consume(queue="orders", max_messages=1)
+
+                self.assertEqual(seen, [])
+                self.assertEqual(len(receiver.completed), 1)
+                publish.assert_called_once()
+                queue, dead_body = publish.call_args.args
+                self.assertEqual(queue, "orders.dlq")
+                dead = EnvelopeCodec.decode(dead_body)
+                self.assertEqual(dead["job"], URN)  # the producer's body, annotated
+                self.assertEqual(dead["dead_letter"]["reason"], "unknown_urn")
+                self.assertIn(self.PREFIX + quote(str(value), safe=""), dead["dead_letter"]["error"])
 
 
 @unittest.skipUnless(HAVE_ASB, "azure-servicebus not installed")

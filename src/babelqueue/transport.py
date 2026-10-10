@@ -14,6 +14,19 @@ from typing import Any, Deque, Dict, Optional, Protocol, runtime_checkable
 from .exceptions import BabelQueueError
 
 
+#: Longest rejected ``bq-schema-version`` value kept for logs and the dead-letter reason; the rest
+#: is cut and ``...`` appended (same cap as the .NET / Java / Node gates), so a huge header cannot
+#: inflate the DLQ record.
+_DECLARED_VERSION_MAX_CHARS = 64
+
+
+def truncate_declared_version(value: Optional[str]) -> Optional[str]:
+    """Cap a rejected ``bq-schema-version`` value at 64 characters plus ``...`` (``None`` passes)."""
+    if value is None or len(value) <= _DECLARED_VERSION_MAX_CHARS:
+        return value
+    return value[:_DECLARED_VERSION_MAX_CHARS] + "..."
+
+
 @dataclass
 class ReceivedMessage:
     """A message popped from a queue, plus a transport-internal ack handle."""
@@ -103,6 +116,21 @@ class Redeliverer(Protocol):
 
     def redeliver(self, message: ReceivedMessage, body: str, delay: float) -> None:
         """Hand ``message`` back to the broker, visible again after ``delay`` seconds."""
+        ...
+
+
+@runtime_checkable
+class Rewinder(Protocol):
+    """Optional :class:`Transport` capability: make an *unacknowledged* delivery come back.
+
+    Needed by brokers whose acknowledgement is a cumulative per-partition position (Kafka): not
+    acking a record is not enough there, because acking a later record on the same partition
+    commits past it and it is lost. :meth:`rewind` moves the consumer back to ``message`` so the
+    next :meth:`Transport.pop` returns it again. The runtime calls it only when it deliberately
+    leaves a message unsettled (a version-gated message whose dead-letter write failed)."""
+
+    def rewind(self, message: ReceivedMessage) -> None:
+        """Position the consumer so ``message`` is delivered again by the next ``pop``."""
         ...
 
 

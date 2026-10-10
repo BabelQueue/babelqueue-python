@@ -34,6 +34,7 @@ from .transport import (
     InMemoryTransport,
     ReceivedMessage,
     Redeliverer,
+    Rewinder,
     RoutedPublisher,
     Transport,
 )
@@ -53,6 +54,7 @@ __all__ = [
     "ReceivedMessage",
     "HeaderPublisher",
     "Redeliverer",
+    "Rewinder",
     "RoutedPublisher",
     "BabelQueueError",
     "UnknownUrnError",

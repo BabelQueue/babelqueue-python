@@ -32,10 +32,24 @@ transport directly and pass it via ``BabelQueue(transport=...)`` or
 
 from __future__ import annotations
 
+import logging
+import re
 from typing import Any, Dict, Optional
+from urllib.parse import quote
 
-from .codec import EnvelopeCodec, parse_envelope
-from .transport import ReceivedMessage, Transport
+from .codec import SCHEMA_VERSION, EnvelopeCodec, parse_envelope
+from .transport import ReceivedMessage, Transport, truncate_declared_version
+
+_logger = logging.getLogger("babelqueue.artemis")
+
+#: A blank ``bq_schema_version``: empty or only ASCII whitespace (space, \t, \n, \v, \f, \r) — the
+#: same set in every SDK (GR-5). Deliberately not ``str.strip()``, which also strips U+001C-U+001F,
+#: U+0085, U+00A0, U+2028, U+3000 ...
+_BLANK_ASCII_PATTERN = re.compile(r"[ \t\n\x0b\x0c\r]*")
+#: Prefix of the reserved ``route_urn`` a version-gated message is delivered under. It is not a
+#: ``urn:babel:`` URN, so no handler can legitimately own it; the runtime reports it as an
+#: unknown URN, which names the rejected ``bq_schema_version``.
+UNSUPPORTED_SCHEMA_ROUTE_PREFIX = "babelqueue:unsupported-schema-version:"
 
 JMS_TYPE_ANNOTATION = "x-opt-jms-type"
 APP_ID = "babelqueue"
@@ -188,6 +202,33 @@ class ArtemisTransport(Transport):
             return 0
 
     @staticmethod
+    def _unsupported_schema_version(properties: Any) -> Optional[str]:
+        """The §7.7 step-3 gate on the ``bq_schema_version`` application property (underscores —
+        ADR-0017): the offending raw value, or ``None``.
+
+        A missing property, a null value or a blank value (the empty string or only ASCII
+        whitespace — the same set in every SDK, GR-5, not ``str.strip()``) is not gated: the usual
+        decode path runs. A ``bytes`` value is decoded as UTF-8. A present value is accepted only
+        when it is exactly the core's supported ``SCHEMA_VERSION``: the string ``"1"`` or the
+        integer ``1`` (a ``bool`` is not an integer here, though it is one in Python); ``"2"``,
+        ``"x"``, ``"01"``, ``" 1"``, ``0``, ``2``, ``1.5``, ``True`` and any other type are
+        rejected."""
+        if not isinstance(properties, dict):
+            return None
+        raw = properties.get("bq_schema_version")
+        if raw is None:
+            return None
+        if isinstance(raw, (bytes, bytearray)):
+            raw = bytes(raw).decode("utf-8", "replace")
+        if isinstance(raw, str):
+            if _BLANK_ASCII_PATTERN.fullmatch(raw) is not None or raw == str(SCHEMA_VERSION):
+                return None
+            return raw
+        if isinstance(raw, int) and not isinstance(raw, bool) and raw == SCHEMA_VERSION:
+            return None
+        return str(raw)
+
+    @staticmethod
     def _payload(message: Any) -> str:
         body = getattr(message, "body", None)
         if isinstance(body, bytes):
@@ -212,6 +253,26 @@ class ArtemisTransport(Transport):
             raise
         if message is None:  # pragma: no cover - defensive (real client raises instead)
             return None
+        # §7.7 step 3: gate on the ``bq_schema_version`` property BEFORE any body decode (the
+        # attempts reconcile below decodes the body). A rejected message keeps its raw body and the
+        # reserved route; the runtime then dead-letters it directly (no retry).
+        unsupported = truncate_declared_version(
+            self._unsupported_schema_version(getattr(message, "properties", None))
+        )
+        if unsupported is not None:
+            _logger.warning(
+                "Artemis message on %r carries unsupported bq_schema_version %r (supported: %s); "
+                "not decoding it.",
+                queue,
+                unsupported,
+                SCHEMA_VERSION,
+            )
+            return ReceivedMessage(
+                body=self._payload(message),
+                queue=queue,
+                handle=receiver,
+                route_urn=UNSUPPORTED_SCHEMA_ROUTE_PREFIX + quote(unsupported, safe=""),
+            )
         body = self._reconcile(self._payload(message), self._delivery_count(message))
         return ReceivedMessage(body=body, queue=queue, handle=receiver)
 

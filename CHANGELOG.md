@@ -9,6 +9,35 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Fixed
+- **`bq-schema-version` pre-decode gate on the SQS, Azure Service Bus, Kafka and Artemis
+  transports** (`pop`). The broker's schema-version property is read **before** the body is
+  decoded (broker-bindings §3.7 / §4.7 / §6.7 / §7.7), mirroring the existing Pulsar gate:
+  a missing or blank value (empty or only ASCII whitespace) takes the normal path; anything
+  else is compared untrimmed to `"1"` and a mismatch is returned with the raw body and the
+  reserved route `babelqueue:unsupported-schema-version:<v>` (version percent-escaped) without
+  decoding it. SQS/ASB/Kafka read `bq-schema-version`, Artemis `bq_schema_version`
+  (ADR-0017); ASB and Artemis also accept an integer `1` (a `bool` is not `1`). The conformance suite now reads each binding's
+  `schema_version_gate` table (including Pulsar's). No wire change.
+- **A version-gated delivery is dead-lettered directly, never retried.** `BabelQueue` now
+  sends a message under the reserved gate route straight to the DLQ (reason `unknown_urn`,
+  body untouched) when `dead_letter` is enabled and drops it otherwise, regardless of
+  `max_attempts` / `on_unknown_urn`. A retry would re-publish through paths that rebuild the
+  version header from the (valid) body (ASB/Kafka/Artemis) or never advance the attempt
+  counter (SQS), letting the gate be bypassed or the message loop. Applies to Pulsar too
+  (previously it retried up to `max_attempts` first).
+  If the dead-letter write itself fails, the message is still never retried: it is left
+  unacknowledged (an error is logged) so the broker redelivers it and the gate rejects it again
+  (SQS at the visibility timeout, Azure Service Bus at lock expiry, Artemis when the link or
+  connection closes). Kafka commits offsets cumulatively, so merely not acknowledging the
+  record would lose it once a later record is committed: `KafkaTransport` now `seek`s the
+  partition back to the failed record's offset so it is polled again and the dead-letter write
+  is retried (no commit moves past it).
+- New optional `Rewinder` protocol (`rewind(message)`), implemented by `KafkaTransport` and
+  exported from `babelqueue`; the runtime calls it after a failed version-gate dead-letter write
+  and then pauses briefly (1 s) before the next poll.
+  The rejected version is capped at 64 characters plus `...` in the log and the route.
+
 ## [1.15.0] - 2026-10-10
 
 ### Added

@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import unittest
 from unittest import mock
+from urllib.parse import quote
 
-from babelqueue import EnvelopeCodec
+from babelqueue import BabelQueue, EnvelopeCodec
 from babelqueue.artemis_transport import ArtemisTransport
 from babelqueue.transport import ReceivedMessage, make_transport
 
@@ -49,9 +50,10 @@ def _assert_no_codec_warnings(case: unittest.TestCase, fn) -> None:
 class FakeMessage:
     """Duck-typed proton Message for the consume path (no proton needed)."""
 
-    def __init__(self, raw: str, delivery_count: int = 0) -> None:
+    def __init__(self, raw: str, delivery_count: int = 0, properties=None) -> None:
         self.body = raw
         self.delivery_count = delivery_count
+        self.properties = properties
 
 
 class Timeout(Exception):
@@ -192,6 +194,134 @@ class ArtemisConsumeTest(unittest.TestCase):
         transport = ArtemisTransport(connection=connection)
         transport.close()
         self.assertTrue(connection.closed)
+
+
+class ArtemisSchemaVersionGateTest(unittest.TestCase):
+    """The ``bq_schema_version`` pre-decode gate (broker-bindings.md §7.7 step 3; underscores, ADR-0017)."""
+
+    PREFIX = "babelqueue:unsupported-schema-version:"
+
+    def _transport(self, raw, properties, delivery_count=0):
+        receiver = FakeReceiver([FakeMessage(raw, delivery_count, properties)])
+        return ArtemisTransport(connection=FakeConnection(receiver=receiver)), receiver
+
+    def _pop(self, raw, properties, delivery_count=0):
+        return self._transport(raw, properties, delivery_count)[0].pop("orders")
+
+    def test_missing_or_blank_property_decodes_normally(self) -> None:
+        # blank = empty or only ASCII whitespace (space, \t, \n, \v, \f, \r), identical in every SDK
+        blanks = ("", "  ", "\u000b", "\f", " \t\n\u000b\f\r", b"", b" ")
+        cases = [None, {}, {"other": "x"}, {"bq_schema_version": None}]
+        cases += [{"bq_schema_version": v} for v in blanks]
+        # the hyphenated spelling belongs to the other bindings and is not this property
+        cases.append({"bq-schema-version": "2"})
+        for properties in cases:
+            with self.subTest(properties=properties):
+                got = self._pop(body(), properties, delivery_count=3)
+                self.assertEqual("", got.route_urn)
+                self.assertEqual(3, EnvelopeCodec.decode(got.body)["attempts"])  # reconciled
+
+    def test_supported_version_is_delivered(self) -> None:
+        for value in ("1", b"1"):
+            with self.subTest(value=value):
+                got = self._pop(body(), {"bq_schema_version": value}, delivery_count=2)
+                self.assertEqual("", got.route_urn)
+                self.assertEqual(2, EnvelopeCodec.decode(got.body)["attempts"])
+
+    def test_unsupported_version_returns_the_route_without_decoding(self) -> None:
+        garbage = "{not json"
+        values = ("2", "x", "01", " 1", "1.0", "-1", "\u00a0", "\u001c", "\u0085", "\ufeff", "\u3000")
+        for value in values:
+            with self.subTest(value=value):
+                transport, receiver = self._transport(garbage, {"bq_schema_version": value})
+                with mock.patch.object(
+                    EnvelopeCodec, "decode", side_effect=AssertionError("decode must not run")
+                ) as decode:
+                    got = transport.pop("orders")
+                decode.assert_not_called()
+                self.assertEqual(self.PREFIX + quote(value, safe=""), got.route_urn)
+                self.assertEqual(garbage, got.body)
+                self.assertIs(receiver, got.handle)
+
+    def test_non_string_values_follow_the_integer_rule(self) -> None:
+        # int 1 is the supported version (Java/.NET parity); every other number, a bool (an int in
+        # Python) and any other type is rejected
+        for value, want in (
+            (1, None),
+            (2, "2"),
+            (0, "0"),
+            (1.5, "1.5"),
+            (1.0, "1.0"),
+            (True, "True"),
+            (False, "False"),
+            (b"2", "2"),
+            ([1], "%5B1%5D"),
+        ):
+            with self.subTest(value=value):
+                got = self._pop("{not json", {"bq_schema_version": value})
+                self.assertEqual("" if want is None else self.PREFIX + want, got.route_urn)
+
+    def test_long_rejected_version_is_truncated_in_the_route(self) -> None:
+        got = self._pop("{not json", {"bq_schema_version": "9" * 100})
+        self.assertEqual(self.PREFIX + "9" * 64 + "...", got.route_urn)
+
+    def test_route_percent_escapes_the_rejected_version(self) -> None:
+        got = self._pop("{not json", {"bq_schema_version": "2&x=?bq-job=%"})
+        self.assertEqual(self.PREFIX + "2%26x%3D%3Fbq-job%3D%25", got.route_urn)
+
+    def test_gate_does_not_decode_a_valid_body_either(self) -> None:
+        raw = body(attempts=0)
+        with mock.patch.object(
+            EnvelopeCodec, "decode", side_effect=AssertionError("decode must not run")
+        ):
+            got = self._pop(raw, {"bq_schema_version": "2"}, delivery_count=5)
+        self.assertEqual(raw, got.body)  # not reconciled, byte-identical
+        self.assertEqual(self.PREFIX + "2", got.route_urn)
+
+    def test_gate_logs_a_warning_naming_the_version_and_queue(self) -> None:
+        with self.assertLogs("babelqueue.artemis", level="WARNING") as logs:
+            self._pop("{not json", {"bq_schema_version": "2"})
+        self.assertIn("'2'", logs.output[0])
+        self.assertIn("'orders'", logs.output[0])
+
+    def test_supported_version_does_not_log(self) -> None:
+        from babelqueue import artemis_transport
+
+        with mock.patch.object(artemis_transport._logger, "warning") as warn:
+            self._pop(body(), {"bq_schema_version": "1"})
+            self._pop(body(), None)
+        warn.assert_not_called()
+
+    def test_gated_message_is_accepted_through_its_receiver(self) -> None:
+        transport, receiver = self._transport(body(), {"bq_schema_version": "2"})
+        transport.ack(transport.pop("orders"))
+        self.assertEqual(1, receiver.accepted)
+
+    def test_app_dead_letters_unsupported_version_without_reaching_a_handler(self) -> None:
+        # max_attempts > 1: a gated message is dead-lettered directly, never retried
+        for value in ("2", "x", "2&x=%"):
+            with self.subTest(value=value):
+                transport, receiver = self._transport(body(), {"bq_schema_version": value})
+                app = BabelQueue(transport=transport, max_attempts=5, dead_letter=True)
+                seen: list = []
+
+                @app.handler(URN)
+                def _on(data, meta):
+                    seen.append(data)
+
+                # publish() builds a proton Message; capture it instead so no proton is needed
+                with mock.patch.object(ArtemisTransport, "publish") as publish:
+                    app.consume(queue="orders", max_messages=1)
+
+                self.assertEqual([], seen)
+                self.assertEqual(1, receiver.accepted)
+                publish.assert_called_once()
+                queue, dead_body = publish.call_args.args
+                self.assertEqual("orders.dlq", queue)
+                dead = EnvelopeCodec.decode(dead_body)
+                self.assertEqual(URN, dead["job"])  # the producer's body, annotated
+                self.assertEqual("unknown_urn", dead["dead_letter"]["reason"])
+                self.assertIn(self.PREFIX + quote(value, safe=""), dead["dead_letter"]["error"])
 
 
 class ArtemisUrlTest(unittest.TestCase):

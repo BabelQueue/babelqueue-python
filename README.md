@@ -124,6 +124,43 @@ app.run()                               # consume forever (Ctrl-C to stop)
   the message unchanged once `shutdown_timeout` expires. Delivery is
   **at-least-once** — keep handlers idempotent (see the idempotency helper).
 
+### Unsupported `schema_version` (SQS, Azure Service Bus, Kafka, Artemis, Pulsar)
+
+These transports read the binding's schema-version property (`bq-schema-version`; Artemis
+`bq_schema_version`) **before** decoding the body. A missing or blank value (empty or only
+ASCII whitespace) follows the normal path; any other value must be exactly `"1"` (compared
+untrimmed; Azure Service Bus and Artemis also accept the integer `1`). A message carrying
+anything else is not decoded: it reaches the runtime on the reserved route
+`babelqueue:unsupported-schema-version:<v>` (the version percent-escaped) and is **never
+retried** — it goes straight to the dead-letter queue (reason `unknown_urn`, the body kept
+verbatim) when `dead_letter` is enabled, and is dropped otherwise, whatever `max_attempts` is.
+It does not depend on a broker `RedrivePolicy`. If the dead-letter write fails the message is
+left unacknowledged (an error is logged), is never retried and never reaches a handler; the
+dead-letter write is attempted again when the broker brings it back, which depends on the
+broker:
+
+- **SQS** — redelivered when the visibility timeout expires.
+- **Azure Service Bus** — redelivered when the message lock expires.
+- **Artemis** — an unsettled AMQP 1.0 delivery is returned only when the link or connection
+  closes, so it stays unsettled until then.
+- **Kafka** — offsets are committed cumulatively per partition, so merely skipping the commit
+  would lose the record once a later one is committed. The transport therefore implements
+  the optional `Rewinder` protocol: it `seek`s the partition back to the failed record's
+  offset and pauses `_rewind_pause` (1 s by default, so an unavailable DLQ is not hammered)
+  before the record is polled again; the gate rejects it again and the dead-letter write
+  is retried. While the dead-letter write keeps failing (for example the `.dlq` topic is not
+  writable) the partition **stalls on that record** (head-of-line blocking, consumer lag
+  grows) and the worker waits the pause on every attempt, which also delays its other
+  partitions and queues. The commit does not move past the record as long as the seek
+  succeeds; if the seek itself fails, an error naming the topic, partition and offset is
+  logged and a later commit on that partition may skip the record, so recover it by hand from
+  that offset. If the partition was lost to a rebalance, the new owner resumes from the last
+  committed offset and the record is not lost.
+- **Pulsar** — acknowledgement is per message; the unacknowledged message is redelivered by
+  the broker.
+
+A warning naming the version (cut at 64 characters plus `...`) and queue is logged.
+
 ### SQS release and poison messages
 
 On a handler failure, unknown-URN `release` or shutdown release, the SQS

@@ -37,16 +37,26 @@ transport directly and pass it via ``BabelQueue(transport=...)``.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, Optional, Set
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
-from .codec import EnvelopeCodec, parse_envelope
-from .transport import ReceivedMessage, Transport
+from .codec import SCHEMA_VERSION, EnvelopeCodec, parse_envelope
+from .transport import ReceivedMessage, Transport, truncate_declared_version
 
 #: SQS's upper bound for ``ChangeMessageVisibility`` (12 hours).
 MAX_VISIBILITY_TIMEOUT = 43200
 
 logger = logging.getLogger("babelqueue.sqs")
+
+#: A blank ``bq-schema-version``: empty or only ASCII whitespace (space, \t, \n, \v, \f, \r) — the
+#: same set in every SDK (GR-5). Deliberately not ``str.strip()``, which also strips U+001C-U+001F,
+#: U+0085, U+00A0, U+2028, U+3000 ...
+_BLANK_ASCII_PATTERN = re.compile(r"[ \t\n\x0b\x0c\r]*")
+#: Prefix of the reserved ``route_urn`` a version-gated message is delivered under. It is not a
+#: ``urn:babel:`` URN, so no handler can legitimately own it; the runtime reports it as an
+#: unknown URN, which names the rejected ``bq-schema-version``.
+UNSUPPORTED_SCHEMA_ROUTE_PREFIX = "babelqueue:unsupported-schema-version:"
 
 
 def _visibility_seconds(delay: float) -> int:
@@ -251,13 +261,59 @@ class SqsTransport(Transport):
         msg = messages[0]
         body = msg.get("Body", "")
         receive_count = (msg.get("Attributes") or {}).get("ApproximateReceiveCount")
-        if receive_count is not None:
+        # §3.7 step 3: gate on ``bq-schema-version`` BEFORE any body decode (the attempts reconcile
+        # below decodes the body). A rejected message keeps its raw body and the reserved route;
+        # the runtime then dead-letters it directly (no retry), so the missing reconcile is moot.
+        unsupported = truncate_declared_version(
+            self._unsupported_schema_version(msg.get("MessageAttributes"))
+        )
+        if unsupported is not None:
+            logger.warning(
+                "SQS message on %r carries unsupported bq-schema-version %r (supported: %s); "
+                "not decoding it.",
+                queue,
+                unsupported,
+                SCHEMA_VERSION,
+            )
+        elif receive_count is not None:
             body = self._reconcile(body, receive_count)
         headers = _message_attribute_headers(msg.get("MessageAttributes"))
         handle = msg.get("ReceiptHandle")
         if handle and receive_count is None:
             self._uncounted_handles.add(handle)
-        return ReceivedMessage(body=body, queue=queue, handle=handle, headers=headers)
+        return ReceivedMessage(
+            body=body,
+            queue=queue,
+            handle=handle,
+            headers=headers,
+            route_urn=(
+                UNSUPPORTED_SCHEMA_ROUTE_PREFIX + quote(unsupported, safe="")
+                if unsupported is not None
+                else ""
+            ),
+        )
+
+    @staticmethod
+    def _unsupported_schema_version(attributes: Any) -> Optional[str]:
+        """The §3.7 step-3 gate on the ``bq-schema-version`` message attribute: the offending raw
+        value, or ``None``.
+
+        A missing attribute, one without a ``StringValue`` or a blank value (the empty string or
+        only ASCII whitespace — the same set in every SDK, GR-5, not ``str.strip()``) is not
+        gated: the usual decode path runs. A present value is accepted only when it is exactly the
+        core's supported ``SCHEMA_VERSION`` as a plain decimal string, so ``"2"``, ``"x"``,
+        ``"01"`` and ``" 1"`` are all rejected."""
+        if not isinstance(attributes, dict):
+            return None
+        spec = attributes.get("bq-schema-version")
+        raw = spec.get("StringValue") if isinstance(spec, dict) else None
+        if raw is None:
+            return None
+        if isinstance(raw, str) and _BLANK_ASCII_PATTERN.fullmatch(raw) is not None:
+            return None
+        if isinstance(raw, str) and raw == str(SCHEMA_VERSION):
+            return None
+        return str(raw)
 
     def ack(self, message: ReceivedMessage) -> None:
         if not message.handle:

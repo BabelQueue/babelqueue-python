@@ -540,8 +540,9 @@ class PulsarConsumeTest(unittest.TestCase):
                 self.assertIn(UNSUPPORTED_SCHEMA_ROUTE_PREFIX + value, dead["dead_letter"]["error"])
 
     def test_republish_of_gated_message_never_writes_the_sentinel(self):
-        """Retry copy and dead-letter record keep the original bq-job / bq-schema-version (the
-        sentinel is an in-process marker) and the body, so a redrive meets the same gate."""
+        """The dead-letter record keeps the original bq-job / bq-schema-version (the sentinel is
+        an in-process marker) and the body, so a redrive meets the same gate. A gated message is
+        never retried: without a DLQ it is dropped (acked) with nothing re-published."""
         from babelqueue import BabelQueue
 
         cases = (
@@ -556,10 +557,14 @@ class PulsarConsumeTest(unittest.TestCase):
                     consumer = FakeConsumer([FakeMessage(body(), properties=dict(props))])
                     tr = PulsarTransport(client=FakeClient(producer=producer, consumer=consumer))
                     app = BabelQueue(
-                        transport=tr, max_attempts=1 if dead_letter else 5, dead_letter=dead_letter
+                        transport=tr, max_attempts=5, dead_letter=dead_letter
                     )
                     app.consume(queue="orders", max_messages=1)
 
+                    if not dead_letter:
+                        self.assertEqual(producer.sent, [])  # no retry copy
+                        self.assertEqual(len(consumer.acked), 1)
+                        continue
                     self.assertEqual(len(producer.sent), 1)
                     content, sent_props = producer.sent[0]
                     self.assertNotIn("unsupported-schema-version", sent_props.get("bq-job", ""))

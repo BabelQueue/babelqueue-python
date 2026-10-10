@@ -23,10 +23,24 @@ or ``KafkaTransport(producer=..., consumer_factory=...)``.
 
 from __future__ import annotations
 
+import logging
+import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
-from .codec import EnvelopeCodec, parse_envelope
-from .transport import ReceivedMessage, Transport
+from .codec import SCHEMA_VERSION, EnvelopeCodec, parse_envelope
+from .transport import ReceivedMessage, Transport, truncate_declared_version
+
+_logger = logging.getLogger("babelqueue.kafka")
+
+#: A blank ``bq-schema-version``: empty or only ASCII whitespace (space, \t, \n, \v, \f, \r) — the
+#: same set in every SDK (GR-5). Deliberately not ``str.strip()``, which also strips U+001C-U+001F,
+#: U+0085, U+00A0, U+2028, U+3000 ...
+_BLANK_ASCII_PATTERN = re.compile(r"[ \t\n\x0b\x0c\r]*")
+#: Prefix of the reserved ``route_urn`` a version-gated message is delivered under. It is not a
+#: ``urn:babel:`` URN, so no handler can legitimately own it; the runtime reports it as an
+#: unknown URN, which names the rejected ``bq-schema-version``.
+UNSUPPORTED_SCHEMA_ROUTE_PREFIX = "babelqueue:unsupported-schema-version:"
 
 Headers = List[Tuple[str, bytes]]
 
@@ -136,6 +150,32 @@ class KafkaTransport(Transport):
         return EnvelopeCodec.encode(env)
 
     @staticmethod
+    def _unsupported_schema_version(headers: Any) -> Optional[str]:
+        """The §6.7 step-2 gate on the ``bq-schema-version`` header: the offending raw value, or
+        ``None``.
+
+        ``headers`` is confluent-kafka's ``[(key, value_bytes)]`` list (or ``None``); the first
+        ``bq-schema-version`` entry wins and its value is decoded as UTF-8. A missing header, a
+        null value or a blank value (the empty string or only ASCII whitespace — the same set in
+        every SDK, GR-5, not ``str.strip()``) is not gated: the usual decode path runs. A present
+        value is accepted only when it is exactly the core's supported ``SCHEMA_VERSION`` as a
+        plain decimal string, so ``"2"``, ``"x"``, ``"01"`` and ``" 1"`` are all rejected."""
+        raw: Any = None
+        for key, value in headers or []:
+            name = key.decode("utf-8", "replace") if isinstance(key, (bytes, bytearray)) else key
+            if name == "bq-schema-version":
+                raw = value
+                break
+        if raw is None:
+            return None
+        if isinstance(raw, (bytes, bytearray)):
+            raw = bytes(raw).decode("utf-8", "replace")
+        raw = str(raw)
+        if _BLANK_ASCII_PATTERN.fullmatch(raw) is not None or raw == str(SCHEMA_VERSION):
+            return None
+        return raw
+
+    @staticmethod
     def _payload(message: Any) -> str:
         value = message.value()
         if isinstance(value, (bytes, bytearray)):
@@ -160,13 +200,62 @@ class KafkaTransport(Transport):
         message = self._consumer(queue).poll(wait)
         if message is None or message.error() is not None:
             return None
-        body = self._reconcile(self._payload(message), message.headers())
+        # §6.7 step 2: gate on the ``bq-schema-version`` header BEFORE any body decode (the attempts
+        # reconcile below decodes the body). A rejected record keeps its raw payload and the
+        # reserved route; the runtime then dead-letters it directly (no retry; §6.5).
+        headers = message.headers()
+        unsupported = truncate_declared_version(
+            self._unsupported_schema_version(headers)
+        )
+        if unsupported is not None:
+            _logger.warning(
+                "Kafka record on %r carries unsupported bq-schema-version %r (supported: %s); "
+                "not decoding it.",
+                queue,
+                unsupported,
+                SCHEMA_VERSION,
+            )
+            return ReceivedMessage(
+                body=self._payload(message),
+                queue=queue,
+                handle=message,
+                route_urn=UNSUPPORTED_SCHEMA_ROUTE_PREFIX + quote(unsupported, safe=""),
+            )
+        body = self._reconcile(self._payload(message), headers)
         return ReceivedMessage(body=body, queue=queue, handle=message)
 
     def ack(self, message: ReceivedMessage) -> None:
         if message.handle is None:
             return
         self._consumer(message.queue).commit(message=message.handle, asynchronous=False)
+
+    def rewind(self, message: ReceivedMessage) -> None:
+        """Seek the partition back to ``message``'s offset so the next ``pop`` returns it again
+        (:class:`~babelqueue.transport.Rewinder`). Kafka's commit is a cumulative per-partition
+        position, so merely not acking a record would lose it once a later record is committed."""
+        handle = message.handle
+        if handle is None:
+            return
+        try:
+            from confluent_kafka import TopicPartition
+        except ImportError:  # only reachable with an injected consumer
+            from collections import namedtuple
+
+            TopicPartition = namedtuple("TopicPartition", "topic partition offset")  # type: ignore[misc]
+        topic, partition, offset = handle.topic(), handle.partition(), handle.offset()
+        try:
+            self._consumer(message.queue).seek(TopicPartition(topic, partition, offset))
+        except Exception:
+            # Name the record so an operator can recover it by hand: if the seek fails the
+            # commit of a later record on this partition may skip it.
+            _logger.error(
+                "Kafka seek back to %s[%s]@%s failed; the unsettled record may be skipped by a "
+                "later commit on this partition.",
+                topic,
+                partition,
+                offset,
+            )
+            raise
 
     def close(self) -> None:  # pragma: no cover - resource cleanup
         try:
