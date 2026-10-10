@@ -28,6 +28,29 @@ The envelope wire format is versioned separately by `meta.schema_version`
   stays on the poison / unknown-URN path instead of being routed to a handler.
 
 ### Fixed
+- **`on_unknown_urn=RELEASE` no longer loops a version-gated or poison message forever.**
+  `BabelQueue.dispatch()` re-published such a message unchanged on every delivery (`attempts` never
+  grew, so it never reached the DLQ). A delivery a transport version-gated (reserved
+  `unsupported-schema-version` `route_urn`, e.g. Pulsar `bq-schema-version`), an undecodable body
+  and a body naming no URN now take the bounded `FAIL` path under `RELEASE` (retry up to
+  `max_attempts`, then dead-letter or drop), matching the Go core (GR-5). A genuinely unknown URN
+  still releases verbatim. No public API or wire change. Note: as on the existing `FAIL` path, a
+  body that is not valid JSON is not carried verbatim through the retry / dead-letter re-publish
+  (the runtime re-encodes the envelope it could build, so the producer's original bytes are lost);
+  previously `RELEASE` re-published those bytes unchanged.
+- **Pulsar consumer version-gates on `bq-schema-version` (broker-bindings §5.7 step 3).**
+  `PulsarTransport.pop()` now reads the `bq-schema-version` message property before decoding the
+  body. A missing or blank value changes nothing; "Blank" is the same set in every SDK: the empty string or only ASCII whitespace (space, `\t`, `\n`, `\v`, `\f`, `\r`); anything else (NBSP, U+001C-U+001F, U+0085, U+FEFF, U+3000, ...) is not blank and is rejected unless it is exactly the supported version. (`str.strip()` is not used: it also strips U+001C-U+001F, U+0085, NBSP, ...) a value other than the supported
+  `SCHEMA_VERSION` (`"2"`, `"x"`, `"01"`, ...) is not decoded: the delivery carries the reserved
+  `route_urn` `babelqueue:unsupported-schema-version:<value>`, which no handler owns, so the
+  runtime quarantines it through the existing unknown-URN retry / dead-letter path (the error
+  names the rejected version). The body is passed through untouched. No wire change. The route
+  is an in-process marker only: it also carries the delivery's original `bq-job`, and the retry /
+  dead-letter re-publish (`publish_routed`) writes that original `bq-job` (or, when the delivery
+  had none, the body's job) and the original raw `bq-schema-version` back, never the sentinel, so
+  a redrive meets the same gate. The gate also logs a `babelqueue.pulsar` warning naming the
+  rejected version and queue, including for a body that is not valid JSON (which the runtime
+  quarantines as a poison message whose error names the reserved route).
 - **Pulsar consumer now follows broker-bindings §5.2 / §5.7.** `PulsarTransport.pop()` routes on
   the `bq-job` message property (set on `ReceivedMessage.route_urn`; the body's URN is used only
   when the property is absent or blank) and takes `attempts` from the authoritative

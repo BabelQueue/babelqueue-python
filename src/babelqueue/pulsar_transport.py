@@ -19,6 +19,18 @@ the DLQ keep the producer's original body. When ``bq-job`` and the body name dif
 the property wins and the optional ``on_routing_mismatch(property_urn, body_urn, envelope)``
 hook is called (for an accepted envelope, after attempts are reconciled). A message left un-acked is redelivered (at-least-once).
 
+Before any of that, a ``bq-schema-version`` property that is present but not the core's supported
+``SCHEMA_VERSION`` (``"2"``, ``"x"``, ``"01"``, ...) is version-gated (§5.7 step 3): the body is
+**not decoded** and the message is handed to the runtime under a reserved ``route_urn`` no
+handler owns, so it is quarantined through the existing unknown-URN retry / dead-letter path (the
+error names the rejected version, and a ``babelqueue.pulsar`` warning is logged with the version
+and queue, also for a body that is not valid JSON). A missing or blank property (empty or only
+ASCII whitespace: space, tab, LF, VT, FF, CR - nothing else counts as blank) decodes as usual.
+The reserved route is an in-process marker only: it carries the delivery's original ``bq-job``,
+and a retry / dead-letter re-publish writes that ``bq-job`` (or, when the delivery had none, the
+body's job) and the original raw ``bq-schema-version`` back — never the sentinel — so a redrive
+meets the same gate.
+
 This implements §5 of the broker-bindings contract. The envelope is unchanged
 (``schema_version`` stays 1); Apache Pulsar is purely additive.
 
@@ -30,16 +42,51 @@ transport directly and pass it via ``BabelQueue(transport=...)`` or
 
 from __future__ import annotations
 
+import logging
 import re
+from urllib.parse import quote, unquote
 from typing import Any, Callable, Dict, Optional, Tuple
 
-from .codec import EnvelopeCodec, parse_envelope
+from .codec import SCHEMA_VERSION, EnvelopeCodec, parse_envelope
 from .transport import ReceivedMessage, Transport
 
 #: ``bq-attempts`` is valid only as a run of ASCII digits (no sign, no whitespace) ...
 _ATTEMPTS_PATTERN = re.compile(r"[0-9]+")
+#: A blank ``bq-schema-version``: empty or only ASCII whitespace (space, \t, \n, \v, \f, \r) — the
+#: same set in every SDK (GR-5). Deliberately not ``str.strip()``, which also strips U+001C-U+001F,
+#: U+0085, U+00A0, U+2028, U+3000 ...
+_BLANK_ASCII_PATTERN = re.compile(r"[ \t\n\x0b\x0c\r]*")
 #: ... that fits a signed 32-bit int, matching the Java and .NET consumers (GR-5).
 _MAX_ATTEMPTS = 2**31 - 1
+#: Prefix of the reserved ``route_urn`` a version-gated message is delivered under. It is not a
+#: ``urn:babel:`` URN, so no handler can legitimately own it; the runtime reports it as an
+#: unknown URN, which names the rejected ``bq-schema-version``.
+UNSUPPORTED_SCHEMA_ROUTE_PREFIX = "babelqueue:unsupported-schema-version:"
+#: Separates the rejected version from the delivery's original ``bq-job`` in a gate route.
+_GATE_JOB_PARAM = "?bq-job="
+
+_logger = logging.getLogger("babelqueue.pulsar")
+
+
+def _gate_route(version: str, properties: Dict[str, Any]) -> str:
+    """The reserved route of a version-gated delivery: the prefix, the rejected version and, when
+    the delivery carried one, its original ``bq-job`` (both percent-escaped). The runtime hands
+    it back through :meth:`PulsarTransport.publish_routed` on every retry / dead-letter write."""
+    route = UNSUPPORTED_SCHEMA_ROUTE_PREFIX + quote(version, safe="")
+    job = properties.get("bq-job")
+    if job is not None:
+        route += _GATE_JOB_PARAM + quote(str(job), safe="")
+    return route
+
+
+def _parse_gate_route(route: str) -> Optional[Tuple[str, Optional[str]]]:
+    """Inverse of :func:`_gate_route`: ``(version, bq_job_or_None)``, or ``None`` for any other
+    route."""
+    if not route.startswith(UNSUPPORTED_SCHEMA_ROUTE_PREFIX):
+        return None
+    rest = route[len(UNSUPPORTED_SCHEMA_ROUTE_PREFIX):]
+    raw_version, sep, raw_job = rest.partition(_GATE_JOB_PARAM)
+    return unquote(raw_version), (unquote(raw_job) if sep else None)
 
 
 class PulsarTransport(Transport):
@@ -124,8 +171,19 @@ class PulsarTransport(Transport):
         the body: bq-job/bq-trace-id/bq-message-id + bq-schema-version/lang/attempts. §5.2.
 
         A non-empty ``route_urn`` pins ``bq-job`` (a retry / release re-publish keeps the original
-        delivery's routing URN); blank derives it from the body."""
+        delivery's routing URN); blank derives it from the body.
+
+        A ``route_urn`` that is a version-gate route is never written: the original delivery's
+        ``bq-job`` (if it had one) and raw ``bq-schema-version`` are restored instead, so the
+        republished message is gated the same way when it is consumed again."""
+        gate = _parse_gate_route(route_urn)
         env = parse_envelope(body)
+        if gate is not None:
+            props = PulsarTransport._projection(body) if env else {}
+            props["bq-schema-version"] = gate[0]
+            if gate[1] is not None:
+                props["bq-job"] = gate[1]
+            return props
         if not env:
             return {}
         meta = env.get("meta") or {}
@@ -145,6 +203,23 @@ class PulsarTransport(Transport):
         if route_urn:
             props["bq-job"] = route_urn
         return props
+
+    @staticmethod
+    def _unsupported_schema_version(properties: Dict[str, Any]) -> Optional[str]:
+        """The §5.7 step-3 gate on ``bq-schema-version``: the offending raw value, or ``None``.
+
+        A missing or blank property is not gated (the usual decode path runs); blank means the
+        empty string or only ASCII whitespace (space, ``\\t``, ``\\n``, ``\\v``, ``\\f``, ``\\r``) — the
+        same set in every SDK (GR-5), not ``str.strip()``, which also strips U+001C-U+001F,
+        U+0085, U+00A0, U+2028, U+3000 ... A present property is accepted only when it is exactly
+        the core's supported ``SCHEMA_VERSION`` as a plain decimal string, so ``"2"``, ``"x"``,
+        ``"01"`` and ``" 1"`` are all rejected."""
+        raw = properties.get("bq-schema-version")
+        if raw is None or (isinstance(raw, str) and _BLANK_ASCII_PATTERN.fullmatch(raw) is not None):
+            return None
+        if isinstance(raw, str) and raw == str(SCHEMA_VERSION):
+            return None
+        return str(raw)
 
     @staticmethod
     def _parse_attempts(raw: Any) -> Optional[int]:
@@ -267,10 +342,26 @@ class PulsarTransport(Transport):
             raise
         if message is None:  # pragma: no cover - defensive (real client raises instead)
             return None
+        properties = self._properties(message)
+        rejected = self._unsupported_schema_version(properties)
+        if rejected is not None:
+            # Version gate (§5.7 step 3): quarantine before decoding. The body is handed over
+            # untouched; the reserved route keeps the runtime from dispatching it to a handler.
+            _logger.warning(
+                "Pulsar message on %r rejected by the bq-schema-version gate: unsupported "
+                "version %r (supported: %s); quarantined without decoding the body",
+                queue, rejected, SCHEMA_VERSION,
+            )
+            return ReceivedMessage(
+                body=self._payload(message),
+                queue=queue,
+                handle=message,
+                route_urn=_gate_route(rejected, properties),
+            )
         body, route_urn = self._reconcile(
             self._payload(message),
             self._redelivery_count(message),
-            self._properties(message),
+            properties,
             self._on_routing_mismatch,
         )
         return ReceivedMessage(body=body, queue=queue, handle=message, route_urn=route_urn)

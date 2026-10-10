@@ -218,6 +218,80 @@ class AppTest(unittest.TestCase):
         self.assertEqual(app.transport.size("orders"), 0)
         self.assertEqual(app.transport.size("orders.dlq"), 0)
 
+    def _redeliver_until_settled(self, app, queue, route_urn, first_body, limit=6):
+        """Feed ``first_body`` through ``dispatch`` and keep redelivering whatever the runtime
+        re-publishes to ``queue`` (as a broker would); returns the number of deliveries."""
+        tr = app.transport
+        body = first_body
+        deliveries = 0
+        while body is not None and deliveries < limit:
+            deliveries += 1
+            app.dispatch(ReceivedMessage(body=body, queue=queue, route_urn=route_urn))
+            body = tr._queues[queue].popleft() if tr._queues.get(queue) else None  # noqa: SLF001
+        return deliveries
+
+    def test_version_gated_message_is_bounded_under_release(self) -> None:
+        from babelqueue.app import _UNSUPPORTED_SCHEMA_ROUTE_PREFIX
+        from babelqueue.pulsar_transport import UNSUPPORTED_SCHEMA_ROUTE_PREFIX
+
+        self.assertEqual(_UNSUPPORTED_SCHEMA_ROUTE_PREFIX, UNSUPPORTED_SCHEMA_ROUTE_PREFIX)
+        route = _UNSUPPORTED_SCHEMA_ROUTE_PREFIX + "2"
+        decodable = EnvelopeCodec.encode(EnvelopeCodec.make("urn:babel:orders:created", {}, queue="orders"))
+        for name, body in (("decodable", decodable), ("undecodable", "{not json")):
+            with self.subTest(body=name):
+                app = BabelQueue(
+                    "memory://", queue="orders", max_attempts=3, dead_letter=True,
+                    on_unknown_urn=UnknownUrnStrategy.RELEASE,
+                )
+                seen = []
+                app.handler("urn:babel:orders:created")(lambda d, m: seen.append(d))
+
+                deliveries = self._redeliver_until_settled(app, "orders", route, body)
+
+                self.assertEqual(deliveries, 3)  # max_attempts, not an endless release loop
+                self.assertEqual(seen, [])
+                self.assertEqual(app.transport.size("orders"), 0)
+                self.assertEqual(app.transport.size("orders.dlq"), 1)
+                dead = EnvelopeCodec.decode(app.transport._queues["orders.dlq"][0])  # noqa: SLF001
+                self.assertEqual(dead["dead_letter"]["reason"], "unknown_urn")
+                self.assertIn(route, dead["dead_letter"]["error"])
+
+    def test_version_gated_message_without_dead_letter_is_dropped_under_release(self) -> None:
+        route = "babelqueue:unsupported-schema-version:x"
+        body = EnvelopeCodec.encode(EnvelopeCodec.make("urn:babel:orders:created", {}, queue="orders"))
+        app = BabelQueue(
+            "memory://", queue="orders", max_attempts=2, on_unknown_urn=UnknownUrnStrategy.RELEASE
+        )
+        self.assertEqual(self._redeliver_until_settled(app, "orders", route, body), 2)
+        self.assertEqual(app.transport.size("orders"), 0)
+
+    def test_unknown_urn_release_still_releases_verbatim(self) -> None:
+        body = EnvelopeCodec.encode(EnvelopeCodec.make("urn:babel:orders:nope", {}, queue="orders"))
+        app = BabelQueue(
+            "memory://", queue="orders", max_attempts=2, dead_letter=True,
+            on_unknown_urn=UnknownUrnStrategy.RELEASE,
+        )
+        for route_urn in ("", "urn:babel:orders:nope"):
+            with self.subTest(route_urn=route_urn):
+                app.dispatch(ReceivedMessage(body=body, queue="orders", route_urn=route_urn))
+                self.assertEqual(app.transport.size("orders.dlq"), 0)
+                self.assertEqual(app.transport._queues["orders"].popleft(), body)  # noqa: SLF001
+
+    def test_ungated_poison_is_bounded_under_release(self) -> None:
+        # Not version-gated: an undecodable body and a body naming no URN can never gain a handler
+        # either, so RELEASE takes the bounded FAIL path for them too (Go routePoison parity).
+        no_urn = EnvelopeCodec.encode(EnvelopeCodec.make("urn:babel:orders:created", {}, queue="orders"))
+        no_urn = no_urn.replace('"urn:babel:orders:created"', '""')
+        for name, body in (("undecodable", "{not json"), ("no-urn", no_urn)):
+            with self.subTest(body=name):
+                app = BabelQueue(
+                    "memory://", queue="orders", max_attempts=3, dead_letter=True,
+                    on_unknown_urn=UnknownUrnStrategy.RELEASE,
+                )
+                self.assertEqual(self._redeliver_until_settled(app, "orders", "", body), 3)
+                self.assertEqual(app.transport.size("orders"), 0)
+                self.assertEqual(app.transport.size("orders.dlq"), 1)
+
     def test_unsupported_broker_scheme_raises(self) -> None:
         from babelqueue import BabelQueueError
 

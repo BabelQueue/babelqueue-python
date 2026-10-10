@@ -440,15 +440,22 @@ class BabelQueue:
         if strategy == UnknownUrnStrategy.DELETE:
             self._ack_settled(received)
             return
-        if strategy == UnknownUrnStrategy.RELEASE:
+        # A transport's version-gated delivery, an undecodable body or a body naming no URN can
+        # never gain a handler, so releasing it unchanged would redeliver it forever. It takes the
+        # bounded FAIL path instead (retry up to max_attempts, then dead-letter or drop); only a
+        # genuinely unknown URN keeps the verbatim release.
+        gated = received.route_urn.startswith(_UNSUPPORTED_SCHEMA_ROUTE_PREFIX)
+        poison = gated or not urn
+        if strategy == UnknownUrnStrategy.RELEASE and not poison:
             self._release(received, received.body, self.unknown_urn_release_delay)
             return
         if strategy == UnknownUrnStrategy.DEAD_LETTER:
             self._dead_letter(received, dict(envelope), "unknown_urn", None)
             return
-        # FAIL — surfaced through the retry/dead-letter path (never kills the loop).
+        # FAIL (and RELEASE of a poison message) — surfaced through the retry/dead-letter path
+        # (never kills the loop). A gated delivery names its reserved route (the rejected version).
         raise UnknownUrnError(
-            f"No handler mapped for URN [{urn or '(empty)'}]."
+            f"No handler mapped for URN [{urn or (received.route_urn if gated else '') or '(empty)'}]."
         )
 
     def _retry_or_dead_letter(
@@ -488,6 +495,13 @@ class BabelQueue:
         target = self.dead_letter_queue or (received.queue + self.dead_letter_suffix)
         self._publish_for(received, target, EnvelopeCodec.encode(annotated))
         self._ack_settled(received)
+
+
+#: Reserved ``ReceivedMessage.route_urn`` prefix a transport uses to hand over a delivery it
+#: version-gated (broker-bindings §5.7 step 3, e.g. the pulsar transport's ``bq-schema-version``
+#: check). Not a ``urn:babel:`` URN, so no handler owns it. Must equal
+#: ``pulsar_transport.UNSUPPORTED_SCHEMA_ROUTE_PREFIX`` (locked by a test); never reaches the wire.
+_UNSUPPORTED_SCHEMA_ROUTE_PREFIX = "babelqueue:unsupported-schema-version:"
 
 
 def _without_forbidden_keys(body: str) -> str:

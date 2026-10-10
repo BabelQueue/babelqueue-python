@@ -12,7 +12,11 @@ import json
 import unittest
 
 from babelqueue import EnvelopeCodec
-from babelqueue.pulsar_transport import PulsarTransport
+from babelqueue.pulsar_transport import (
+    UNSUPPORTED_SCHEMA_ROUTE_PREFIX,
+    PulsarTransport,
+    _gate_route,
+)
 from babelqueue.transport import ReceivedMessage, make_transport
 
 try:
@@ -447,6 +451,144 @@ class PulsarConsumeTest(unittest.TestCase):
         self.assertEqual(self._pop_message(raw, {"bq-attempts": "3"}).body, raw)
         self.assertEqual(self._pop_message(raw, None, redelivery_count=3).body, raw)
         self.assertEqual(self._pop(raw, {"bq-attempts": "4"})["attempts"], 4)
+
+    # -- bq-schema-version gate (§5.7 step 3) --------------------------------
+
+    def _pop_raw(self, raw, props):
+        consumer = FakeConsumer([FakeMessage(raw, properties=props)])
+        tr = PulsarTransport(client=FakeClient(consumer=consumer))
+        return tr.pop("orders", timeout=0.1)
+
+    def test_schema_version_missing_or_blank_decodes_normally(self):
+        # blank = empty or only ASCII whitespace (space, \t, \n, \v, \f, \r), identical in every SDK
+        blanks = ("", "  ", "\u000b", "\f", " \t\n\u000b\f\r")
+        for props in (None, {}) + tuple({"bq-schema-version": v} for v in blanks):
+            with self.subTest(props=props):
+                got = self._pop_raw(body(), props)
+                self.assertEqual(got.route_urn, "")
+                self.assertEqual(EnvelopeCodec.urn(EnvelopeCodec.decode(got.body)), URN)
+
+    def test_schema_version_supported_is_delivered(self):
+        got = self._pop_raw(body(), {"bq-schema-version": "1", "bq-attempts": "3"})
+        self.assertEqual(got.route_urn, "")
+        self.assertEqual(EnvelopeCodec.decode(got.body)["attempts"], 3)
+
+    def test_unsupported_schema_version_gates_before_decode(self):
+        # A body that is not JSON still yields the version-gate route: a decode error would
+        # leave route_urn empty. The payload reaches the runtime untouched.
+        garbage = "{not json"
+        # NBSP, U+001C, U+0085, U+FEFF and U+3000 are not ASCII whitespace, hence not blank
+        for value in ("2", "x", "01", " 1", "1.0", "-1", "\u00a0", "\u001c", "\u0085", "\ufeff", "\u3000"):
+            with self.subTest(value=value):
+                got = self._pop_raw(garbage, {"bq-schema-version": value, "bq-job": URN})
+                self.assertEqual(got.route_urn, _gate_route(value, {"bq-job": URN}))
+                self.assertTrue(got.route_urn.startswith(UNSUPPORTED_SCHEMA_ROUTE_PREFIX))
+                self.assertEqual(got.body, garbage)
+
+    def test_gate_logs_a_warning_naming_the_version_even_for_an_invalid_body(self):
+        with self.assertLogs("babelqueue.pulsar", level="WARNING") as logs:
+            self._pop_raw("{not json", {"bq-schema-version": "2"})
+        self.assertIn("'2'", logs.output[0])
+        self.assertIn("'orders'", logs.output[0])
+
+    def test_supported_version_does_not_log(self):
+        from unittest import mock
+
+        from babelqueue import pulsar_transport
+
+        with mock.patch.object(pulsar_transport._logger, "warning") as warn:
+            self._pop_raw(body(), {"bq-schema-version": "1"})
+            self._pop_raw(body(), {})
+        warn.assert_not_called()
+
+    def test_gated_message_does_not_call_the_mismatch_hook(self):
+        calls = []
+        consumer = FakeConsumer(
+            [FakeMessage(body(), properties={"bq-schema-version": "2", "bq-job": "urn:babel:orders:refunded"})]
+        )
+        tr = PulsarTransport(
+            client=FakeClient(consumer=consumer), on_routing_mismatch=lambda *a: calls.append(a)
+        )
+        tr.pop("orders", timeout=0.1)
+        self.assertEqual(calls, [])
+
+    def test_app_quarantines_unsupported_schema_version(self):
+        from babelqueue import BabelQueue
+
+        for value in ("2", "x"):
+            with self.subTest(value=value):
+                producer = FakeProducer()
+                consumer = FakeConsumer(
+                    [FakeMessage(body(), properties={"bq-schema-version": value, "bq-job": URN})]
+                )
+                tr = PulsarTransport(client=FakeClient(producer=producer, consumer=consumer))
+                app = BabelQueue(transport=tr, max_attempts=1, dead_letter=True)
+                seen = []
+
+                @app.handler(URN)
+                def on_created(data, meta):
+                    seen.append(data)
+
+                app.consume(queue="orders", max_messages=1)
+
+                self.assertEqual(seen, [])  # never reaches a handler
+                self.assertEqual(len(consumer.acked), 1)
+                self.assertEqual(len(producer.sent), 1)
+                dead = EnvelopeCodec.decode(producer.sent[0][0].decode("utf-8"))
+                self.assertEqual(dead["job"], URN)  # the producer's body, annotated
+                self.assertEqual(dead["dead_letter"]["reason"], "unknown_urn")
+                self.assertIn(UNSUPPORTED_SCHEMA_ROUTE_PREFIX + value, dead["dead_letter"]["error"])
+
+    def test_republish_of_gated_message_never_writes_the_sentinel(self):
+        """Retry copy and dead-letter record keep the original bq-job / bq-schema-version (the
+        sentinel is an in-process marker) and the body, so a redrive meets the same gate."""
+        from babelqueue import BabelQueue
+
+        cases = (
+            ("with bq-job", {"bq-schema-version": "2", "bq-job": "urn:babel:orders:legacy"}, "urn:babel:orders:legacy"),
+            ("without bq-job", {"bq-schema-version": "x"}, URN),  # derived from the body, never the sentinel
+            ("escaped", {"bq-schema-version": "2&x=?bq-job=%", "bq-job": "a?bq-job=b&c d"}, "a?bq-job=b&c d"),
+        )
+        for name, props, want_job in cases:
+            for dead_letter in (False, True):
+                with self.subTest(case=name, dead_letter=dead_letter):
+                    producer = FakeProducer()
+                    consumer = FakeConsumer([FakeMessage(body(), properties=dict(props))])
+                    tr = PulsarTransport(client=FakeClient(producer=producer, consumer=consumer))
+                    app = BabelQueue(
+                        transport=tr, max_attempts=1 if dead_letter else 5, dead_letter=dead_letter
+                    )
+                    app.consume(queue="orders", max_messages=1)
+
+                    self.assertEqual(len(producer.sent), 1)
+                    content, sent_props = producer.sent[0]
+                    self.assertNotIn("unsupported-schema-version", sent_props.get("bq-job", ""))
+                    self.assertEqual(sent_props.get("bq-job"), want_job)
+                    self.assertEqual(sent_props["bq-schema-version"], props["bq-schema-version"])
+                    self.assertEqual(EnvelopeCodec.decode(content.decode("utf-8"))["job"], URN)
+
+                    # the re-published message is gated again on the next consume
+                    again = self._pop_raw(content.decode("utf-8"), sent_props)
+                    self.assertTrue(again.route_urn.startswith(UNSUPPORTED_SCHEMA_ROUTE_PREFIX))
+
+    def test_invalid_body_with_unsupported_version_is_quarantined_without_a_handler(self):
+        from babelqueue import BabelQueue
+
+        producer = FakeProducer()
+        consumer = FakeConsumer([FakeMessage("{not json", properties={"bq-schema-version": "2"})])
+        tr = PulsarTransport(client=FakeClient(producer=producer, consumer=consumer))
+        app = BabelQueue(transport=tr, max_attempts=1, dead_letter=True)
+        seen = []
+
+        @app.handler(URN)
+        def on_created(data, meta):
+            seen.append(data)
+
+        with self.assertLogs("babelqueue.pulsar", level="WARNING"):
+            app.consume(queue="orders", max_messages=1)
+        self.assertEqual(seen, [])
+        for _content, sent_props in producer.sent:
+            self.assertNotIn("unsupported-schema-version", (sent_props or {}).get("bq-job", ""))
 
     def test_pop_empty_returns_none_on_timeout(self):
         tr = PulsarTransport(client=FakeClient(consumer=FakeConsumer([])))
