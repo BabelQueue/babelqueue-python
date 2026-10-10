@@ -8,6 +8,7 @@ client covers everything). Only ``_build_client`` needs the real package.
 
 from __future__ import annotations
 
+import json
 import unittest
 
 from babelqueue import EnvelopeCodec
@@ -54,15 +55,19 @@ class Timeout(Exception):
 class FakeMessage:
     """Duck-typed pulsar Message: data()/redelivery_count() are callables."""
 
-    def __init__(self, raw: str, redelivery_count: int = 0) -> None:
+    def __init__(self, raw: str, redelivery_count: int = 0, properties=None) -> None:
         self._raw = raw
         self._rc = redelivery_count
+        self._props = properties
 
     def data(self) -> bytes:
         return self._raw.encode("utf-8")
 
     def redelivery_count(self) -> int:
         return self._rc
+
+    def properties(self):
+        return self._props
 
 
 class FakeProducer:
@@ -125,22 +130,22 @@ class PulsarProjectionTest(unittest.TestCase):
         self.assertEqual(PulsarTransport._projection("not-json"), {})
 
     def test_reconcile_attempts_is_redelivery_count(self):
-        out = PulsarTransport._reconcile(body(0), 2)
+        out = PulsarTransport._reconcile(body(0), 2)[0]
         self.assertEqual(EnvelopeCodec.decode(out)["attempts"], 2)
 
     def test_reconcile_first_delivery_is_zero(self):
-        out = PulsarTransport._reconcile(body(0), 0)
+        out = PulsarTransport._reconcile(body(0), 0)[0]
         self.assertEqual(EnvelopeCodec.decode(out)["attempts"], 0)
 
     def test_reconcile_ignores_garbage_count(self):
         raw = body(5)
-        self.assertEqual(PulsarTransport._reconcile(raw, "not-a-number"), raw)
+        self.assertEqual(PulsarTransport._reconcile(raw, "not-a-number"), (raw, ""))
 
     def test_reconcile_never_lowers_runtime_count(self):
         # The runtime retries by republishing with attempts+1 (redelivery count back to 0),
         # so a higher body count must win over a lower native one.
         raw = body(5)
-        self.assertEqual(int(EnvelopeCodec.decode(PulsarTransport._reconcile(raw, 1))["attempts"]), 5)
+        self.assertEqual(int(EnvelopeCodec.decode(PulsarTransport._reconcile(raw, 1)[0])["attempts"]), 5)
 
 
 class PulsarPublishTest(unittest.TestCase):
@@ -181,6 +186,267 @@ class PulsarConsumeTest(unittest.TestCase):
         self.assertEqual(msg.queue, "orders")
         self.assertIs(msg.handle, message)
         self.assertEqual(EnvelopeCodec.decode(msg.body)["attempts"], 2)
+
+    def _pop_message(self, raw: str, properties, redelivery_count: int = 0, **options):
+        message = FakeMessage(raw, redelivery_count=redelivery_count, properties=properties)
+        tr = PulsarTransport(client=FakeClient(consumer=FakeConsumer([message])), **options)
+        popped = tr.pop("orders")
+        self.assertIsNotNone(popped)
+        return popped
+
+    def _pop(self, raw: str, properties, redelivery_count: int = 0, **options) -> dict:
+        return EnvelopeCodec.decode(self._pop_message(raw, properties, redelivery_count, **options).body)
+
+    def _body_with_urn(self, urn: str, attempts: int = 0) -> str:
+        env = EnvelopeCodec.decode(body(attempts))
+        env["job"] = urn
+        return EnvelopeCodec.encode(env)
+
+    def test_pop_routes_on_bq_job_property_without_rewriting_the_body(self):
+        other = "urn:babel:billing:invoiced"
+        raw = self._body_with_urn(other)
+        calls = []
+        popped = self._pop_message(
+            raw,
+            {"bq-job": URN},
+            on_routing_mismatch=lambda prop, body_urn, envelope: calls.append((prop, body_urn, envelope)),
+        )
+        self.assertEqual(popped.route_urn, URN)
+        self.assertEqual(popped.body, raw)  # byte-identical: the producer's body is untouched
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], URN)
+        self.assertEqual(calls[0][1], other)
+        self.assertEqual(calls[0][2]["job"], other)
+        self.assertEqual(calls[0][2]["data"], {"order_id": 1042})
+
+    def test_pop_routing_works_without_a_hook(self):
+        popped = self._pop_message(self._body_with_urn("urn:babel:billing:invoiced"), {"bq-job": URN})
+        self.assertEqual(popped.route_urn, URN)
+
+    def test_app_routes_on_bq_job_and_retry_keeps_the_original_body(self):
+        from babelqueue import BabelQueue
+
+        other = "urn:babel:billing:invoiced"
+        raw = self._body_with_urn(other)
+        producer = FakeProducer()
+        consumer = FakeConsumer([FakeMessage(raw, properties={"bq-job": URN})])
+        tr = PulsarTransport(client=FakeClient(producer=producer, consumer=consumer))
+        app = BabelQueue(transport=tr, max_attempts=3)
+        seen = []
+
+        @app.handler(URN)
+        def on_created(data, meta, envelope):
+            seen.append(EnvelopeCodec.urn(envelope))
+            raise RuntimeError("boom")
+
+        app.consume(queue="orders", max_messages=1)
+
+        self.assertEqual(seen, [other])  # handler got the producer's body, not a rewritten one
+        retried = EnvelopeCodec.decode(producer.sent[0][0].decode("utf-8"))
+        self.assertEqual(retried["job"], other)
+        self.assertEqual(retried["attempts"], 1)
+        # The re-published message keeps the ORIGINAL bq-job property (not the body URN) ...
+        self.assertEqual(producer.sent[0][1]["bq-job"], URN)
+        self.assertEqual(producer.sent[0][1]["bq-attempts"], "1")
+
+        # ... so the broker's second delivery is routed to the same handler.
+        consumer._messages.append(FakeMessage(producer.sent[0][0].decode("utf-8"), properties=producer.sent[0][1]))
+        app.consume(queue="orders", max_messages=1)
+        self.assertEqual(seen, [other, other])
+
+    def test_app_unknown_urn_release_keeps_the_original_route(self):
+        from babelqueue import BabelQueue, UnknownUrnStrategy
+
+        routed = "urn:babel:orders:unregistered"
+        raw = self._body_with_urn(URN)
+        producer = FakeProducer()
+        consumer = FakeConsumer([FakeMessage(raw, properties={"bq-job": routed})])
+        tr = PulsarTransport(client=FakeClient(producer=producer, consumer=consumer))
+        app = BabelQueue(transport=tr, on_unknown_urn=UnknownUrnStrategy.RELEASE)
+        seen = []
+
+        @app.handler(URN)  # the body URN has a handler; the route URN does not
+        def on_created(data, meta):
+            seen.append(data)
+
+        app.consume(queue="orders", max_messages=1)
+
+        self.assertEqual(len(producer.sent), 1)
+        self.assertEqual(producer.sent[0][0].decode("utf-8"), raw)
+        self.assertEqual(producer.sent[0][1]["bq-job"], routed)
+
+        consumer._messages.append(FakeMessage(producer.sent[0][0].decode("utf-8"), properties=producer.sent[0][1]))
+        app.consume(queue="orders", max_messages=1)
+        self.assertEqual(seen, [])  # still unknown, not flipped to the body URN's handler
+        self.assertEqual(len(producer.sent), 2)
+        self.assertEqual(producer.sent[1][1]["bq-job"], routed)
+
+    def test_app_dead_letter_record_keeps_the_original_route(self):
+        from babelqueue import BabelQueue
+
+        other = "urn:babel:billing:invoiced"
+        raw = self._body_with_urn(other)
+        producer = FakeProducer()
+        consumer = FakeConsumer([FakeMessage(raw, properties={"bq-job": URN})])
+        tr = PulsarTransport(client=FakeClient(producer=producer, consumer=consumer))
+        app = BabelQueue(transport=tr, max_attempts=1, dead_letter=True)
+
+        @app.handler(URN)
+        def on_created(data, meta):
+            raise RuntimeError("boom")
+
+        app.consume(queue="orders", max_messages=1)
+
+        self.assertEqual(len(producer.sent), 1)
+        dead = EnvelopeCodec.decode(producer.sent[0][0].decode("utf-8"))
+        self.assertEqual(dead["job"], other)  # the producer's body, annotated
+        self.assertEqual(dead["dead_letter"]["original_queue"], "orders")
+        # The DLQ record carries the ORIGINAL bq-job, not one derived from the body URN.
+        self.assertEqual(producer.sent[0][1]["bq-job"], URN)
+
+    def test_publish_routed_pins_bq_job_and_blank_derives_from_body(self):
+        producer = FakeProducer()
+        tr = PulsarTransport(client=FakeClient(producer=producer))
+        raw = self._body_with_urn("urn:babel:billing:invoiced")
+
+        tr.publish_routed("orders", raw, URN)
+        tr.publish_routed("orders", raw, "")
+        tr.publish("orders", raw)
+
+        self.assertEqual(producer.sent[0][1]["bq-job"], URN)
+        self.assertEqual(producer.sent[1][1]["bq-job"], "urn:babel:billing:invoiced")
+        self.assertEqual(producer.sent[2][1]["bq-job"], "urn:babel:billing:invoiced")
+
+    def test_routing_mismatch_hook_fires_only_on_mismatch(self):
+        calls = []
+        hook = lambda *args: calls.append(args)  # noqa: E731
+        self._pop(body(0), {"bq-job": URN}, on_routing_mismatch=hook)
+        self._pop(body(0), {"bq-job": f"  {URN}  "}, on_routing_mismatch=hook)
+        self._pop(body(0), None, on_routing_mismatch=hook)
+        self._pop(body(0), {"bq-job": "  "}, on_routing_mismatch=hook)
+        no_job = EnvelopeCodec.decode(body(0))
+        del no_job["job"]
+        self._pop(EnvelopeCodec.encode(no_job), {"bq-job": URN}, on_routing_mismatch=hook)
+        self.assertEqual(calls, [])
+
+    def test_raising_routing_mismatch_hook_does_not_break_pop_or_ack(self):
+        def boom(*args):
+            raise RuntimeError("hook failure")
+
+        message = FakeMessage(
+            self._body_with_urn("urn:babel:billing:invoiced"), properties={"bq-job": URN}
+        )
+        consumer = FakeConsumer([message])
+        tr = PulsarTransport(client=FakeClient(consumer=consumer), on_routing_mismatch=boom)
+
+        popped = tr.pop("orders")
+
+        self.assertIsNotNone(popped)
+        self.assertEqual(popped.route_urn, URN)
+        tr.ack(popped)
+        self.assertEqual(consumer.acked, [message])
+
+    def test_hook_sees_reconciled_attempts(self):
+        calls = []
+        self._pop(
+            self._body_with_urn("urn:babel:billing:invoiced"),
+            {"bq-job": URN, "bq-attempts": "4"},
+            on_routing_mismatch=lambda prop, body_urn, envelope: calls.append(envelope["attempts"]),
+        )
+        self.assertEqual(calls, [4])
+
+    def test_hook_not_called_for_a_rejected_envelope(self):
+        calls = []
+        hook = lambda *args: calls.append(args)  # noqa: E731
+        env = EnvelopeCodec.decode(self._body_with_urn("urn:babel:billing:invoiced"))
+        env["meta"]["schema_version"] = 2
+        self._pop_message(json.dumps(env), {"bq-job": URN}, on_routing_mismatch=hook)
+        env = EnvelopeCodec.decode(self._body_with_urn("urn:babel:billing:invoiced"))
+        env["trace_id"] = ""
+        self._pop_message(json.dumps(env), {"bq-job": URN}, on_routing_mismatch=hook)
+        self.assertEqual(calls, [])
+
+    def test_pop_keeps_the_urn_alias_in_the_body(self):
+        env = EnvelopeCodec.decode(body(0))
+        env["urn"] = env.pop("job")
+        raw = json.dumps(env)
+        popped = self._pop_message(raw, {"bq-job": "urn:babel:billing:invoiced"})
+        self.assertEqual(popped.body, raw)
+        self.assertEqual(popped.route_urn, "urn:babel:billing:invoiced")
+
+    def test_pop_falls_back_to_body_urn_when_bq_job_missing_or_blank(self):
+        for props in (None, {}, {"bq-job": ""}, {"bq-job": "   "}):
+            with self.subTest(props=props):
+                popped = self._pop_message(body(0), props)
+                self.assertEqual(popped.route_urn, "")
+                self.assertEqual(EnvelopeCodec.urn(EnvelopeCodec.decode(popped.body)), URN)
+
+    def test_pop_bq_job_is_trimmed(self):
+        popped = self._pop_message(self._body_with_urn("urn:babel:billing:invoiced"), {"bq-job": f"  {URN}  "})
+        self.assertEqual(popped.route_urn, URN)
+
+    def test_pop_body_without_job_is_rejected_despite_bq_job(self):
+        raw = body(0)
+        env = EnvelopeCodec.decode(raw)
+        del env["job"]
+        popped = self._pop_message(EnvelopeCodec.encode(env), {"bq-job": URN})
+        env = EnvelopeCodec.decode(popped.body)
+        self.assertEqual(popped.route_urn, "")
+        self.assertEqual(EnvelopeCodec.urn(env), "")
+        self.assertFalse(EnvelopeCodec.accepts(env))
+
+    def test_pop_bq_attempts_is_authoritative(self):
+        cases = [
+            ("property replaces body", 5, "3", 0, 3),
+            ("property raises body", 1, "4", 0, 4),
+            ("redelivery raises property", 0, "2", 6, 6),
+            ("property above redelivery", 0, "7", 2, 7),
+            ("leading zeros are digits", 0, "007", 0, 7),
+            ("zero property lowers body", 5, "0", 0, 0),
+            ("int32 max is valid", 0, "2147483647", 0, 2147483647),
+        ]
+        for name, body_attempts, prop, rc, want in cases:
+            with self.subTest(name):
+                env = self._pop(body(body_attempts), {"bq-attempts": prop}, rc)
+                self.assertEqual(env["attempts"], want)
+
+    def test_pop_invalid_bq_attempts_falls_back_to_body(self):
+        bad_values = ["", " ", "abc", "-1", "+3", "-0", "3.5", "1e2", " 3", "3 ", "3\n", " 3x",
+                      "\u0663", "2147483648", "99999999999999999999", None, 3]
+        for bad in bad_values:
+            with self.subTest(bad=bad):
+                env = self._pop(body(5), {"bq-attempts": bad})
+                self.assertEqual(env["attempts"], 5)
+
+    def test_pop_invalid_bq_attempts_still_applies_redelivery_count(self):
+        env = self._pop(body(5), {"bq-attempts": "nope"}, redelivery_count=9)
+        self.assertEqual(env["attempts"], 9)
+
+    def test_pop_missing_bq_attempts_falls_back_to_body(self):
+        for props in (None, {}):
+            with self.subTest(props=props):
+                self.assertEqual(self._pop(body(5), props)["attempts"], 5)
+
+    def test_missing_or_non_integer_body_attempts_stays_rejected(self):
+        for name, value in (("missing", None), ("string", "3"), ("null", "null"), ("float", 1.5), ("bool", True)):
+            with self.subTest(name):
+                env = EnvelopeCodec.decode(body(0))
+                if name == "missing":
+                    del env["attempts"]
+                elif name == "null":
+                    env["attempts"] = None
+                else:
+                    env["attempts"] = value
+                raw = json.dumps(env)
+                popped = self._pop_message(raw, {"bq-attempts": "4"}, redelivery_count=2)
+                self.assertEqual(popped.body, raw)  # attempts is never repaired into the body
+                self.assertFalse(EnvelopeCodec.accepts(EnvelopeCodec.decode(popped.body)))
+
+    def test_attempts_written_only_when_the_value_changes(self):
+        raw = body(3)
+        self.assertEqual(self._pop_message(raw, {"bq-attempts": "3"}).body, raw)
+        self.assertEqual(self._pop_message(raw, None, redelivery_count=3).body, raw)
+        self.assertEqual(self._pop(raw, {"bq-attempts": "4"})["attempts"], 4)
 
     def test_pop_empty_returns_none_on_timeout(self):
         tr = PulsarTransport(client=FakeClient(consumer=FakeConsumer([])))

@@ -36,7 +36,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from .codec import EnvelopeCodec
 from .replay import HEADER_REPLAY_BYPASS
-from .transport import HeaderPublisher, ReceivedMessage, Transport
+from .transport import HeaderPublisher, ReceivedMessage, Transport, publish_keeping_route
 
 Envelope = Mapping[str, Any]
 Select = Callable[[Envelope], bool]
@@ -88,7 +88,7 @@ def redrive(
     result = RedriveResult()
     for message, envelope in batch:
         if envelope is None:
-            transport.publish(dlq, message.body)  # restore the poison body; never drop it
+            publish_keeping_route(transport, dlq, message.body, message.route_urn)  # restore the poison body; never drop it
             transport.ack(message)
             result.skipped += 1
             result.items.append(RedriveItem("", "", "", "", dlq, "", False))
@@ -109,7 +109,7 @@ def redrive(
         )
 
         if select is not None and not select(envelope):
-            transport.publish(dlq, message.body)  # not selected: restore unchanged
+            publish_keeping_route(transport, dlq, message.body, message.route_urn)  # not selected: restore unchanged
             transport.ack(message)
             result.skipped += 1
             result.items.append(item)
@@ -119,7 +119,7 @@ def redrive(
         item.to = target
 
         if dry_run:
-            transport.publish(dlq, message.body)  # report the plan; restore unchanged
+            publish_keeping_route(transport, dlq, message.body, message.route_urn)  # report the plan; restore unchanged
             transport.ack(message)
             result.skipped += 1
             result.items.append(item)
@@ -130,10 +130,10 @@ def redrive(
         reset["attempts"] = 0
         try:
             item.bypassed = _publish_redriven(
-                transport, target, EnvelopeCodec.encode(reset), bypass
+                transport, target, EnvelopeCodec.encode(reset), bypass, message.route_urn
             )
         except Exception:
-            transport.publish(dlq, message.body)  # restore on a publish failure, then surface
+            publish_keeping_route(transport, dlq, message.body, message.route_urn)  # restore on a publish failure, then surface
             transport.ack(message)
             raise
         transport.ack(message)
@@ -156,14 +156,18 @@ def _decoded(body: str) -> Optional[Dict[str, Any]]:
     return envelope
 
 
-def _publish_redriven(transport: Transport, queue: str, body: str, bypass: bool) -> bool:
+def _publish_redriven(
+    transport: Transport, queue: str, body: str, bypass: bool, route_urn: str = ""
+) -> bool:
     """Re-publish a reset message to ``queue``. When ``bypass`` is set and the transport is a
     :class:`~babelqueue.transport.HeaderPublisher`, stamp the ``bq-replay-bypass`` header and
-    return True; otherwise publish plainly and return False."""
+    return True; otherwise publish plainly and return False. Either way a non-empty ``route_urn``
+    (the dead-lettered message's routing property) is carried back through
+    :class:`~babelqueue.transport.RoutedPublisher` when the transport implements it."""
     if bypass and isinstance(transport, HeaderPublisher):
         transport.publish_with_headers(queue, body, {HEADER_REPLAY_BYPASS: "1"})
         return True
-    transport.publish(queue, body)
+    publish_keeping_route(transport, queue, body, route_urn)
     return False
 
 

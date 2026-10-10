@@ -9,6 +9,40 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+- **`ReceivedMessage.route_urn` routing seam** (MINOR). An optional field a transport can set
+  when its broker carries the URN out of band. When non-empty `BabelQueue.dispatch()` looks the
+  handler up by it instead of the decoded body's URN; empty (the default for every existing
+  transport) keeps routing on the body. The body is never rewritten, so the handler, the retry
+  re-publish and the dead-letter record carry the producer's original body (including a `urn`
+  alias). No wire change.
+- **`RoutedPublisher` optional transport capability** (MINOR). `publish_routed(queue, body,
+  route_urn)`. When a delivery has a `route_urn` and the transport implements it, the retry, release and dead-letter
+  writes, and `redrive`, use it so the broker's routing property keeps the original
+  value across attempts (no flip to the body URN on the second delivery). `PulsarTransport`
+  implements it (`bq-job` pinned; blank derives from the body). Others keep plain `publish`.
+  No wire change.
+
+### Changed
+- `BabelQueue.dispatch()` applies `route_urn` only to a body that decodes; an undecodable body
+  stays on the poison / unknown-URN path instead of being routed to a handler.
+
+### Fixed
+- **Pulsar consumer now follows broker-bindings §5.2 / §5.7.** `PulsarTransport.pop()` routes on
+  the `bq-job` message property (set on `ReceivedMessage.route_urn`; the body's URN is used only
+  when the property is absent or blank) and takes `attempts` from the authoritative
+  `bq-attempts` property (the body's value is used only when the property is absent or not a
+  plain ASCII-decimal integer that fits a 32-bit int), then applies `max(.., redelivery_count)`.
+  Previously only the body was read. The body's `job` / `urn` is **not** rewritten, so a
+  property/body mismatch no longer leaks into retries or the DLQ; `attempts` is written into the
+  body only when the body already holds an integer `attempts` and the value changes (a missing
+  or non-integer `attempts` is still rejected by `EnvelopeCodec.accepts`). When the property and
+  the body name different URNs the property wins and the new optional
+  `on_routing_mismatch(property_urn, body_urn, envelope)` constructor hook is called for an
+  accepted envelope, after attempts are reconciled (its exceptions are swallowed; it is separate
+  from error handling). A body without a URN is still rejected. No wire change
+  (`schema_version: 1`).
+
 ## [1.14.0] - 2026-10-03
 
 ### Added

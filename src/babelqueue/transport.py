@@ -24,6 +24,12 @@ class ReceivedMessage:
     #: Out-of-band transport headers a :class:`HeaderPublisher` carried with the message
     #: (e.g. the ``bq-replay-bypass`` marker). Empty for transports that don't surface them.
     headers: Dict[str, str] = field(default_factory=dict)
+    #: Optional routing override: when non-empty the app looks the handler up by this URN
+    #: instead of the decoded body's URN. A transport whose broker carries the URN out of band
+    #: (e.g. the Pulsar ``bq-job`` property) fills it so routing follows the property while the
+    #: body is left untouched (handler, retry and dead-letter keep the producer's original body).
+    #: Empty means "route on the body URN" (the default for every other transport).
+    route_urn: str = ""
 
 
 class Transport(ABC):
@@ -55,6 +61,30 @@ class HeaderPublisher(Protocol):
     def publish_with_headers(self, queue: str, body: str, headers: Dict[str, str]) -> None:
         """Append ``body`` to ``queue`` along with out-of-band ``headers``."""
         ...
+
+
+@runtime_checkable
+class RoutedPublisher(Protocol):
+    """Optional :class:`Transport` capability: re-publish a body while keeping the routing
+    identity the broker's own routing property carried on the original delivery
+    (:attr:`ReceivedMessage.route_urn`). The runtime uses it for its retry and unknown-URN
+    release re-publishes when the received message was routed on a URN that differs from its
+    body, so the route stays constant across retries (broker-bindings §5.2 / §5.7). A transport
+    that does not implement it gets a plain :meth:`Transport.publish`."""
+
+    def publish_routed(self, queue: str, body: str, route_urn: str) -> None:
+        """Append ``body`` to ``queue``, pinning the broker routing property to ``route_urn``."""
+        ...
+
+
+def publish_keeping_route(transport: "Transport", queue: str, body: str, route_urn: str = "") -> None:
+    """Publish ``body`` to ``queue``, carrying ``route_urn`` when it is non-empty and the
+    transport implements :class:`RoutedPublisher`; otherwise a plain :meth:`Transport.publish`.
+    Shared by the runtime's re-publishes (retry, release, dead-letter) and by ``redrive``."""
+    if route_urn and isinstance(transport, RoutedPublisher):
+        transport.publish_routed(queue, body, route_urn)
+    else:
+        transport.publish(queue, body)
 
 
 @runtime_checkable

@@ -138,3 +138,41 @@ def test_redrive_undecodable_restored():
     assert result.redriven == 0 and result.skipped == 1
     message = t.pop("dlq", 0)
     assert message is not None and message.body == "not-json{{{"
+
+
+class _RoutedDLQ(InMemoryTransport):
+    """Stamps a route URN on every popped message and records publish_routed calls."""
+
+    def __init__(self, route_urn=""):
+        super().__init__()
+        self.route_urn = route_urn
+        self.routed = []
+
+    def pop(self, queue, timeout=0.0):
+        message = super().pop(queue, timeout)
+        if message is not None:
+            message.route_urn = self.route_urn
+        return message
+
+    def publish_routed(self, queue, body, route_urn):
+        self.routed.append((queue, route_urn))
+        super().publish(queue, body)
+
+
+def test_redrive_keeps_the_route_urn():
+    route = "urn:babel:orders:refunded"
+    t = _RoutedDLQ(route)
+    _dead_letter(t, "dlq", "urn:babel:orders:created", "orders")
+    redrive(t, "dlq")
+    assert t.routed == [("orders", route)]
+
+    t2 = _RoutedDLQ(route)  # a dry-run restore to the DLQ keeps the route too
+    _dead_letter(t2, "dlq", "urn:babel:orders:created", "orders")
+    redrive(t2, "dlq", dry_run=True)
+    assert t2.routed == [("dlq", route)]
+
+    t3 = _RoutedDLQ()  # no route -> plain publish
+    _dead_letter(t3, "dlq", "urn:babel:orders:created", "orders")
+    redrive(t3, "dlq")
+    assert t3.routed == []
+    assert len(_drain(t3, "orders")) == 1

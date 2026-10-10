@@ -45,6 +45,7 @@ from .transport import (
     Redeliverer,
     Transport,
     make_transport,
+    publish_keeping_route,
 )
 
 Handler = Callable[..., None]
@@ -278,6 +279,10 @@ class BabelQueue:
         ):
             envelope = EnvelopeCodec.decode(received.body)
             urn = str(envelope.get("job") or envelope.get("urn") or "")
+            if received.route_urn and envelope:
+                # Transport-supplied routing override; body untouched. Only for a body that
+                # decodes: an undecodable one (decode() yields {}) stays on the poison path.
+                urn = received.route_urn
             handler = self._handlers.get(urn) if urn else None
 
             try:
@@ -381,8 +386,15 @@ class BabelQueue:
         if isinstance(self.transport, Redeliverer):
             self.transport.redeliver(received, body, delay)
             return
-        self.transport.publish(received.queue, _without_forbidden_keys(body))
+        self._publish_for(received, received.queue, _without_forbidden_keys(body))
         self._ack_settled(received)
+
+    def _publish_for(self, received: ReceivedMessage, queue: str, body: str) -> None:
+        """Publish ``body`` to ``queue`` on behalf of ``received`` (a retry / release re-publish
+        or its dead-letter record). Keeps the routing URN the broker property carried on this
+        delivery when the transport can pin it (:class:`RoutedPublisher`), so a property/body
+        mismatch does not flip to the body URN on the next attempt or in the DLQ."""
+        publish_keeping_route(self.transport, queue, body, received.route_urn)
 
     def _ack_settled(self, received: ReceivedMessage) -> None:
         """Acknowledge a message whose outcome is already final (handled, dead-lettered,
@@ -474,7 +486,7 @@ class BabelQueue:
             exception=(type(exc).__name__ if exc is not None else None),
         )
         target = self.dead_letter_queue or (received.queue + self.dead_letter_suffix)
-        self.transport.publish(target, EnvelopeCodec.encode(annotated))
+        self._publish_for(received, target, EnvelopeCodec.encode(annotated))
         self._ack_settled(received)
 
 

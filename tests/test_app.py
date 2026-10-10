@@ -8,6 +8,7 @@ from __future__ import annotations
 import unittest
 
 from babelqueue import BabelQueue, EnvelopeCodec, UnknownUrnStrategy
+from babelqueue.transport import InMemoryTransport, ReceivedMessage
 
 
 class AppTest(unittest.TestCase):
@@ -60,6 +61,109 @@ class AppTest(unittest.TestCase):
 
         app.consume(max_messages=1)
         self.assertEqual(captured, {"order_id": 9, "amount": "9.90"})
+
+    def test_route_urn_overrides_the_body_urn_without_rewriting_the_body(self) -> None:
+        app = BabelQueue("memory://", queue="orders")
+        seen = []
+
+        @app.handler("urn:babel:orders:created")
+        def handle(data, meta, message):  # noqa: ANN001
+            seen.append(message["job"])
+
+        body = EnvelopeCodec.encode(EnvelopeCodec.make("urn:babel:billing:invoiced", {}, queue="orders"))
+        app.dispatch(ReceivedMessage(body=body, queue="orders", route_urn="urn:babel:orders:created"))
+
+        self.assertEqual(seen, ["urn:babel:billing:invoiced"])  # handler sees the original body
+
+    def test_route_urn_never_rescues_an_undecodable_body(self) -> None:
+        app = BabelQueue("memory://", queue="orders")
+        seen = []
+
+        @app.handler("urn:babel:orders:created")
+        def handle(data, meta):  # noqa: ANN001
+            seen.append(data)
+
+        app.dispatch(ReceivedMessage(body="not-json", queue="orders", route_urn="urn:babel:orders:created"))
+
+        self.assertEqual(seen, [])  # poison path (unknown URN / retry), never the handler
+
+    def test_retry_and_release_republish_carry_the_route_urn(self) -> None:
+        class RoutedMemory(InMemoryTransport):
+            def __init__(self) -> None:
+                super().__init__()
+                self.routed = []
+
+            def publish_routed(self, queue, body, route_urn):  # noqa: ANN001
+                self.routed.append((queue, body, route_urn))
+
+        route = "urn:babel:orders:created"
+        body = EnvelopeCodec.encode(EnvelopeCodec.make("urn:babel:billing:invoiced", {}, queue="orders"))
+
+        tr = RoutedMemory()
+        app = BabelQueue(transport=tr, queue="orders", max_attempts=3)
+
+        @app.handler(route)
+        def boom(data, meta):  # noqa: ANN001
+            raise RuntimeError("boom")
+
+        app.dispatch(ReceivedMessage(body=body, queue="orders", route_urn=route))
+        self.assertEqual([r[2] for r in tr.routed], [route])
+        self.assertEqual(EnvelopeCodec.decode(tr.routed[0][1])["attempts"], 1)
+
+        tr2 = RoutedMemory()
+        app2 = BabelQueue(transport=tr2, queue="orders", on_unknown_urn=UnknownUrnStrategy.RELEASE)
+        app2.dispatch(ReceivedMessage(body=body, queue="orders", route_urn="urn:babel:orders:nope"))
+        self.assertEqual([(r[1], r[2]) for r in tr2.routed], [(body, "urn:babel:orders:nope")])
+
+        tr3 = RoutedMemory()  # no route_urn -> plain publish, not publish_routed
+        app3 = BabelQueue(transport=tr3, queue="orders", max_attempts=3)
+        app3.handler("urn:babel:billing:invoiced")(boom)
+        app3.dispatch(ReceivedMessage(body=body, queue="orders"))
+        self.assertEqual(tr3.routed, [])
+        self.assertEqual(tr3.size("orders"), 1)
+
+    def test_dead_letter_write_carries_the_route_urn(self) -> None:
+        class RoutedMemory(InMemoryTransport):
+            def __init__(self) -> None:
+                super().__init__()
+                self.routed = []
+
+            def publish_routed(self, queue, body, route_urn):  # noqa: ANN001
+                self.routed.append((queue, body, route_urn))
+
+        route = "urn:babel:orders:created"
+        body = EnvelopeCodec.encode(EnvelopeCodec.make("urn:babel:billing:invoiced", {}, queue="orders"))
+
+        tr = RoutedMemory()
+        app = BabelQueue(transport=tr, queue="orders", max_attempts=1, dead_letter=True)
+
+        @app.handler(route)
+        def boom(data, meta):  # noqa: ANN001
+            raise RuntimeError("boom")
+
+        app.dispatch(ReceivedMessage(body=body, queue="orders", route_urn=route))
+        self.assertEqual([(r[0], r[2]) for r in tr.routed], [("orders.dlq", route)])
+        self.assertEqual(EnvelopeCodec.decode(tr.routed[0][1])["dead_letter"]["original_queue"], "orders")
+
+        tr2 = RoutedMemory()  # no route_urn -> plain publish into the DLQ
+        app2 = BabelQueue(transport=tr2, queue="orders", max_attempts=1, dead_letter=True)
+        app2.handler("urn:babel:billing:invoiced")(boom)
+        app2.dispatch(ReceivedMessage(body=body, queue="orders"))
+        self.assertEqual(tr2.routed, [])
+        self.assertEqual(tr2.size("orders.dlq"), 1)
+
+    def test_empty_route_urn_routes_on_the_body_urn(self) -> None:
+        app = BabelQueue("memory://", queue="orders")
+        seen = []
+
+        @app.handler("urn:babel:orders:created")
+        def handle(data, meta):  # noqa: ANN001
+            seen.append(data)
+
+        body = EnvelopeCodec.encode(EnvelopeCodec.make("urn:babel:orders:created", {"a": 1}, queue="orders"))
+        app.dispatch(ReceivedMessage(body=body, queue="orders"))
+
+        self.assertEqual(seen, [{"a": 1}])
 
     def test_unknown_urn_delete_drops_message(self) -> None:
         app = BabelQueue("memory://", queue="q", on_unknown_urn=UnknownUrnStrategy.DELETE)

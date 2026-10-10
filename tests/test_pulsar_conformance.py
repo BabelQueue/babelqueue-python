@@ -35,7 +35,7 @@ class PulsarConformanceTest(unittest.TestCase):
             env["attempts"] = case["body_attempts"]
             body = EnvelopeCodec.encode(env)
 
-            out = PulsarTransport._reconcile(body, case["redelivery_count"])
+            out = PulsarTransport._reconcile(body, case["redelivery_count"])[0]
 
             self.assertEqual(
                 EnvelopeCodec.decode(out)["attempts"],
