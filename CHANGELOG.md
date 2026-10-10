@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.15.0] - 2026-10-10
+
 ### Added
 - **`ReceivedMessage.route_urn` routing seam** (MINOR). An optional field a transport can set
   when its broker carries the URN out of band. When non-empty `BabelQueue.dispatch()` looks the
