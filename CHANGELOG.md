@@ -9,6 +9,13 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.16.0] - 2026-10-10
+
+### Added
+- New optional `Rewinder` protocol (`rewind(message)`), implemented by `KafkaTransport` and
+  exported from `babelqueue` (public API, MINOR). The runtime calls it after a failed
+  version-gate dead-letter write and then pauses briefly (1 s) before the next poll.
+
 ### Fixed
 - **`bq-schema-version` pre-decode gate on the SQS, Azure Service Bus, Kafka and Artemis
   transports** (`pop`). The broker's schema-version property is read **before** the body is
@@ -33,10 +40,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
   record would lose it once a later record is committed: `KafkaTransport` now `seek`s the
   partition back to the failed record's offset so it is polled again and the dead-letter write
   is retried (no commit moves past it).
-- New optional `Rewinder` protocol (`rewind(message)`), implemented by `KafkaTransport` and
-  exported from `babelqueue`; the runtime calls it after a failed version-gate dead-letter write
-  and then pauses briefly (1 s) before the next poll.
-  The rejected version is capped at 64 characters plus `...` in the log and the route.
+- The rejected `bq-schema-version` value is capped at 64 characters plus `...` in the log and
+  the route.
 
 ## [1.15.0] - 2026-10-10
 
