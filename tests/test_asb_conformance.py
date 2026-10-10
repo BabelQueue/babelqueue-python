@@ -65,6 +65,9 @@ class AsbConformanceTest(unittest.TestCase):
         self.assertEqual(EnvelopeCodec.decode(valid_body)["job"], "urn:babel:orders:created")
 
         for case in gate["cases"]:
+            if case.get("value_type") == "float":
+                # An explicit floating-point case (e.g. 1.0): the reader must hand over a real float.
+                self.assertIsInstance(case["value"], float, "schema_version_gate case %r" % (case,))
             carrier = self._gate_carrier(case)
             rejected = AsbTransport._unsupported_schema_version(carrier)
             want = "reject" if case["expect"] == "reject" else "decode"
