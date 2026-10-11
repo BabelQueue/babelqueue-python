@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.18.0] - 2026-10-11
+
 ### Added
 - `BatchPopper` (optional transport capability, exported from `babelqueue`) with
   `pop_batch(queue, max=0, timeout=1.0)`: take several deliveries at once and hold them un-settled.
