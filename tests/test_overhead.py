@@ -1,12 +1,13 @@
 """GR-8 budget: the envelope encode/decode path must add no more than 2% over plain
 JSON serialization (the baseline a publisher already pays), measured against a
 conservative broker round-trip. Pure CPU — no broker — so the gate is stable and
-environment-independent in CI. Same methodology + reference as every other SDK.
+environment-independent in CI. Same reference as every other SDK; timing is best-of-N
+(interleaved rounds) to resist shared-runner noise.
 """
 
 import json
 import time
-from typing import Callable
+from typing import Callable, List, Sequence
 
 from babelqueue import EnvelopeCodec
 
@@ -19,14 +20,27 @@ REFERENCE_BROKER_ROUNDTRIP_NS = 2_000_000
 _DATA = {"order_id": 1042, "amount": 99.9, "currency": "USD", "note": "café ☕"}
 
 
-def _ns_per_op(fn: Callable[[], None]) -> float:
-    for _ in range(5_000):  # warm up
-        fn()
-    iterations = 50_000
-    start = time.perf_counter_ns()
-    for _ in range(iterations):
-        fn()
-    return (time.perf_counter_ns() - start) / iterations
+def _best_ns_per_op(
+    fns: Sequence[Callable[[], None]], rounds: int = 9, iterations: int = 10_000
+) -> List[float]:
+    """Best-of-N per-op time for each fn (the `timeit` recommendation).
+
+    Scheduler preemption and noisy neighbours on shared CI runners only ever make a
+    round slower, never faster, so the minimum across several short rounds is the
+    closest estimate of the true cost. Rounds are interleaved across the functions so a
+    throttling window hits all of them alike instead of skewing just one.
+    """
+    for fn in fns:
+        for _ in range(5_000):  # warm up
+            fn()
+    best = [float("inf")] * len(fns)
+    for _ in range(rounds):
+        for i, fn in enumerate(fns):
+            start = time.perf_counter_ns()
+            for _ in range(iterations):
+                fn()
+            best[i] = min(best[i], (time.perf_counter_ns() - start) / iterations)
+    return best
 
 
 def test_codec_overhead_within_budget() -> None:
@@ -36,7 +50,8 @@ def test_codec_overhead_within_budget() -> None:
     def bare() -> None:
         json.loads(json.dumps(_DATA))
 
-    marginal = max(0.0, _ns_per_op(envelope) - _ns_per_op(bare))
+    envelope_ns, bare_ns = _best_ns_per_op([envelope, bare])
+    marginal = max(0.0, envelope_ns - bare_ns)
     overhead = marginal / REFERENCE_BROKER_ROUNDTRIP_NS * 100
 
     assert overhead <= 2.0, (

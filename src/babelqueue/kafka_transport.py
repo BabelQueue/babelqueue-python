@@ -281,7 +281,7 @@ class KafkaTransport(Transport):
         except ImportError:  # only reachable with an injected consumer
             from collections import namedtuple
 
-            TopicPartition = namedtuple("TopicPartition", "topic partition offset")  # type: ignore[misc]
+            TopicPartition = namedtuple("TopicPartition", "topic partition offset")  # type: ignore[misc,no-redef]
         topic, partition, offset = handle.topic(), handle.partition(), handle.offset()
         try:
             self._consumer(queue).seek(TopicPartition(topic, partition, offset))
