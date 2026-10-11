@@ -27,15 +27,23 @@ class Message:
 
 
 class Producer:
-    def __init__(self, conf): pass
+    def __init__(self, conf): self._reports = []
 
-    def produce(self, topic, value=None, headers=None, timestamp=None, **kw):
+    def produce(self, topic, value=None, headers=None, timestamp=None, on_delivery=None, **kw):
         with _LOCK:
             log = TOPICS.setdefault(topic, [])  # auto-create, like the real broker default
             log.append(Message(topic, len(log), value, list(headers or [])))
+        if on_delivery is not None:
+            self._reports.append(on_delivery)
 
     def poll(self, t): return 0
-    def flush(self, *a): return 0
+
+    def flush(self, *a):
+        # Serve the delivery reports like librdkafka does: from poll()/flush(), all successful.
+        reports, self._reports = self._reports, []
+        for report in reports:
+            report(None, None)
+        return 0
 
 
 class Consumer:

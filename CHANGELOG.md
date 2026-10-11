@@ -9,6 +9,30 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+- `SettlePublisher` (optional transport capability, exported from `babelqueue`) with
+  `publish_settle(queue, body, route_urn="")`: the runtime's settle writes (retry republish,
+  envelope / poison / gate-rejection DLQ, `redrive` restore) go through it when a transport
+  implements it. `KafkaTransport` implements it.
+- `KafkaDeliveryError` (a `BabelQueueError`) and the optional `KafkaTransport(delivery_timeout=30.0)`
+  constructor argument.
+
+### Fixed
+- **Kafka: retry / dead-letter writes are now broker-confirmed before the offset is committed.**
+  `KafkaTransport.publish_settle()` waits for this write's own delivery report
+  (`flush(delivery_timeout)`). A delivery error or timeout raises `KafkaDeliveryError`, nothing is
+  committed, and the record is re-read through the existing rewind/seek path — so such a write can
+  no longer be lost to a commit that raced ahead of it. `publish()` (and so `app.publish()`) is
+  unchanged: still fire-and-forget and strict (a body that is not valid UTF-8 still raises
+  `UnicodeEncodeError`), also from inside a handler.
+- **Kafka: a record whose value is not valid UTF-8 is dead-lettered raw instead of raising.** The
+  original bytes are written to `<queue>.dlq` unchanged, with no projected headers (as
+  Java/Go/Node do for poison records), and the offset is committed only once that write is
+  confirmed; with the DLQ off, or `UnknownUrnStrategy.DELETE`, the record is dropped and
+  committed. It reuses the version-gate settle path, so a failed write logs as a "version-gated"
+  message — the logged route (`...:non-utf8-payload`) tells them apart. A non-UTF-8 `bq-attempts`
+  header no longer raises. No wire change.
+
 ## [1.16.1] - 2026-10-11
 
 ### Changed

@@ -8,12 +8,13 @@ producer/consumer fakes). Only ``_build_producer``/``_build_consumer`` need the 
 
 from __future__ import annotations
 
+import json
 import unittest
 from unittest import mock
 from urllib.parse import quote
 
 from babelqueue import BabelQueue, EnvelopeCodec
-from babelqueue.kafka_transport import KafkaTransport
+from babelqueue.kafka_transport import NON_UTF8_ROUTE, KafkaDeliveryError, KafkaTransport
 from babelqueue.transport import ReceivedMessage, make_transport
 
 URN = "urn:babel:orders:created"
@@ -63,16 +64,25 @@ class FakeMessage:
 
 
 class FakeProducer:
+    """Delivers every message successfully; delivery reports are served from ``flush``/``poll``
+    (like librdkafka)."""
+
     def __init__(self) -> None:
         self.produced = []
+        self._reports = []
 
-    def produce(self, topic, value=None, headers=None, timestamp=None, **kw) -> None:
+    def produce(self, topic, value=None, headers=None, timestamp=None, on_delivery=None, **kw) -> None:
         self.produced.append({"topic": topic, "value": value, "headers": headers, "timestamp": timestamp})
+        if on_delivery is not None:
+            self._reports.append(on_delivery)
 
     def poll(self, _t):
         return 0
 
     def flush(self, *a):
+        reports, self._reports = self._reports, []
+        for report in reports:
+            report(None, None)
         return 0
 
 
@@ -199,6 +209,31 @@ class KafkaPublishTest(unittest.TestCase):
         _assert_no_codec_warnings(self, lambda: transport(producer=producer).publish("orders", raw))
         self.assertEqual(producer.produced[0]["value"], raw.encode("utf-8"))
         self.assertEqual(header_map(producer.produced[0]["headers"])["bq-job"], URN)
+
+    def test_publish_rejects_a_body_that_is_not_valid_utf8(self):
+        # A user publish stays strict: a lone surrogate (e.g. from os.fsdecode) must raise
+        # instead of being written as a non-UTF-8 record with no projected headers.
+        bad = '{"name": "' + b"caf\xe9".decode("utf-8", "surrogateescape") + '"}'
+        producer = FakeProducer()
+        with self.assertRaises(UnicodeEncodeError):
+            transport(producer=producer).publish("orders", bad)
+        self.assertEqual(producer.produced, [])
+
+    def test_publish_through_the_app_rejects_surrogate_data(self):
+        producer = FakeProducer()
+        app = BabelQueue(transport=transport(producer=producer))
+        with self.assertRaises(UnicodeEncodeError):
+            app.publish(URN, {"name": b"caf\xe9".decode("utf-8", "surrogateescape")}, queue="orders")
+        self.assertEqual(producer.produced, [])
+
+    def test_publish_settle_writes_a_non_utf8_body_back_raw_without_headers(self):
+        # Only the settle path may write a consumed non-UTF-8 record back byte-for-byte.
+        raw = b'{"job": "x", "name": "caf\xe9"}'
+        producer = FakeProducer()
+        transport(producer=producer).publish_settle("orders.dlq", raw.decode("utf-8", "surrogateescape"))
+        self.assertEqual(len(producer.produced), 1)
+        self.assertEqual(producer.produced[0]["value"], raw)
+        self.assertEqual(producer.produced[0]["headers"], [])
 
 
 class KafkaConsumeTest(unittest.TestCase):
@@ -489,10 +524,12 @@ class KafkaRestartRedeliveryTest(unittest.TestCase):
         consumer = self._log(bad, good)
         kafka = transport(FakeProducer(), consumer)
 
-        # The decode error escapes ``pop`` (as it always has) but must not leave the record
-        # pending, or every later ``pop`` would seek back to it and fail again.
-        with self.assertRaises(UnicodeDecodeError):
-            kafka.pop("orders")
+        # A value that is not UTF-8 no longer raises out of ``pop``: it is handed over under the
+        # reserved route so the runtime can dead-letter the raw bytes (see the delivery tests).
+        first = kafka.pop("orders")
+        self.assertIsNotNone(first)
+        self.assertEqual(first.route_urn, NON_UTF8_ROUTE)
+        kafka.ack(first)
         message = kafka.pop("orders")
 
         self.assertIsNotNone(message)
@@ -579,6 +616,252 @@ class KafkaRestartRedeliveryTest(unittest.TestCase):
         with self.assertLogs("babelqueue.kafka", level="ERROR") as logs:
             self.assertIsNone(kafka.pop("orders"))
         self.assertIn("orders[0]@0", logs.output[0])
+
+
+class FakeKafkaError(Exception):
+    """Stands in for ``confluent_kafka.KafkaError`` in a failed delivery report."""
+
+
+class ReportingProducer(FakeProducer):
+    """A producer that reports delivery like librdkafka: ``on_delivery`` is served by ``flush``.
+
+    ``outcomes`` is consumed one entry per ``produce``: ``"ok"`` (delivered), ``"error"`` (the
+    delivery report carries an error) or ``"timeout"`` (``flush`` returns with a message still
+    queued and no report). ``stray`` is a count of unrelated messages that stay queued on the
+    producer, so ``flush`` returns it even when every report arrived."""
+
+    def __init__(self, outcomes=(), stray=0) -> None:
+        super().__init__()
+        self.stray = stray
+        self.outcomes = list(outcomes)
+        self.confirmed = []  # produce calls that carried a delivery callback
+        self._queued = []
+
+    def produce(self, topic, value=None, headers=None, timestamp=None, on_delivery=None, **kw) -> None:
+        super().produce(topic, value=value, headers=headers, timestamp=timestamp)
+        outcome = self.outcomes.pop(0) if self.outcomes else "ok"
+        if on_delivery is not None:
+            self.confirmed.append(topic)
+            self._queued.append((on_delivery, outcome))
+
+    def flush(self, *a):
+        remaining = self.stray
+        for callback, outcome in self._queued:
+            if outcome == "ok":
+                callback(None, None)
+            elif outcome == "error":
+                callback(FakeKafkaError("msg timed out"), None)
+            else:
+                remaining += 1
+        self._queued = []
+        return remaining
+
+
+class KafkaDeliveryConfirmationTest(unittest.TestCase):
+    """Retry / dead-letter writes must be confirmed by the broker before the offset is committed,
+    and a value that is not UTF-8 is dead-lettered raw instead of being skipped."""
+
+    BAD = b"\xff\xfe not utf-8 \x80"
+
+    def _app(self, producer, consumer, max_attempts=3, **kw):
+        app = BabelQueue(transport=transport(producer, consumer), max_attempts=max_attempts, **kw)
+        app._rewind_pause = 0.0  # noqa: SLF001
+        return app
+
+    @staticmethod
+    def _failing_handler(app):
+        seen: list = []
+
+        @app.handler(URN)
+        def _on(data, meta):
+            seen.append(meta.get("id"))
+            raise RuntimeError("handler failure")
+
+        return seen
+
+    def test_plain_publish_is_fire_and_forget_even_while_a_record_is_in_flight(self):
+        # A handler's own publish (or any caller's) must keep the pre-existing semantics: no
+        # delivery wait and no KafkaDeliveryError, whether or not a record is being processed.
+        consumer = OffsetConsumer([OffsetMessage(body().encode("utf-8"), [], offset=0)])
+        producer = ReportingProducer(["error", "ok"])
+        app = self._app(producer, consumer)
+        seen: list = []
+
+        @app.handler(URN)
+        def _on(data, meta):
+            app.publish("urn:babel:other", {"x": 1}, queue="other")  # delivery "fails", ignored
+            seen.append(meta.get("id"))
+
+        app.consume(queue="orders", max_messages=1)
+
+        self.assertEqual(len(seen), 1)  # the handler was not failed by the publish
+        self.assertEqual(producer.confirmed, [])
+        self.assertEqual(consumer.commits, [0])
+
+    def test_plain_publish_after_a_failed_settle_is_still_fire_and_forget(self):
+        consumer = OffsetConsumer([OffsetMessage(body().encode("utf-8"), [], offset=0)])
+        producer = ReportingProducer(["error", "error"])
+        app = self._app(producer, consumer)
+        self._failing_handler(app)
+        with self.assertRaises(KafkaDeliveryError):
+            app.consume(queue="orders", max_messages=1)  # leaves the record in flight
+
+        app.publish("urn:babel:other", {"x": 1}, queue="other")  # must not raise
+
+        self.assertEqual(producer.confirmed, ["orders"])
+
+    def test_unrelated_queued_messages_do_not_fail_a_confirmed_settle_write(self):
+        consumer = OffsetConsumer([OffsetMessage(body().encode("utf-8"), [], offset=0)])
+        producer = ReportingProducer(["ok"], stray=3)  # flush() reports 3 other messages queued
+        app = self._app(producer, consumer)
+        self._failing_handler(app)
+
+        app.consume(queue="orders", max_messages=1)
+
+        self.assertEqual(consumer.commits, [0])  # this write's own report arrived: delivered
+        self.assertEqual(len(producer.produced), 1)  # and it was not republished twice
+
+    def test_confirmed_retry_republish_is_committed(self):
+        consumer = OffsetConsumer([OffsetMessage(body().encode("utf-8"), [], offset=0)])
+        producer = ReportingProducer(["ok"])
+        app = self._app(producer, consumer)
+        self._failing_handler(app)
+
+        app.consume(queue="orders", max_messages=1)
+
+        self.assertEqual(producer.confirmed, ["orders"])
+        self.assertEqual(consumer.commits, [0])
+
+    def test_retry_delivery_error_does_not_commit_and_is_redelivered(self):
+        consumer = OffsetConsumer([OffsetMessage(body().encode("utf-8"), [], offset=0)])
+        producer = ReportingProducer(["error"])
+        app = self._app(producer, consumer)
+        seen = self._failing_handler(app)
+
+        with self.assertRaises(KafkaDeliveryError):
+            app.consume(queue="orders", max_messages=1)
+        self.assertEqual(consumer.commits, [])
+        self.assertEqual(consumer.committed_offset, 0)
+
+        app.consume(queue="orders", max_messages=1)  # the broker is back
+        self.assertEqual(consumer.seeks, [("orders", 0, 0)])
+        self.assertEqual(consumer.commits, [0])
+        self.assertEqual(len(seen), 2)
+
+    def test_retry_delivery_timeout_does_not_commit(self):
+        consumer = OffsetConsumer([OffsetMessage(body().encode("utf-8"), [], offset=0)])
+        producer = ReportingProducer(["timeout"])
+        app = self._app(producer, consumer)
+        self._failing_handler(app)
+
+        with self.assertRaises(KafkaDeliveryError):
+            app.consume(queue="orders", max_messages=1)
+        self.assertEqual(consumer.commits, [])
+
+    def test_envelope_dead_letter_delivery_error_does_not_commit(self):
+        consumer = OffsetConsumer([OffsetMessage(body().encode("utf-8"), [], offset=0)])
+        producer = ReportingProducer(["error"])
+        app = self._app(producer, consumer, max_attempts=1, dead_letter=True)
+        self._failing_handler(app)
+
+        with self.assertRaises(KafkaDeliveryError):
+            app.consume(queue="orders", max_messages=1)
+        self.assertEqual([m["topic"] for m in producer.produced], ["orders.dlq"])
+        self.assertEqual(consumer.commits, [])
+
+    def test_gated_dead_letter_delivery_error_does_not_commit(self):
+        record = OffsetMessage(body().encode("utf-8"), [("bq-schema-version", b"2")], offset=0)
+        consumer = OffsetConsumer([record])
+        producer = ReportingProducer(["error"])
+        app = self._app(producer, consumer, dead_letter=True)
+
+        with self.assertLogs("babelqueue.app", level="ERROR"):
+            app.consume(queue="orders", max_messages=1)
+        self.assertEqual(producer.confirmed, ["orders.dlq"])
+        self.assertEqual(consumer.commits, [])
+        self.assertEqual(consumer.seeks, [("orders", 0, 0)])
+
+    def test_non_utf8_record_is_dead_lettered_raw_and_committed(self):
+        consumer = OffsetConsumer(
+            [
+                OffsetMessage(self.BAD, [], offset=0),
+                OffsetMessage(body().encode("utf-8"), [], offset=1),
+            ]
+        )
+        producer = ReportingProducer()
+        app = self._app(producer, consumer, dead_letter=True)
+        seen: list = []
+
+        @app.handler(URN)
+        def _on(data, meta):
+            seen.append(data)
+
+        with self.assertLogs("babelqueue.kafka", level="WARNING"):
+            app.consume(queue="orders", max_messages=2)
+
+        self.assertEqual(producer.produced[0]["topic"], "orders.dlq")
+        self.assertEqual(producer.produced[0]["value"], self.BAD)  # original bytes, untouched
+        self.assertEqual(producer.confirmed[0], "orders.dlq")
+        self.assertEqual(consumer.commits, [0, 1])
+        self.assertEqual(len(seen), 1)  # the poison record never reached a handler
+
+    def test_non_utf8_record_with_valid_json_is_dead_lettered_raw_without_projected_headers(self):
+        # Valid JSON, but written Latin-1: the trace_id carries a byte that is not UTF-8. The header
+        # projection cannot encode it, which used to fail the DLQ write on every redelivery and
+        # lock the partition.
+        envelope = EnvelopeCodec.decode(body())
+        envelope["trace_id"] = "tr\u00e9-1"
+        latin1 = json.dumps(envelope, ensure_ascii=False).encode("latin-1")
+        self.assertIn(b"\xe9", latin1)
+        consumer = OffsetConsumer(
+            [
+                OffsetMessage(latin1, [], offset=0),
+                OffsetMessage(body().encode("utf-8"), [], offset=1),
+            ]
+        )
+        producer = ReportingProducer()
+        app = self._app(producer, consumer, dead_letter=True)
+
+        @app.handler(URN)
+        def _on(data, meta):
+            return None
+
+        with self.assertLogs("babelqueue.kafka", level="WARNING"):
+            app.consume(queue="orders", max_messages=2)
+
+        self.assertEqual(producer.produced[0]["topic"], "orders.dlq")
+        self.assertEqual(producer.produced[0]["value"], latin1)
+        self.assertEqual(producer.produced[0]["headers"], [])
+        self.assertEqual(consumer.commits, [0, 1])
+
+    def test_non_utf8_dead_letter_delivery_error_does_not_commit(self):
+        consumer = OffsetConsumer([OffsetMessage(self.BAD, [], offset=0)])
+        producer = ReportingProducer(["error", "ok"])
+        app = self._app(producer, consumer, dead_letter=True)
+
+        with self.assertLogs("babelqueue.app", level="ERROR"):
+            app.consume(queue="orders", max_messages=1)
+        self.assertEqual(consumer.commits, [])
+        self.assertEqual(consumer.seeks, [("orders", 0, 0)])
+
+        app.consume(queue="orders", max_messages=1)  # redelivered, the DLQ accepts it now
+        self.assertEqual(consumer.commits, [0])
+        self.assertEqual([m["value"] for m in producer.produced], [self.BAD, self.BAD])
+
+    def test_non_utf8_record_is_dropped_and_committed_without_a_dlq(self):
+        consumer = OffsetConsumer([OffsetMessage(self.BAD, [], offset=0)])
+        producer = ReportingProducer()
+        app = self._app(producer, consumer, dead_letter=False)
+
+        with self.assertLogs("babelqueue.kafka", level="WARNING"):
+            app.consume(queue="orders", max_messages=1)
+        self.assertEqual(producer.produced, [])
+        self.assertEqual(consumer.commits, [0])
+
+    def test_non_utf8_attempts_header_does_not_raise(self):
+        record = FakeMessage(body(2).encode("utf-8"), headers=[("bq-attempts", b"\xff\xfe")])
+        message = transport(consumer=FakeConsumer([record])).pop("orders")
+        self.assertEqual(EnvelopeCodec.decode(message.body)["attempts"], 2)  # the body's own count
 
 
 class KafkaSchemeTest(unittest.TestCase):

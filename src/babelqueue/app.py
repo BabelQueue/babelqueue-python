@@ -308,8 +308,9 @@ class BabelQueue:
                     # It is left unacked; the broker (or a rewind, for cumulative-offset brokers
                     # such as Kafka) brings it back and the gate rejects it again.
                     logger.error(
-                        "Dead-lettering a version-gated message on queue %r failed; it was NOT "
+                        "Dead-lettering a version-gated message (route %r) on queue %r failed; it was NOT "
                         "retried or acknowledged; it will come back and the dead-letter write will be retried.",
+                        received.route_urn,
                         received.queue,
                         exc_info=exc,
                     )
@@ -447,7 +448,8 @@ class BabelQueue:
             self.transport.rewind(received)
         except Exception:  # noqa: BLE001 - reported, never kills the loop
             logger.error(
-                "Failed to rewind an unsettled version-gated message on queue %r.",
+                "Failed to rewind an unsettled version-gated message (route %r) on queue %r.",
+                received.route_urn,
                 received.queue,
                 exc_info=True,
             )

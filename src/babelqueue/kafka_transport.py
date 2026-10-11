@@ -15,6 +15,13 @@ native delivery count, so the ``bq-attempts`` header is the authoritative retry 
 body's ``attempts`` is the fallback for non-BabelQueue producers); the runtime owns retry by
 republishing with attempts+1 and dead-letters to ``<queue>.dlq``.
 
+Settlement writes (retry republish, DLQ) go through ``publish_settle`` and wait for the broker's
+delivery report (``delivery_timeout``); a failure raises ``KafkaDeliveryError`` and the offset is
+not committed. ``publish`` itself stays fire-and-forget. A record value that is not valid UTF-8 is handed to the runtime under a
+reserved route so its original bytes are dead-lettered raw (written back with no projected headers;
+with the DLQ off, or ``UnknownUrnStrategy.DELETE``, it is dropped and committed). The runtime logs
+it as a version-gated message because it reuses that settle path; the route in the log names it.
+
 This implements §6 of the broker-bindings contract. The envelope is unchanged
 (``schema_version`` stays 1); Apache Kafka is purely additive.
 
@@ -31,6 +38,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 from .codec import SCHEMA_VERSION, EnvelopeCodec, parse_envelope
+from .exceptions import BabelQueueError
 from .transport import ReceivedMessage, Transport, truncate_declared_version
 
 _logger = logging.getLogger("babelqueue.kafka")
@@ -45,7 +53,21 @@ _BLANK_ASCII_PATTERN = re.compile(r"[ \t\n\x0b\x0c\r]*")
 #: rejected ``bq-schema-version`` is named in the logged error.
 UNSUPPORTED_SCHEMA_ROUTE_PREFIX = "babelqueue:unsupported-schema-version:"
 
+#: Reserved ``route_urn`` of a record whose value is not valid UTF-8. Like a version-gated record it
+#: can never gain a handler and must not be retried (a retry would re-publish the same bytes), so it
+#: reuses the gated route: the runtime dead-letters it directly, byte-identical, and drops it when no
+#: DLQ is configured. The body carries the raw bytes as ``surrogateescape`` text, which
+#: :meth:`KafkaTransport.publish` encodes back to the exact original bytes.
+NON_UTF8_ROUTE = UNSUPPORTED_SCHEMA_ROUTE_PREFIX + "non-utf8-payload"
+
+#: How long (seconds) a settle-path publish waits for the broker to confirm the write.
+DEFAULT_DELIVERY_TIMEOUT = 30.0
+
 Headers = List[Tuple[str, bytes]]
+
+
+class KafkaDeliveryError(BabelQueueError):
+    """A retry / dead-letter write was not confirmed by the broker (delivery error or timeout)."""
 
 
 def _brokers_from_url(url: str) -> str:
@@ -61,10 +83,12 @@ class KafkaTransport(Transport):
         producer: Any = None,
         consumer_factory: Optional[Callable[[str], Any]] = None,
         group_id: str = "babelqueue",
+        delivery_timeout: float = DEFAULT_DELIVERY_TIMEOUT,
         **client_config: Any,
     ) -> None:
         self._brokers = _brokers_from_url(url or "kafka://localhost:9092")
         self._group_id = group_id
+        self._delivery_timeout = delivery_timeout
         self._client_config = client_config
         self._producer = producer
         self._consumer_factory = consumer_factory
@@ -143,7 +167,13 @@ class KafkaTransport(Transport):
         attempts = int(env.get("attempts", 0) or 0)
         for key, value in headers or []:
             if key == "bq-attempts":
-                raw = value.decode("utf-8") if isinstance(value, (bytes, bytearray)) else str(value)
+                # ``replace``: a non-UTF-8 header value must not raise out of ``pop``; it simply
+                # fails ``int()`` below and the body's own attempts stand.
+                raw = (
+                    bytes(value).decode("utf-8", "replace")
+                    if isinstance(value, (bytes, bytearray))
+                    else str(value)
+                )
                 try:
                     attempts = int(raw)
                 except (ValueError, TypeError):
@@ -182,23 +212,77 @@ class KafkaTransport(Transport):
 
     @staticmethod
     def _payload(message: Any) -> str:
+        """The record value as text. Never raises: bytes that are not UTF-8 are kept as
+        ``surrogateescape`` code points, so :meth:`publish` can write the exact bytes back."""
         value = message.value()
         if isinstance(value, (bytes, bytearray)):
-            return value.decode("utf-8")
+            return bytes(value).decode("utf-8", "surrogateescape")
         return str(value) if value is not None else ""
+
+    @staticmethod
+    def _is_non_utf8(message: Any) -> bool:
+        value = message.value()
+        if not isinstance(value, (bytes, bytearray)):
+            return False
+        try:
+            bytes(value).decode("utf-8")
+        except UnicodeDecodeError:
+            return True
+        return False
 
     # -- Transport ----------------------------------------------------------
 
     def publish(self, queue: str, body: str) -> None:
-        env = parse_envelope(body)
-        meta = env.get("meta") or {}
         producer = self._producer_()
-        kwargs: Dict[str, Any] = {"value": body.encode("utf-8"), "headers": self._projection(body)}
-        created_at = meta.get("created_at")
-        if created_at:
-            kwargs["timestamp"] = int(created_at)
+        kwargs = self._record_kwargs(body)
         producer.produce(queue, **kwargs)
         producer.poll(0)
+
+    def publish_settle(self, queue: str, body: str, route_urn: str = "") -> None:
+        """:class:`~babelqueue.transport.SettlePublisher`: the runtime's settle write (retry
+        republish, envelope / poison / gate DLQ, ``redrive`` restore). Unlike :meth:`publish` it
+        waits for the broker's delivery report, because the offset may only be committed once the
+        write is confirmed; a delivery error or timeout raises :class:`KafkaDeliveryError`."""
+        self._produce_confirmed(self._producer_(), queue, self._record_kwargs(body, raw_ok=True))
+
+    @classmethod
+    def _record_kwargs(cls, body: str, raw_ok: bool = False) -> Dict[str, Any]:
+        """``produce`` arguments for ``body``. With ``raw_ok`` (the settle path only), a body
+        carrying ``surrogateescape`` code points (a consumed record whose value was not UTF-8) is
+        written back byte-for-byte with no projected headers: it is not a trustworthy envelope,
+        and the projection could not encode it. Without it (a user ``publish``) such a body is
+        rejected with ``UnicodeEncodeError``, as before."""
+        try:
+            body.encode("utf-8")
+        except UnicodeEncodeError:
+            if not raw_ok:
+                raise
+            return {"value": body.encode("utf-8", "surrogateescape"), "headers": []}
+        kwargs: Dict[str, Any] = {"value": body.encode("utf-8"), "headers": cls._projection(body)}
+        created_at = (parse_envelope(body).get("meta") or {}).get("created_at")
+        if created_at:
+            kwargs["timestamp"] = int(created_at)
+        return kwargs
+
+    def _produce_confirmed(self, producer: Any, queue: str, kwargs: Dict[str, Any]) -> None:
+        """Produce and wait for the delivery report; raise :class:`KafkaDeliveryError` when the
+        broker reported an error or did not confirm within ``delivery_timeout``."""
+        outcome: Dict[str, Any] = {}
+
+        def on_delivery(err: Any, _msg: Any = None) -> None:
+            outcome["error"] = err
+
+        producer.produce(queue, on_delivery=on_delivery, **kwargs)
+        producer.flush(self._delivery_timeout)
+        # ``flush`` returns the count of *every* message still queued on the producer, so it says
+        # nothing about this write: only this write's own delivery report decides. No report within
+        # the timeout means it is unconfirmed.
+        if "error" not in outcome:
+            raise KafkaDeliveryError(
+                f"Kafka delivery to {queue!r} was not confirmed within {self._delivery_timeout}s."
+            )
+        if outcome["error"] is not None:
+            raise KafkaDeliveryError(f"Kafka delivery to {queue!r} failed: {outcome['error']}")
 
     def pop(self, queue: str, timeout: float = 1.0) -> Optional[ReceivedMessage]:
         wait = timeout if timeout and timeout > 0 else 1.0
@@ -226,6 +310,18 @@ class KafkaTransport(Transport):
                 queue=queue,
                 handle=message,
                 route_urn=UNSUPPORTED_SCHEMA_ROUTE_PREFIX + quote(unsupported, safe=""),
+            )
+            self._pending[queue] = message
+            return received
+        if self._is_non_utf8(message):
+            # The value cannot be decoded, so there is no envelope to retry or annotate: hand it
+            # over under the reserved route; the runtime dead-letters the raw bytes directly (and
+            # does not commit if that write is not confirmed) instead of letting ``pop`` raise.
+            _logger.warning(
+                "Kafka record on %r is not valid UTF-8; dead-lettering its raw bytes.", queue
+            )
+            received = ReceivedMessage(
+                body=self._payload(message), queue=queue, handle=message, route_urn=NON_UTF8_ROUTE
             )
             self._pending[queue] = message
             return received

@@ -36,6 +36,7 @@ from .transport import (
     Redeliverer,
     Rewinder,
     RoutedPublisher,
+    SettlePublisher,
     Transport,
 )
 
@@ -56,6 +57,7 @@ __all__ = [
     "Redeliverer",
     "Rewinder",
     "RoutedPublisher",
+    "SettlePublisher",
     "BabelQueueError",
     "UnknownUrnError",
     "DecryptError",

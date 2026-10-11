@@ -90,11 +90,29 @@ class RoutedPublisher(Protocol):
         ...
 
 
+@runtime_checkable
+class SettlePublisher(Protocol):
+    """Optional :class:`Transport` capability: a re-publish that *settles* a received message
+    (retry, release, dead-letter, poison/gate DLQ, ``redrive`` restore) and so must be
+    broker-confirmed before the delivery is acknowledged. Brokers whose acknowledgement is a
+    cumulative position (Kafka) need it: committing before the write is confirmed loses the
+    record on a delivery failure. It raises when the write is not confirmed; the caller then leaves
+    the delivery unsettled. A user's own :meth:`Transport.publish` is never routed here. A transport
+    that does not implement it gets the :class:`RoutedPublisher` / plain-publish behaviour."""
+
+    def publish_settle(self, queue: str, body: str, route_urn: str = "") -> None:
+        """Append ``body`` to ``queue`` and return only once the broker confirmed the write."""
+        ...
+
+
 def publish_keeping_route(transport: "Transport", queue: str, body: str, route_urn: str = "") -> None:
     """Publish ``body`` to ``queue``, carrying ``route_urn`` when it is non-empty and the
     transport implements :class:`RoutedPublisher`; otherwise a plain :meth:`Transport.publish`.
+    A :class:`SettlePublisher` transport gets the confirmed settle write instead.
     Shared by the runtime's re-publishes (retry, release, dead-letter) and by ``redrive``."""
-    if route_urn and isinstance(transport, RoutedPublisher):
+    if isinstance(transport, SettlePublisher):
+        transport.publish_settle(queue, body, route_urn)
+    elif route_urn and isinstance(transport, RoutedPublisher):
         transport.publish_routed(queue, body, route_urn)
     else:
         transport.publish(queue, body)
