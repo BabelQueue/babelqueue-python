@@ -48,10 +48,14 @@ def _assert_no_codec_warnings(case: unittest.TestCase, fn) -> None:
 
 
 class FakeMessage:
-    def __init__(self, value, headers=None, err=None) -> None:
+    def __init__(self, value, headers=None, err=None, key=None) -> None:
         self._value = value
         self._headers = headers or []
         self._err = err
+        self._key = key
+
+    def key(self):
+        return self._key
 
     def value(self):
         return self._value
@@ -72,7 +76,15 @@ class FakeProducer:
         self._reports = []
 
     def produce(self, topic, value=None, headers=None, timestamp=None, on_delivery=None, **kw) -> None:
-        self.produced.append({"topic": topic, "value": value, "headers": headers, "timestamp": timestamp})
+        self.produced.append(
+            {
+                "topic": topic,
+                "value": value,
+                "headers": headers,
+                "timestamp": timestamp,
+                "key": kw.get("key"),
+            }
+        )
         if on_delivery is not None:
             self._reports.append(on_delivery)
 
@@ -104,8 +116,8 @@ class FakeConsumer:
 class OffsetMessage(FakeMessage):
     """A record that knows its place in a single-partition log."""
 
-    def __init__(self, value, headers, offset, topic="orders", partition=0) -> None:
-        super().__init__(value, headers=headers)
+    def __init__(self, value, headers, offset, topic="orders", partition=0, key=None) -> None:
+        super().__init__(value, headers=headers, key=key)
         self._offset, self._topic, self._partition = offset, topic, partition
 
     def topic(self):
@@ -638,7 +650,7 @@ class ReportingProducer(FakeProducer):
         self._queued = []
 
     def produce(self, topic, value=None, headers=None, timestamp=None, on_delivery=None, **kw) -> None:
-        super().produce(topic, value=value, headers=headers, timestamp=timestamp)
+        super().produce(topic, value=value, headers=headers, timestamp=timestamp, **kw)
         outcome = self.outcomes.pop(0) if self.outcomes else "ok"
         if on_delivery is not None:
             self.confirmed.append(topic)
@@ -862,6 +874,104 @@ class KafkaDeliveryConfirmationTest(unittest.TestCase):
         record = FakeMessage(body(2).encode("utf-8"), headers=[("bq-attempts", b"\xff\xfe")])
         message = transport(consumer=FakeConsumer([record])).pop("orders")
         self.assertEqual(EnvelopeCodec.decode(message.body)["attempts"], 2)  # the body's own count
+
+
+class KafkaKeyPreservationTest(unittest.TestCase):
+    """The consumed record's key is carried, byte-for-byte, onto every record the runtime itself
+    writes for it (retry republish, envelope DLQ, gate DLQ, raw non-UTF-8 DLQ). Null stays null,
+    empty stays empty, and no key is ever made up (§6)."""
+
+    KEYS = (b"order-1042", b"", None)
+
+    def _run(self, record_value, key, headers=(), **app_kw):
+        consumer = OffsetConsumer([OffsetMessage(record_value, list(headers), offset=0, key=key)])
+        producer = ReportingProducer()
+        app = BabelQueue(transport=transport(producer, consumer), **app_kw)
+        app._rewind_pause = 0.0  # noqa: SLF001
+
+        @app.handler(URN)
+        def _on(data, meta):
+            raise RuntimeError("handler failure")
+
+        app.consume(queue="orders", max_messages=1)
+        self.assertEqual(consumer.commits, [0])
+        self.assertEqual(len(producer.produced), 1)
+        return producer.produced[0]
+
+    def test_pop_surfaces_the_record_key(self):
+        for key in self.KEYS:
+            with self.subTest(key=key):
+                got = transport(consumer=FakeConsumer([FakeMessage(body().encode(), key=key)])).pop("orders")
+                self.assertEqual(got.key, key)
+
+    def test_pop_tolerates_a_record_without_a_key_accessor(self):
+        class NoKey:
+            def value(self):
+                return body().encode()
+
+            def headers(self):
+                return []
+
+            def error(self):
+                return None
+
+        self.assertIsNone(transport(consumer=FakeConsumer([NoKey()])).pop("orders").key)
+
+    def test_retry_republish_keeps_the_key(self):
+        for key in self.KEYS:
+            with self.subTest(key=key):
+                record = self._run(body().encode(), key, max_attempts=3)
+                self.assertEqual(record["topic"], "orders")
+                self.assertEqual(record["key"], key)
+
+    def test_envelope_dead_letter_keeps_the_key(self):
+        for key in self.KEYS:
+            with self.subTest(key=key):
+                record = self._run(body().encode(), key, max_attempts=1, dead_letter=True)
+                self.assertEqual(record["topic"], "orders.dlq")
+                self.assertEqual(record["key"], key)
+
+    def test_gated_dead_letter_keeps_the_key(self):
+        for key in self.KEYS:
+            with self.subTest(key=key):
+                record = self._run(
+                    body().encode(), key, headers=[("bq-schema-version", b"2")], dead_letter=True
+                )
+                self.assertEqual(record["topic"], "orders.dlq")
+                self.assertEqual(record["key"], key)
+
+    def test_non_utf8_raw_dead_letter_keeps_the_key(self):
+        bad = b"\xff\xfe not utf-8 \x80"
+        for key in self.KEYS:
+            with self.subTest(key=key):
+                with self.assertLogs("babelqueue.kafka", level="WARNING"):
+                    record = self._run(bad, key, dead_letter=True)
+                self.assertEqual(record["topic"], "orders.dlq")
+                self.assertEqual(record["value"], bad)
+                self.assertEqual(record["key"], key)
+
+    def test_a_null_key_is_not_passed_to_produce(self):
+        class StrictProducer(FakeProducer):
+            def produce(self, topic, value=None, headers=None, timestamp=None, on_delivery=None, **kw):
+                assert "key" not in kw, "a null key must not be synthesised"
+                super().produce(topic, value=value, headers=headers, timestamp=timestamp, on_delivery=on_delivery)
+
+        transport(producer=StrictProducer()).publish_settle("orders", body(), key=None)
+
+    def test_plain_publish_does_not_set_a_key(self):
+        producer = FakeProducer()
+        transport(producer=producer).publish("orders", body())
+        self.assertIsNone(producer.produced[0]["key"])
+
+    def test_redrive_restore_keeps_the_key(self):
+        from babelqueue import redrive
+
+        consumer = FakeConsumer([FakeMessage(b"not json at all", key=b"k-7")])
+        producer = FakeProducer()
+        result = redrive.redrive(transport(producer, consumer), "orders.dlq", timeout=0)
+        self.assertEqual(result.skipped, 1)
+        self.assertEqual(producer.produced[0]["topic"], "orders.dlq")
+        self.assertEqual(producer.produced[0]["key"], b"k-7")
 
 
 class KafkaSchemeTest(unittest.TestCase):

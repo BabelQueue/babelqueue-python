@@ -43,6 +43,11 @@ class ReceivedMessage:
     #: body is left untouched (handler, retry and dead-letter keep the producer's original body).
     #: Empty means "route on the body URN" (the default for every other transport).
     route_urn: str = ""
+    #: The broker record key of this delivery, byte-for-byte (``None`` = null key; an empty
+    #: ``bytes`` is an empty key), for transports that have one (Kafka). The runtime hands it back
+    #: to a :class:`SettlePublisher` on its own re-publishes (retry, DLQ) so the key is not lost;
+    #: it never synthesises one. Not part of the envelope; ``None`` for every other transport.
+    key: Optional[bytes] = None
 
 
 class Transport(ABC):
@@ -100,18 +105,33 @@ class SettlePublisher(Protocol):
     the delivery unsettled. A user's own :meth:`Transport.publish` is never routed here. A transport
     that does not implement it gets the :class:`RoutedPublisher` / plain-publish behaviour."""
 
-    def publish_settle(self, queue: str, body: str, route_urn: str = "") -> None:
-        """Append ``body`` to ``queue`` and return only once the broker confirmed the write."""
+    def publish_settle(
+        self, queue: str, body: str, route_urn: str = "", key: Optional[bytes] = None
+    ) -> None:
+        """Append ``body`` to ``queue`` and return only once the broker confirmed the write.
+
+        ``key`` is the consumed record's key (:attr:`ReceivedMessage.key`), carried unchanged
+        when the broker has record keys; ``None`` means a null key."""
         ...
 
 
-def publish_keeping_route(transport: "Transport", queue: str, body: str, route_urn: str = "") -> None:
+def publish_keeping_route(
+    transport: "Transport",
+    queue: str,
+    body: str,
+    route_urn: str = "",
+    key: Optional[bytes] = None,
+) -> None:
     """Publish ``body`` to ``queue``, carrying ``route_urn`` when it is non-empty and the
     transport implements :class:`RoutedPublisher`; otherwise a plain :meth:`Transport.publish`.
-    A :class:`SettlePublisher` transport gets the confirmed settle write instead.
+    A :class:`SettlePublisher` transport gets the confirmed settle write instead, with the
+    consumed record's ``key`` when there is one (a null key is simply not passed).
     Shared by the runtime's re-publishes (retry, release, dead-letter) and by ``redrive``."""
     if isinstance(transport, SettlePublisher):
-        transport.publish_settle(queue, body, route_urn)
+        if key is None:
+            transport.publish_settle(queue, body, route_urn)
+        else:
+            transport.publish_settle(queue, body, route_urn, key=key)
     elif route_urn and isinstance(transport, RoutedPublisher):
         transport.publish_routed(queue, body, route_urn)
     else:

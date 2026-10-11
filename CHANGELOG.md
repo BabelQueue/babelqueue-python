@@ -16,8 +16,17 @@ The envelope wire format is versioned separately by `meta.schema_version`
   implements it. `KafkaTransport` implements it.
 - `KafkaDeliveryError` (a `BabelQueueError`) and the optional `KafkaTransport(delivery_timeout=30.0)`
   constructor argument.
+- `ReceivedMessage.key` (`Optional[bytes]`, `None` = null key) and an optional `key=` argument on
+  `SettlePublisher.publish_settle()` / `publish_keeping_route()`. `KafkaTransport.pop()` fills the
+  key from the consumed record.
 
 ### Fixed
+- **Kafka: the original record key now survives the retry republish, the envelope DLQ and the
+  raw (poison / gate-rejection) DLQ.** The key was dropped on every settle write, so a keyed record
+  lost its key (and with it per-key partition affinity) after the first retry. A null key stays
+  null, an empty key stays empty, and a key is never synthesised. `redrive` restores to `<queue>.dlq`
+  also keep it. Partition equality is not guaranteed. The envelope and the `dead_letter` block are
+  unchanged.
 - **Kafka: retry / dead-letter writes are now broker-confirmed before the offset is committed.**
   `KafkaTransport.publish_settle()` waits for this write's own delivery report
   (`flush(delivery_timeout)`). A delivery error or timeout raises `KafkaDeliveryError`, nothing is

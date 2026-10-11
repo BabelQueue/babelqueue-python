@@ -88,7 +88,7 @@ def redrive(
     result = RedriveResult()
     for message, envelope in batch:
         if envelope is None:
-            publish_keeping_route(transport, dlq, message.body, message.route_urn)  # restore the poison body; never drop it
+            publish_keeping_route(transport, dlq, message.body, message.route_urn, message.key)  # restore the poison body; never drop it
             transport.ack(message)
             result.skipped += 1
             result.items.append(RedriveItem("", "", "", "", dlq, "", False))
@@ -109,7 +109,7 @@ def redrive(
         )
 
         if select is not None and not select(envelope):
-            publish_keeping_route(transport, dlq, message.body, message.route_urn)  # not selected: restore unchanged
+            publish_keeping_route(transport, dlq, message.body, message.route_urn, message.key)  # not selected: restore unchanged
             transport.ack(message)
             result.skipped += 1
             result.items.append(item)
@@ -119,7 +119,7 @@ def redrive(
         item.to = target
 
         if dry_run:
-            publish_keeping_route(transport, dlq, message.body, message.route_urn)  # report the plan; restore unchanged
+            publish_keeping_route(transport, dlq, message.body, message.route_urn, message.key)  # report the plan; restore unchanged
             transport.ack(message)
             result.skipped += 1
             result.items.append(item)
@@ -133,7 +133,7 @@ def redrive(
                 transport, target, EnvelopeCodec.encode(reset), bypass, message.route_urn
             )
         except Exception:
-            publish_keeping_route(transport, dlq, message.body, message.route_urn)  # restore on a publish failure, then surface
+            publish_keeping_route(transport, dlq, message.body, message.route_urn, message.key)  # restore on a publish failure, then surface
             transport.ack(message)
             raise
         transport.ack(message)

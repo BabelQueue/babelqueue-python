@@ -17,7 +17,9 @@ republishing with attempts+1 and dead-letters to ``<queue>.dlq``.
 
 Settlement writes (retry republish, DLQ) go through ``publish_settle`` and wait for the broker's
 delivery report (``delivery_timeout``); a failure raises ``KafkaDeliveryError`` and the offset is
-not committed. ``publish`` itself stays fire-and-forget. A record value that is not valid UTF-8 is handed to the runtime under a
+not committed. ``publish`` itself stays fire-and-forget. Those writes also carry the consumed
+record's key unchanged (``ReceivedMessage.key``; null stays null, empty stays empty, never
+synthesised). A record value that is not valid UTF-8 is handed to the runtime under a
 reserved route so its original bytes are dead-lettered raw (written back with no projected headers;
 with the DLQ off, or ``UnknownUrnStrategy.DELETE``, it is dropped and committed). The runtime logs
 it as a version-gated message because it reuses that settle path; the route in the log names it.
@@ -220,6 +222,13 @@ class KafkaTransport(Transport):
         return str(value) if value is not None else ""
 
     @staticmethod
+    def _key(message: Any) -> Optional[bytes]:
+        """The record key as the client reports it (``None`` = null key); tolerant of an injected
+        consumer whose records expose no ``key()``."""
+        key_of = getattr(message, "key", None)
+        return key_of() if callable(key_of) else None
+
+    @staticmethod
     def _is_non_utf8(message: Any) -> bool:
         value = message.value()
         if not isinstance(value, (bytes, bytearray)):
@@ -238,12 +247,21 @@ class KafkaTransport(Transport):
         producer.produce(queue, **kwargs)
         producer.poll(0)
 
-    def publish_settle(self, queue: str, body: str, route_urn: str = "") -> None:
+    def publish_settle(
+        self, queue: str, body: str, route_urn: str = "", key: Optional[bytes] = None
+    ) -> None:
         """:class:`~babelqueue.transport.SettlePublisher`: the runtime's settle write (retry
         republish, envelope / poison / gate DLQ, ``redrive`` restore). Unlike :meth:`publish` it
         waits for the broker's delivery report, because the offset may only be committed once the
-        write is confirmed; a delivery error or timeout raises :class:`KafkaDeliveryError`."""
-        self._produce_confirmed(self._producer_(), queue, self._record_kwargs(body, raw_ok=True))
+        write is confirmed; a delivery error or timeout raises :class:`KafkaDeliveryError`.
+
+        ``key`` is the consumed record's key (:attr:`ReceivedMessage.key`): it is written back
+        unchanged, so a retry or DLQ record keeps the original key (``None`` stays a null key, an
+        empty key stays empty, and no key is ever synthesised). §6."""
+        kwargs = self._record_kwargs(body, raw_ok=True)
+        if key is not None:
+            kwargs["key"] = key
+        self._produce_confirmed(self._producer_(), queue, kwargs)
 
     @classmethod
     def _record_kwargs(cls, body: str, raw_ok: bool = False) -> Dict[str, Any]:
@@ -310,6 +328,7 @@ class KafkaTransport(Transport):
                 queue=queue,
                 handle=message,
                 route_urn=UNSUPPORTED_SCHEMA_ROUTE_PREFIX + quote(unsupported, safe=""),
+                key=self._key(message),
             )
             self._pending[queue] = message
             return received
@@ -321,12 +340,16 @@ class KafkaTransport(Transport):
                 "Kafka record on %r is not valid UTF-8; dead-lettering its raw bytes.", queue
             )
             received = ReceivedMessage(
-                body=self._payload(message), queue=queue, handle=message, route_urn=NON_UTF8_ROUTE
+                body=self._payload(message),
+                queue=queue,
+                handle=message,
+                route_urn=NON_UTF8_ROUTE,
+                key=self._key(message),
             )
             self._pending[queue] = message
             return received
         body = self._reconcile(self._payload(message), headers)
-        received = ReceivedMessage(body=body, queue=queue, handle=message)
+        received = ReceivedMessage(body=body, queue=queue, handle=message, key=self._key(message))
         # Track the record as in flight only once ``pop`` has built it. A decode error above
         # escapes before this point and must not leave the record pending: the next ``pop`` would
         # seek back to it and fail identically, wedging the partition forever.

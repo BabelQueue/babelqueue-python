@@ -415,7 +415,7 @@ class BabelQueue:
         or its dead-letter record). Keeps the routing URN the broker property carried on this
         delivery when the transport can pin it (:class:`RoutedPublisher`), so a property/body
         mismatch does not flip to the body URN on the next attempt or in the DLQ."""
-        publish_keeping_route(self.transport, queue, body, received.route_urn)
+        publish_keeping_route(self.transport, queue, body, received.route_urn, received.key)
 
     def _ack_settled(self, received: ReceivedMessage) -> None:
         """Acknowledge a message whose outcome is already final (handled, dead-lettered,
