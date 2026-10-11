@@ -265,9 +265,11 @@ class AppTest(unittest.TestCase):
                     self.assertEqual(seen, [])  # never reaches the handler
                     self.assertEqual(app.transport.size("orders"), 0)
                     self.assertEqual(app.transport.size("orders.dlq"), 1)
-                    dead = EnvelopeCodec.decode(app.transport._queues["orders.dlq"][0])  # noqa: SLF001
-                    self.assertEqual(dead["dead_letter"]["reason"], "unknown_urn")
-                    self.assertIn(route, dead["dead_letter"]["error"])
+                    # The gate rejects without decoding: the DLQ record is the incoming raw body,
+                    # byte-identical, with no dead_letter block (even for an undecodable body).
+                    dead = app.transport._queues["orders.dlq"][0]  # noqa: SLF001
+                    self.assertEqual(dead, body)
+                    self.assertNotIn("dead_letter", dead)
 
     def test_version_gated_message_whose_dead_letter_write_fails_is_not_retried(self) -> None:
         from babelqueue.app import _UNSUPPORTED_SCHEMA_ROUTE_PREFIX

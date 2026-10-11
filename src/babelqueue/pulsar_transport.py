@@ -59,8 +59,9 @@ _BLANK_ASCII_PATTERN = re.compile(r"[ \t\n\x0b\x0c\r]*")
 #: ... that fits a signed 32-bit int, matching the Java and .NET consumers (GR-5).
 _MAX_ATTEMPTS = 2**31 - 1
 #: Prefix of the reserved ``route_urn`` a version-gated message is delivered under. It is not a
-#: ``urn:babel:`` URN, so no handler can legitimately own it; the runtime reports it as an
-#: unknown URN, which names the rejected ``bq-schema-version``.
+#: ``urn:babel:`` URN, so no handler can legitimately own it; the runtime dead-letters it
+#: directly (never retried, never decoded; the DLQ record is the incoming raw body). The
+#: rejected ``bq-schema-version`` is named in the logged error.
 UNSUPPORTED_SCHEMA_ROUTE_PREFIX = "babelqueue:unsupported-schema-version:"
 #: Separates the rejected version from the delivery's original ``bq-job`` in a gate route.
 _GATE_JOB_PARAM = "?bq-job="

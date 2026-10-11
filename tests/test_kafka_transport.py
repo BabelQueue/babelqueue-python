@@ -318,8 +318,9 @@ class KafkaSchemaVersionGateTest(unittest.TestCase):
         for value in (b"2", b"x", b"2&x=%"):
             with self.subTest(value=value):
                 producer = FakeProducer()
+                incoming = body().encode("utf-8")
                 consumer = FakeConsumer(
-                    [FakeMessage(body().encode("utf-8"), headers=[("bq-schema-version", value)])]
+                    [FakeMessage(incoming, headers=[("bq-schema-version", value)])]
                 )
                 app = BabelQueue(
                     transport=transport(producer, consumer), max_attempts=5, dead_letter=True
@@ -336,10 +337,9 @@ class KafkaSchemaVersionGateTest(unittest.TestCase):
                 self.assertEqual(len(consumer.committed), 1)
                 self.assertEqual(len(producer.produced), 1)
                 self.assertEqual(producer.produced[0]["topic"], "orders.dlq")
-                dead = EnvelopeCodec.decode(producer.produced[0]["value"].decode("utf-8"))
-                self.assertEqual(dead["job"], URN)  # the producer's body, annotated
-                self.assertEqual(dead["dead_letter"]["reason"], "unknown_urn")
-                self.assertIn(self.PREFIX + quote(value.decode(), safe=""), dead["dead_letter"]["error"])
+                # rejected without decoding: the DLQ record is the incoming body, byte-identical
+                self.assertEqual(producer.produced[0]["value"], incoming)
+                self.assertNotIn(b"dead_letter", producer.produced[0]["value"])
 
     def _failing_dlq_producer(self, failures):
         class DlqFailingProducer(FakeProducer):
@@ -379,7 +379,8 @@ class KafkaSchemaVersionGateTest(unittest.TestCase):
     def test_failed_gated_record_is_not_lost_when_a_later_record_is_committed(self):
         # Cumulative offsets: committing record 8 would silently skip an unacked record 7.
         producer = self._failing_dlq_producer(failures=2)
-        gated = OffsetMessage(body().encode("utf-8"), [("bq-schema-version", b"2")], offset=7)
+        incoming = body().encode("utf-8")
+        gated = OffsetMessage(incoming, [("bq-schema-version", b"2")], offset=7)
         later = OffsetMessage(body().encode("utf-8"), [("bq-schema-version", b"1")], offset=8)
         consumer = OffsetConsumer([])
         consumer.log = [None] * 7 + [gated, later]
@@ -397,8 +398,8 @@ class KafkaSchemaVersionGateTest(unittest.TestCase):
 
         # The gated record reached the DLQ before the later record was committed past it.
         self.assertEqual([m["topic"] for m in producer.produced], ["orders.dlq"])
-        dead = EnvelopeCodec.decode(producer.produced[0]["value"].decode("utf-8"))
-        self.assertEqual(dead["dead_letter"]["reason"], "unknown_urn")
+        self.assertEqual(producer.produced[0]["value"], incoming)  # raw, byte-identical
+        self.assertNotIn(b"dead_letter", producer.produced[0]["value"])
         self.assertEqual(consumer.commits, [7, 8])
         self.assertEqual(consumer.committed_offset, 9)
         self.assertEqual(len(seen), 1)  # only the supported record reached the handler

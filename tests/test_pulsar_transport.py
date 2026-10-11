@@ -518,8 +518,9 @@ class PulsarConsumeTest(unittest.TestCase):
         for value in ("2", "x"):
             with self.subTest(value=value):
                 producer = FakeProducer()
+                incoming = body()
                 consumer = FakeConsumer(
-                    [FakeMessage(body(), properties={"bq-schema-version": value, "bq-job": URN})]
+                    [FakeMessage(incoming, properties={"bq-schema-version": value, "bq-job": URN})]
                 )
                 tr = PulsarTransport(client=FakeClient(producer=producer, consumer=consumer))
                 app = BabelQueue(transport=tr, max_attempts=1, dead_letter=True)
@@ -534,10 +535,9 @@ class PulsarConsumeTest(unittest.TestCase):
                 self.assertEqual(seen, [])  # never reaches a handler
                 self.assertEqual(len(consumer.acked), 1)
                 self.assertEqual(len(producer.sent), 1)
-                dead = EnvelopeCodec.decode(producer.sent[0][0].decode("utf-8"))
-                self.assertEqual(dead["job"], URN)  # the producer's body, annotated
-                self.assertEqual(dead["dead_letter"]["reason"], "unknown_urn")
-                self.assertIn(UNSUPPORTED_SCHEMA_ROUTE_PREFIX + value, dead["dead_letter"]["error"])
+                # rejected without decoding: the DLQ record is the incoming body, byte-identical
+                self.assertEqual(producer.sent[0][0].decode("utf-8"), incoming)
+                self.assertNotIn("dead_letter", producer.sent[0][0].decode("utf-8"))
 
     def test_republish_of_gated_message_never_writes_the_sentinel(self):
         """The dead-letter record keeps the original bq-job / bq-schema-version (the sentinel is

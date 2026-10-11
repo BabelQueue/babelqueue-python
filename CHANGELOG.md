@@ -9,6 +9,16 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Changed
+- **Schema-version gate rejection now dead-letters the incoming body, byte-identical.** A message
+  whose `bq-schema-version` (`bq_schema_version` on Artemis) is unsupported is rejected *without
+  decoding it* (broker-bindings §3.7/§4.7/§5.7/§6.7/§7.7) and, when the DLQ is enabled, the DLQ
+  record is the raw body as received, with no `dead_letter` block. Previously the core decoded
+  the envelope and wrote an annotated `dead_letter{reason:"unknown_urn"}` record. This aligns the
+  Python SDK with Java, .NET and Node. A DLQ consumer that expected the annotation for gated
+  messages is affected; a failed DLQ write still leaves the message unsettled (rewound on Kafka),
+  and DLQ off / `UnknownUrnStrategy.DELETE` still drops it. No wire or API change.
+
 ### Fixed
 - **Kafka: a record whose settlement raised was silently lost on a consume-loop restart.** When a
   retry / release / dead-letter `publish` failed (or the loop was otherwise interrupted before

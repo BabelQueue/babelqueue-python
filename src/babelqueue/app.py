@@ -279,7 +279,11 @@ class BabelQueue:
         with _headers_scope(received.headers), _replay_scope(
             bool(received.headers.get(HEADER_REPLAY_BYPASS))
         ):
-            envelope = EnvelopeCodec.decode(received.body)
+            # A version-gated delivery is rejected without decoding its body (broker-bindings
+            # §3.7/§4.7/§5.7/§6.7/§7.7): the raw body goes to the DLQ byte-identical, so there is
+            # no envelope to read here.
+            gated = received.route_urn.startswith(_UNSUPPORTED_SCHEMA_ROUTE_PREFIX)
+            envelope = {} if gated else EnvelopeCodec.decode(received.body)
             urn = str(envelope.get("job") or envelope.get("urn") or "")
             if received.route_urn and envelope:
                 # Transport-supplied routing override; body untouched. Only for a body that
@@ -479,7 +483,7 @@ class BabelQueue:
         # gate would be bypassed or the message would loop. It goes straight to the DLQ (or is
         # dropped when no DLQ is configured).
         if received.route_urn.startswith(_UNSUPPORTED_SCHEMA_ROUTE_PREFIX):
-            self._settle_version_gated(received, envelope)
+            self._settle_version_gated(received)
             return
         # An undecodable body or a body naming no URN can never gain a handler either, so
         # releasing it unchanged would redeliver it forever. It takes the bounded FAIL path
@@ -495,11 +499,21 @@ class BabelQueue:
         # (never kills the loop).
         raise UnknownUrnError(f"No handler mapped for URN [{urn or '(empty)'}].")
 
-    def _settle_version_gated(self, received: ReceivedMessage, envelope: Mapping[str, Any]) -> None:
-        """Dead-letter a version-gated delivery directly (no retry); drop it when no DLQ is set."""
+    def _dead_letter_target(self, received: ReceivedMessage) -> str:
+        """The queue a dead-lettered delivery is written to (configured DLQ or ``<queue><suffix>``)."""
+        return self.dead_letter_queue or (received.queue + self.dead_letter_suffix)
+
+    def _settle_version_gated(self, received: ReceivedMessage) -> None:
+        """Dead-letter a version-gated delivery directly (no retry); drop it when no DLQ is set.
+
+        The gate rejects the message *without decoding it*, so the DLQ record is the incoming raw
+        body, byte-identical, with no ``dead_letter`` block (matching the Java, .NET and Node
+        SDKs). A failed DLQ write propagates: the delivery is left unacknowledged and handed back
+        (see :meth:`dispatch`), never retried.
+        """
         if self.dead_letter_enabled or self.on_unknown_urn == UnknownUrnStrategy.DEAD_LETTER:
-            error = UnknownUrnError(f"No handler mapped for URN [{received.route_urn}].")
-            self._dead_letter(received, dict(envelope), "unknown_urn", error)
+            self._publish_for(received, self._dead_letter_target(received), received.body)
+            self._ack_settled(received)
             return
         self._ack_settled(received)
 
@@ -537,8 +551,9 @@ class BabelQueue:
             error=(str(exc) if exc is not None else None),
             exception=(type(exc).__name__ if exc is not None else None),
         )
-        target = self.dead_letter_queue or (received.queue + self.dead_letter_suffix)
-        self._publish_for(received, target, EnvelopeCodec.encode(annotated))
+        self._publish_for(
+            received, self._dead_letter_target(received), EnvelopeCodec.encode(annotated)
+        )
         self._ack_settled(received)
 
 

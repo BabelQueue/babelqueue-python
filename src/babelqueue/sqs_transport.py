@@ -54,8 +54,9 @@ logger = logging.getLogger("babelqueue.sqs")
 #: U+0085, U+00A0, U+2028, U+3000 ...
 _BLANK_ASCII_PATTERN = re.compile(r"[ \t\n\x0b\x0c\r]*")
 #: Prefix of the reserved ``route_urn`` a version-gated message is delivered under. It is not a
-#: ``urn:babel:`` URN, so no handler can legitimately own it; the runtime reports it as an
-#: unknown URN, which names the rejected ``bq-schema-version``.
+#: ``urn:babel:`` URN, so no handler can legitimately own it; the runtime dead-letters it
+#: directly (never retried, never decoded; the DLQ record is the incoming raw body). The
+#: rejected ``bq-schema-version`` is named in the logged error.
 UNSUPPORTED_SCHEMA_ROUTE_PREFIX = "babelqueue:unsupported-schema-version:"
 
 

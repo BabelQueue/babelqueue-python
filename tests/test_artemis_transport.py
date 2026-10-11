@@ -301,7 +301,8 @@ class ArtemisSchemaVersionGateTest(unittest.TestCase):
         # max_attempts > 1: a gated message is dead-lettered directly, never retried
         for value in ("2", "x", "2&x=%"):
             with self.subTest(value=value):
-                transport, receiver = self._transport(body(), {"bq_schema_version": value})
+                incoming = body()
+                transport, receiver = self._transport(incoming, {"bq_schema_version": value})
                 app = BabelQueue(transport=transport, max_attempts=5, dead_letter=True)
                 seen: list = []
 
@@ -318,10 +319,9 @@ class ArtemisSchemaVersionGateTest(unittest.TestCase):
                 publish.assert_called_once()
                 queue, dead_body = publish.call_args.args
                 self.assertEqual("orders.dlq", queue)
-                dead = EnvelopeCodec.decode(dead_body)
-                self.assertEqual(URN, dead["job"])  # the producer's body, annotated
-                self.assertEqual("unknown_urn", dead["dead_letter"]["reason"])
-                self.assertIn(self.PREFIX + quote(value, safe=""), dead["dead_letter"]["error"])
+                # rejected without decoding: the DLQ record is the incoming body, byte-identical
+                self.assertEqual(incoming, dead_body)
+                self.assertNotIn("dead_letter", dead_body)
 
 
 class ArtemisUrlTest(unittest.TestCase):

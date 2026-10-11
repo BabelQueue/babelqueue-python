@@ -277,7 +277,8 @@ class AsbSchemaVersionGateTest(unittest.TestCase):
         # max_attempts > 1: a gated message is dead-lettered directly, never retried
         for value in ("2", "x", 2, "2&x=%"):
             with self.subTest(value=value):
-                receiver = FakeReceiver([FakeReceived(body(), 1, {"bq-schema-version": value})])
+                incoming = body()
+                receiver = FakeReceiver([FakeReceived(incoming, 1, {"bq-schema-version": value})])
                 app = BabelQueue(
                     transport=AsbTransport(client=FakeClient(receiver=receiver)),
                     max_attempts=5,
@@ -298,10 +299,9 @@ class AsbSchemaVersionGateTest(unittest.TestCase):
                 publish.assert_called_once()
                 queue, dead_body = publish.call_args.args
                 self.assertEqual(queue, "orders.dlq")
-                dead = EnvelopeCodec.decode(dead_body)
-                self.assertEqual(dead["job"], URN)  # the producer's body, annotated
-                self.assertEqual(dead["dead_letter"]["reason"], "unknown_urn")
-                self.assertIn(self.PREFIX + quote(str(value), safe=""), dead["dead_letter"]["error"])
+                # rejected without decoding: the DLQ record is the incoming body, byte-identical
+                self.assertEqual(dead_body, incoming)
+                self.assertNotIn("dead_letter", dead_body)
 
 
 @unittest.skipUnless(HAVE_ASB, "azure-servicebus not installed")

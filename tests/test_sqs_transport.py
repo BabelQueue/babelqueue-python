@@ -646,7 +646,8 @@ class SqsSchemaVersionGateTest(unittest.TestCase):
                 def _on(data, meta):
                     seen.append(data)
 
-                self._enqueue(fake, self._body(), value)
+                incoming = self._body()
+                self._enqueue(fake, incoming, value)
                 app.consume("orders", max_messages=1, timeout=0)
 
                 self.assertEqual(seen, [])  # never reaches the handler
@@ -654,13 +655,10 @@ class SqsSchemaVersionGateTest(unittest.TestCase):
                 self.assertEqual(fake.visibility_changes, [])  # not released for a retry
                 self.assertEqual(len(fake.sent), 1)
                 self.assertEqual(fake.sent[0]["QueueUrl"], "http://fake/orders.dlq")
-                dead = EnvelopeCodec.decode(fake.sent[0]["MessageBody"])
-                self.assertEqual(dead["job"], self.URN)  # the producer's body, annotated
-                self.assertEqual(dead["dead_letter"]["reason"], "unknown_urn")
-                self.assertIn(
-                    "babelqueue:unsupported-schema-version:" + quote(value, safe=""),
-                    dead["dead_letter"]["error"],
-                )
+                # The gate rejects without decoding: the DLQ record is the incoming body,
+                # byte-identical, with no dead_letter block.
+                self.assertEqual(fake.sent[0]["MessageBody"], incoming)
+                self.assertNotIn("dead_letter", fake.sent[0]["MessageBody"])
 
     def test_app_without_dead_letter_drops_unsupported_version_without_retry(self):
         tr, fake = self._tr()

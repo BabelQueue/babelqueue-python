@@ -132,8 +132,8 @@ ASCII whitespace) follows the normal path; any other value must be exactly `"1"`
 untrimmed; Azure Service Bus and Artemis also accept the integer `1`). A message carrying
 anything else is not decoded: it reaches the runtime on the reserved route
 `babelqueue:unsupported-schema-version:<v>` (the version percent-escaped) and is **never
-retried** — it goes straight to the dead-letter queue (reason `unknown_urn`, the body kept
-verbatim) when `dead_letter` is enabled, and is dropped otherwise, whatever `max_attempts` is.
+retried** — it goes straight to the dead-letter queue (the incoming body, byte-identical,
+with no `dead_letter` block) when `dead_letter` is enabled, and is dropped otherwise, whatever `max_attempts` is.
 It does not depend on a broker `RedrivePolicy`. If the dead-letter write fails the message is
 left unacknowledged (an error is logged), is never retried and never reaches a handler; the
 dead-letter write is attempted again when the broker brings it back, which depends on the

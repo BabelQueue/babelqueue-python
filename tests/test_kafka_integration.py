@@ -7,7 +7,8 @@ real ``confluent_kafka`` produce / poll / commit / seek paths that the fake-base
 
 Scenarios: (1) a handler error is retried up to ``max_attempts`` and then dead-lettered to
 ``<queue>.dlq`` with a ``dead_letter`` block; (2) a record whose ``bq-schema-version`` header is
-``"2"`` is gated before any decode and dead-lettered directly, never reaching a handler.
+``"2"`` is gated before any decode and dead-lettered directly as the incoming raw value,
+byte-identical with no ``dead_letter`` block, never reaching a handler.
 """
 
 from __future__ import annotations
@@ -37,17 +38,23 @@ def _create_topics(*topics: str) -> None:
         future.result(30)
 
 
-def _pop_until(transport: KafkaTransport, queue: str) -> Optional[Dict[str, Any]]:
-    """Poll ``queue`` until a record arrives (or the deadline passes); ack it and return its decoded
-    envelope. The ack matters: an un-acked record is "abandoned" and the next ``pop`` seeks back to
-    it, so a later ``pop`` would hand the very same record out again."""
+def _pop_raw_until(transport: KafkaTransport, queue: str) -> Optional[str]:
+    """Poll ``queue`` until a record arrives (or the deadline passes); ack it and return its raw
+    body, undecoded. The ack matters: an un-acked record is "abandoned" and the next ``pop`` seeks
+    back to it, so a later ``pop`` would hand the very same record out again."""
     stop = time.monotonic() + DEADLINE_SECONDS
     while time.monotonic() < stop:
         received = transport.pop(queue, timeout=2.0)
         if received is not None:
             transport.ack(received)
-            return json.loads(received.body)
+            return received.body
     return None
+
+
+def _pop_until(transport: KafkaTransport, queue: str) -> Optional[Dict[str, Any]]:
+    """:func:`_pop_raw_until`, with the body decoded as JSON."""
+    body = _pop_raw_until(transport, queue)
+    return json.loads(body) if body is not None else None
 
 
 @unittest.skipUnless(ENABLED, "live-broker test: set BQ_INTEGRATION=1 (and BQ_KAFKA_BROKERS) to run")
@@ -110,8 +117,8 @@ class KafkaLiveIntegrationTest(unittest.TestCase):
 
         # The §6.7 gate decides on the *header* alone, before the body is decoded. The body here is
         # deliberately not a v1 envelope (a "future format"), so this also proves the gate never
-        # tries to decode it. Per the gate design, Python annotates the rejection as an
-        # ``unknown_urn`` dead-letter record built from whatever the body decodes to (here: nothing).
+        # tries to decode it. The rejected record is dead-lettered as the incoming raw value,
+        # byte-identical, with no ``dead_letter`` block (§6.7, like the Java/.NET/Node SDKs).
         raw = f"future-format-{self.queue}".encode("utf-8")
         producer = Producer({"bootstrap.servers": BROKERS})
         producer.produce(
@@ -128,17 +135,13 @@ class KafkaLiveIntegrationTest(unittest.TestCase):
         self.assertEqual(processed, 1)
 
         dlq_transport = self._transport(f"{self.group}-dlq")
-        envelope = _pop_until(dlq_transport, self.dlq)
-        self.assertIsNotNone(envelope, f"nothing arrived on {self.dlq}")
-        assert envelope is not None  # for the type checker
+        dead_body = _pop_raw_until(dlq_transport, self.dlq)
+        self.assertIsNotNone(dead_body, f"nothing arrived on {self.dlq}")
+        assert dead_body is not None  # for the type checker
         self.assertEqual(calls, [])
-        block = envelope["dead_letter"]
-        self.assertEqual(block["reason"], "unknown_urn")
-        self.assertEqual(block["original_queue"], self.queue)
-        self.assertEqual(block["attempts"], 0)
-        self.assertEqual(block["lang"], "python")
-        self.assertEqual(block["exception"], "UnknownUrnError")
-        self.assertIn("unsupported-schema-version:2", block["error"])
+        # Byte-identical to the incoming value; never decoded, so no dead_letter block either.
+        self.assertEqual(dead_body.encode("utf-8"), raw)
+        self.assertNotIn("dead_letter", dead_body)
 
         # Exactly one record was dead-lettered (the gate does not retry or double-write).
         self.assertIsNone(dlq_transport.pop(self.dlq, timeout=3.0), "a second record reached the DLQ")

@@ -47,8 +47,9 @@ _logger = logging.getLogger("babelqueue.artemis")
 #: U+0085, U+00A0, U+2028, U+3000 ...
 _BLANK_ASCII_PATTERN = re.compile(r"[ \t\n\x0b\x0c\r]*")
 #: Prefix of the reserved ``route_urn`` a version-gated message is delivered under. It is not a
-#: ``urn:babel:`` URN, so no handler can legitimately own it; the runtime reports it as an
-#: unknown URN, which names the rejected ``bq_schema_version``.
+#: ``urn:babel:`` URN, so no handler can legitimately own it; the runtime dead-letters it
+#: directly (never retried, never decoded; the DLQ record is the incoming raw body). The
+#: rejected ``bq_schema_version`` is named in the logged error.
 UNSUPPORTED_SCHEMA_ROUTE_PREFIX = "babelqueue:unsupported-schema-version:"
 
 JMS_TYPE_ANNOTATION = "x-opt-jms-type"
