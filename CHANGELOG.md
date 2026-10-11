@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.16.1] - 2026-10-11
+
 ### Changed
 - **Schema-version gate rejection now dead-letters the incoming body, byte-identical.** A message
   whose `bq-schema-version` (`bq_schema_version` on Artemis) is unsupported is rejected *without
