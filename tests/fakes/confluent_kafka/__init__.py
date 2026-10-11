@@ -8,6 +8,8 @@ _LOCK = threading.RLock()
 TOPICS = {}      # topic -> list[Message]
 COMMITTED = {}   # (group, topic) -> next offset to read
 
+OFFSET_BEGINNING = -2
+
 
 class TopicPartition:
     def __init__(self, topic, partition=0, offset=-1001):
@@ -15,9 +17,10 @@ class TopicPartition:
 
 
 class Message:
-    def __init__(self, topic, offset, value, headers):
-        self._t, self._o, self._v, self._h = topic, offset, value, headers
+    def __init__(self, topic, offset, value, headers, key=None):
+        self._t, self._o, self._v, self._h, self._k = topic, offset, value, headers, key
 
+    def key(self): return self._k  # None = null key, b"" = empty key (kept distinct)
     def value(self): return self._v
     def headers(self): return self._h
     def error(self): return None
@@ -29,10 +32,10 @@ class Message:
 class Producer:
     def __init__(self, conf): self._reports = []
 
-    def produce(self, topic, value=None, headers=None, timestamp=None, on_delivery=None, **kw):
+    def produce(self, topic, value=None, headers=None, timestamp=None, on_delivery=None, key=None, **kw):
         with _LOCK:
             log = TOPICS.setdefault(topic, [])  # auto-create, like the real broker default
-            log.append(Message(topic, len(log), value, list(headers or [])))
+            log.append(Message(topic, len(log), value, list(headers or []), key))
         if on_delivery is not None:
             self._reports.append(on_delivery)
 
@@ -55,6 +58,11 @@ class Consumer:
     def subscribe(self, topics):
         self.topic = topics[0]
         self.position = COMMITTED.get((self.group, self.topic), 0)
+
+    def assign(self, partitions):
+        tp = partitions[0]
+        self.topic = tp.topic
+        self.position = 0 if tp.offset == OFFSET_BEGINNING else tp.offset
 
     def poll(self, timeout=None):
         with _LOCK:

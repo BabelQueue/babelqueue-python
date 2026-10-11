@@ -8,7 +8,10 @@ real ``confluent_kafka`` produce / poll / commit / seek paths that the fake-base
 Scenarios: (1) a handler error is retried up to ``max_attempts`` and then dead-lettered to
 ``<queue>.dlq`` with a ``dead_letter`` block; (2) a record whose ``bq-schema-version`` header is
 ``"2"`` is gated before any decode and dead-lettered directly as the incoming raw value,
-byte-identical with no ``dead_letter`` block, never reaching a handler.
+byte-identical with no ``dead_letter`` block, never reaching a handler; (3) the record key
+(contract §6.5 "Record key on republish") survives the retry republish, the DLQ write, the redrive
+dry-run restore and the redrive itself, byte-for-byte: a null key stays null, an empty key stays
+empty, a non-empty key stays non-null. Every hop is read back from the broker with a raw consumer.
 """
 
 from __future__ import annotations
@@ -18,10 +21,11 @@ import os
 import time
 import unittest
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from babelqueue import BabelQueue
+from babelqueue import BabelQueue, EnvelopeCodec
 from babelqueue.kafka_transport import KafkaTransport
+from babelqueue.redrive import redrive
 
 URN = "urn:babel:orders:created"
 ENABLED = os.environ.get("BQ_INTEGRATION") == "1"
@@ -55,6 +59,38 @@ def _pop_until(transport: KafkaTransport, queue: str) -> Optional[Dict[str, Any]
     """:func:`_pop_raw_until`, with the body decoded as JSON."""
     body = _pop_raw_until(transport, queue)
     return json.loads(body) if body is not None else None
+
+
+def _read_records(topic: str, count: int) -> List[Tuple[int, Optional[bytes]]]:
+    """Read the first ``count`` records of ``topic`` with a raw consumer (no transport logic, no
+    group state) and return ``(offset, key)`` pairs; ``key`` is ``None`` for a null key and
+    ``b""`` for an empty one. Fails the test if fewer arrive before the deadline."""
+    from confluent_kafka import OFFSET_BEGINNING, Consumer, TopicPartition
+
+    consumer = Consumer(
+        {
+            "bootstrap.servers": BROKERS,
+            "group.id": f"bq-it-raw-{uuid.uuid4().hex[:8]}",
+            "enable.auto.commit": False,
+            "auto.offset.reset": "earliest",
+        }
+    )
+    records: List[Tuple[int, Optional[bytes]]] = []
+    try:
+        consumer.assign([TopicPartition(topic, 0, OFFSET_BEGINNING)])
+        stop = time.monotonic() + DEADLINE_SECONDS
+        while len(records) < count and time.monotonic() < stop:
+            message = consumer.poll(1.0)
+            if message is None:
+                continue
+            if message.error():
+                raise AssertionError(f"read {topic}: {message.error()}")
+            records.append((message.offset(), message.key()))
+    finally:
+        consumer.close()
+    if len(records) < count:
+        raise AssertionError(f"{topic} holds {len(records)} record(s), want at least {count}")
+    return records
 
 
 @unittest.skipUnless(ENABLED, "live-broker test: set BQ_INTEGRATION=1 (and BQ_KAFKA_BROKERS) to run")
@@ -148,6 +184,80 @@ class KafkaLiveIntegrationTest(unittest.TestCase):
 
         # The source record was settled: the group's committed offset moved past it.
         self.assertEqual(self._committed_offset(), 1)
+
+    def test_null_record_key_survives_retry_dlq_and_redrive(self) -> None:
+        self._assert_key_survives(None)
+
+    def test_empty_record_key_survives_retry_dlq_and_redrive(self) -> None:
+        self._assert_key_survives(b"")
+
+    def test_non_empty_record_key_survives_retry_dlq_and_redrive(self) -> None:
+        self._assert_key_survives(b"order-1042")
+
+    def _assert_key_survives(self, key: Optional[bytes]) -> None:
+        """Seed one record with ``key``, fail it through a retry into the DLQ, then restore (dry
+        run) and redrive it; the key read back from the broker is identical on every hop."""
+        from confluent_kafka import Producer
+
+        sandbox = f"{self.queue}.sandbox"
+        _create_topics(sandbox)
+        calls: List[int] = []
+        app = BabelQueue(
+            transport=self._transport(), queue=self.queue, max_attempts=2, dead_letter=True
+        )
+
+        @app.handler(URN)
+        def boom(data: Dict[str, Any], meta: Dict[str, Any]) -> None:
+            calls.append(1)
+            raise RuntimeError("boom")
+
+        body = EnvelopeCodec.encode(EnvelopeCodec.make(URN, {"order_id": 7}, queue=self.queue))
+        producer = Producer({"bootstrap.servers": BROKERS})
+        producer.produce(
+            self.queue, value=body.encode("utf-8"), key=key, headers=[("bq-job", URN.encode())]
+        )
+        producer.flush(30)
+        seeded = _read_records(self.queue, 1)
+        self._assert_same_key("seeded record", key, seeded[0][1])
+
+        # max_attempts=2: the first failure is republished once onto the work topic (retry), the
+        # second one is dead-lettered.
+        stop = time.monotonic() + DEADLINE_SECONDS
+        while len(calls) < 2 and time.monotonic() < stop:
+            app.consume(self.queue, max_messages=1, timeout=2.0, handle_signals=False)
+        self.assertEqual(len(calls), 2)
+
+        work = _read_records(self.queue, 2)
+        self._assert_same_key("retry republish", key, work[1][1])
+        dead = _read_records(self.dlq, 1)
+        self._assert_same_key("DLQ write", key, dead[0][1])
+
+        # Dry run restores the record verbatim onto the DLQ (original + restore); the real
+        # redrive then drains the restore (the group's committed offset is past the original) onto
+        # a sandbox topic. A pop can return nothing while the consumer group is still joining, so
+        # each run is repeated until it saw a record (an empty run has no side effects). ``max=1``
+        # is deliberate: KafkaTransport.pop re-seeks an un-acked in-flight record, so an unbounded
+        # drain (max=0) would keep re-popping the same record.
+        ops = self._transport(f"{self.group}-ops")
+        stop = time.monotonic() + DEADLINE_SECONDS
+        dry = redrive(ops, self.dlq, dry_run=True, max=1, timeout=2.0)
+        while not dry.items and time.monotonic() < stop:
+            dry = redrive(ops, self.dlq, dry_run=True, max=1, timeout=2.0)
+        self.assertEqual(len(dry.items), 1)
+        restored = _read_records(self.dlq, 2)
+        self._assert_same_key("dry-run restore", key, restored[1][1])
+
+        moved = redrive(ops, self.dlq, to_queue=sandbox, max=1, timeout=2.0)
+        while not moved.items and time.monotonic() < stop:
+            moved = redrive(ops, self.dlq, to_queue=sandbox, max=1, timeout=2.0)
+        self.assertEqual(moved.redriven, 1)
+        redriven = _read_records(sandbox, 1)
+        self._assert_same_key("redrive", key, redriven[0][1])
+
+    def _assert_same_key(self, hop: str, expected: Optional[bytes], actual: Optional[bytes]) -> None:
+        # None (null key) and b"" (empty key) are different values, so == also tells them apart.
+        self.assertEqual(actual is None, expected is None, f"{hop}: null-ness changed ({actual!r})")
+        self.assertEqual(actual, expected, f"{hop}: key changed")
 
     def _committed_offset(self) -> int:
         from confluent_kafka import Consumer, TopicPartition
