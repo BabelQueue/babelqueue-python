@@ -176,3 +176,43 @@ def test_redrive_keeps_the_route_urn():
     redrive(t3, "dlq")
     assert t3.routed == []
     assert len(_drain(t3, "orders")) == 1
+
+
+class _KeyedDLQ(InMemoryTransport):
+    """Stamps a key on every popped message and records the key of every settle write."""
+
+    def __init__(self, key):
+        super().__init__()
+        self.key = key
+        self.settled = []
+
+    def pop(self, queue, timeout=0.0):
+        message = super().pop(queue, timeout)
+        if message is not None:
+            message.key = self.key
+        return message
+
+    def publish_settle(self, queue, body, route_urn="", key=None):
+        self.settled.append((queue, key))
+        super().publish(queue, body)
+
+
+@pytest.mark.parametrize("key", [b"order-1042", b"", None])
+def test_redrive_carries_the_record_key(key):
+    t = _KeyedDLQ(key)
+    _dead_letter(t, "dlq", "urn:babel:orders:created", "orders")
+    result = redrive(t, "dlq")
+    assert result.redriven == 1
+    assert t.settled == [("orders", key)]  # b"" stays b"", None stays None
+
+    t2 = _KeyedDLQ(key)  # a dry-run restore to the DLQ keeps it too
+    _dead_letter(t2, "dlq", "urn:babel:orders:created", "orders")
+    redrive(t2, "dlq", dry_run=True)
+    assert t2.settled == [("dlq", key)]
+
+
+def test_redrive_on_a_non_keyed_transport_is_unchanged():
+    t = InMemoryTransport()
+    _dead_letter(t, "dlq", "urn:babel:orders:created", "orders")
+    assert redrive(t, "dlq").redriven == 1
+    assert len(_drain(t, "orders")) == 1

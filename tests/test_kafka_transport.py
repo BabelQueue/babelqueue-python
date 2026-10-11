@@ -13,7 +13,7 @@ import unittest
 from unittest import mock
 from urllib.parse import quote
 
-from babelqueue import BabelQueue, EnvelopeCodec
+from babelqueue import BabelQueue, EnvelopeCodec, dead_letter
 from babelqueue.kafka_transport import NON_UTF8_ROUTE, KafkaDeliveryError, KafkaTransport
 from babelqueue.transport import ReceivedMessage, make_transport
 
@@ -972,6 +972,52 @@ class KafkaKeyPreservationTest(unittest.TestCase):
         self.assertEqual(result.skipped, 1)
         self.assertEqual(producer.produced[0]["topic"], "orders.dlq")
         self.assertEqual(producer.produced[0]["key"], b"k-7")
+
+
+class KafkaRedriveKeyTest(unittest.TestCase):
+    """DLQ redrive carries the DLQ record key onto the redriven record (contract §6.5 "Record key
+    on republish"): null stays null, empty stays empty, never synthesised."""
+
+    KEYS = (b"order-1042", b"", None)
+
+    def _redrive(self, key, **kw):
+        from babelqueue import redrive
+
+        dead = dead_letter.annotate(EnvelopeCodec.decode(body()), "failed", "orders", 3, error="boom")
+        consumer = FakeConsumer([FakeMessage(EnvelopeCodec.encode(dead).encode(), key=key)])
+        producer = FakeProducer()
+        result = redrive.redrive(transport(producer, consumer), "orders.dlq", timeout=0, **kw)
+        return result, producer
+
+    def test_redrive_write_keeps_the_key(self):
+        for key in self.KEYS:
+            with self.subTest(key=key):
+                result, producer = self._redrive(key)
+                self.assertEqual(result.redriven, 1)
+                self.assertEqual(len(producer.produced), 1)
+                self.assertEqual(producer.produced[0]["topic"], "orders")
+                self.assertEqual(producer.produced[0]["key"], key)
+
+    def test_dry_run_restore_keeps_the_key(self):
+        for key in self.KEYS:
+            with self.subTest(key=key):
+                result, producer = self._redrive(key, dry_run=True)
+                self.assertEqual(result.skipped, 1)
+                self.assertEqual(producer.produced[0]["topic"], "orders.dlq")
+                self.assertEqual(producer.produced[0]["key"], key)
+
+    def test_a_null_key_is_not_synthesised_on_the_redrive_write(self):
+        class StrictProducer(FakeProducer):
+            def produce(self, topic, value=None, headers=None, timestamp=None, on_delivery=None, **kw):
+                assert "key" not in kw, "a null key must not be synthesised"
+                super().produce(topic, value=value, headers=headers, timestamp=timestamp, on_delivery=on_delivery)
+
+        from babelqueue import redrive
+
+        dead = dead_letter.annotate(EnvelopeCodec.decode(body()), "failed", "orders", 3, error="boom")
+        consumer = FakeConsumer([FakeMessage(EnvelopeCodec.encode(dead).encode(), key=None)])
+        result = redrive.redrive(transport(StrictProducer(), consumer), "orders.dlq", timeout=0)
+        self.assertEqual(result.redriven, 1)
 
 
 class KafkaSchemeTest(unittest.TestCase):

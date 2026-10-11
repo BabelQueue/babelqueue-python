@@ -9,6 +9,14 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Fixed
+- **`redrive` now carries the DLQ record key onto the redriven record.** The restore writes back to
+  the DLQ already kept the key; the redrive write to the work topic did not, so a replayed Kafka
+  record lost its key (and per-key partition affinity). It now goes through
+  `publish_keeping_route(..., key=message.key)`, byte-for-byte (null stays null, empty stays empty),
+  per contract §6.5 "Record key on republish". Non-keyed transports behave exactly as before; the
+  `bypass=True` header path still carries no key. No wire change.
+
 ## [1.17.0] - 2026-10-11
 
 ### Added

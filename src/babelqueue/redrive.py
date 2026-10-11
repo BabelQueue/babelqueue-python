@@ -130,7 +130,7 @@ def redrive(
         reset["attempts"] = 0
         try:
             item.bypassed = _publish_redriven(
-                transport, target, EnvelopeCodec.encode(reset), bypass, message.route_urn
+                transport, target, EnvelopeCodec.encode(reset), bypass, message.route_urn, message.key
             )
         except Exception:
             publish_keeping_route(transport, dlq, message.body, message.route_urn, message.key)  # restore on a publish failure, then surface
@@ -157,17 +157,26 @@ def _decoded(body: str) -> Optional[Dict[str, Any]]:
 
 
 def _publish_redriven(
-    transport: Transport, queue: str, body: str, bypass: bool, route_urn: str = ""
+    transport: Transport,
+    queue: str,
+    body: str,
+    bypass: bool,
+    route_urn: str = "",
+    key: Optional[bytes] = None,
 ) -> bool:
     """Re-publish a reset message to ``queue``. When ``bypass`` is set and the transport is a
     :class:`~babelqueue.transport.HeaderPublisher`, stamp the ``bq-replay-bypass`` header and
     return True; otherwise publish plainly and return False. Either way a non-empty ``route_urn``
     (the dead-lettered message's routing property) is carried back through
-    :class:`~babelqueue.transport.RoutedPublisher` when the transport implements it."""
+    :class:`~babelqueue.transport.RoutedPublisher` when the transport implements it, and the DLQ
+    record's ``key`` (:attr:`ReceivedMessage.key`; Kafka, contract §6.5 "Record key on republish")
+    is carried byte-for-byte through :class:`~babelqueue.transport.SettlePublisher` — a null key
+    stays null, an empty key stays empty. The bypass-header path carries no record key (as in the
+    Go reference)."""
     if bypass and isinstance(transport, HeaderPublisher):
         transport.publish_with_headers(queue, body, {HEADER_REPLAY_BYPASS: "1"})
         return True
-    publish_keeping_route(transport, queue, body, route_urn)
+    publish_keeping_route(transport, queue, body, route_urn, key)
     return False
 
 
