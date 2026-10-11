@@ -41,7 +41,12 @@ from urllib.parse import quote
 
 from .codec import SCHEMA_VERSION, EnvelopeCodec, parse_envelope
 from .exceptions import BabelQueueError
-from .transport import ReceivedMessage, Transport, truncate_declared_version
+from .transport import (
+    NON_NUMERIC_ATTEMPTS_ROUTE,
+    ReceivedMessage,
+    Transport,
+    truncate_declared_version,
+)
 
 _logger = logging.getLogger("babelqueue.kafka")
 
@@ -72,6 +77,20 @@ class KafkaDeliveryError(BabelQueueError):
     """A retry / dead-letter write was not confirmed by the broker (delivery error or timeout)."""
 
 
+def _runtime_attempts(env: Any) -> int:
+    """The envelope's ``attempts`` exactly as the runtime's retry path reads it
+    (``int(envelope.get("attempts", 0))``): an absent key is 0. Raises ``ValueError`` for every
+    value that read would choke on — null, ``""``, a list/dict, ``"three"``, ``inf``/``nan`` — and
+    for a bool, which is no counter at all although ``int()`` happens to accept it."""
+    value = env.get("attempts", 0)
+    if isinstance(value, bool):
+        raise ValueError("attempts is a bool")
+    try:
+        return int(value)
+    except (TypeError, OverflowError) as exc:
+        raise ValueError("attempts is not an integer") from exc
+
+
 def _brokers_from_url(url: str) -> str:
     rest = url.split("://", 1)[1] if "://" in url else url
     return rest.split("/", 1)[0] or "localhost:9092"
@@ -95,8 +114,13 @@ class KafkaTransport(Transport):
         self._producer = producer
         self._consumer_factory = consumer_factory
         self._consumers: Dict[str, Any] = {}
-        # Per queue: the record handed out by ``pop`` that has been neither acked nor rewound yet.
-        self._pending: Dict[str, Any] = {}
+        # Per queue: the records handed out that have been neither acked nor rewound yet (one for
+        # ``pop``; several for ``pop_batch``, which a drain-first consumer such as ``redrive`` uses).
+        self._pending: Dict[str, List[Any]] = {}
+        # Per queue: records acked while an earlier record on the same partition was still in
+        # flight. Kafka's commit is a cumulative per-partition position, so committing them now
+        # would pass the unsettled record; they are committed once that record settles.
+        self._settled: Dict[str, List[Any]] = {}
 
     # -- helpers ------------------------------------------------------------
 
@@ -156,7 +180,12 @@ class KafkaTransport(Transport):
         if meta.get("schema_version") is not None:
             headers.append(("bq-schema-version", str(meta["schema_version"]).encode("utf-8")))
         add("bq-source-lang", meta.get("lang"))
-        headers.append(("bq-attempts", str(int(env.get("attempts", 0) or 0)).encode("utf-8")))
+        try:
+            headers.append(("bq-attempts", str(_runtime_attempts(env)).encode("utf-8")))
+        except ValueError:
+            # A foreign producer's non-numeric ``attempts``: leave the redundant header out (the
+            # body is authoritative then) rather than fail the publish and strand the record.
+            pass
         return headers
 
     @staticmethod
@@ -166,7 +195,14 @@ class KafkaTransport(Transport):
         env = EnvelopeCodec.decode(body)
         if not env:
             return body
-        attempts = int(env.get("attempts", 0) or 0)
+        try:
+            body_attempts = _runtime_attempts(env)
+        except ValueError:
+            # A foreign producer wrote a non-numeric ``attempts``: there is nothing to reconcile
+            # against, and raising out of ``pop`` would skip the record unrestored. Pass the body
+            # through untouched; the runtime / ``redrive`` handle it like any other record.
+            return body
+        attempts = body_attempts
         for key, value in headers or []:
             if key == "bq-attempts":
                 # ``replace``: a non-UTF-8 header value must not raise out of ``pop``; it simply
@@ -181,7 +217,7 @@ class KafkaTransport(Transport):
                 except (ValueError, TypeError):
                     pass
                 break
-        if attempts == int(env.get("attempts", 0) or 0):
+        if attempts == body_attempts:
             return body
         env["attempts"] = attempts
         return EnvelopeCodec.encode(env)
@@ -227,6 +263,20 @@ class KafkaTransport(Transport):
         consumer whose records expose no ``key()``."""
         key_of = getattr(message, "key", None)
         return key_of() if callable(key_of) else None
+
+    @staticmethod
+    def _has_non_numeric_attempts(body: str) -> bool:
+        """Whether the body is an envelope whose ``attempts`` the runtime's retry path could
+        not read (see ``_runtime_attempts``), so such a record could never be retried. An absent
+        ``attempts`` is a plain 0, not a poison."""
+        env = parse_envelope(body)
+        if not env or "attempts" not in env:
+            return False
+        try:
+            _runtime_attempts(env)
+        except ValueError:
+            return True
+        return False
 
     @staticmethod
     def _is_non_utf8(message: Any) -> bool:
@@ -303,8 +353,47 @@ class KafkaTransport(Transport):
             raise KafkaDeliveryError(f"Kafka delivery to {queue!r} failed: {outcome['error']}")
 
     def pop(self, queue: str, timeout: float = 1.0) -> Optional[ReceivedMessage]:
-        wait = timeout if timeout and timeout > 0 else 1.0
         self._rewind_abandoned(queue)
+        return self._poll_one(queue, timeout)
+
+    def pop_batch(
+        self, queue: str, max: int = 0, timeout: float = 1.0
+    ) -> List[ReceivedMessage]:
+        """Up to ``max`` records (all currently available when ``max`` is 0), all held in flight
+        (:class:`~babelqueue.transport.BatchPopper`).
+
+        A drain-first consumer pops every record before it settles any, so the abandoned-record
+        rewind that every :meth:`pop` starts with must run once, up front — not between the polls,
+        where it would seek back to the record just handed out and return it again. The records
+        are then acked in any order; commits still never pass an unsettled one (:meth:`ack`).
+        """
+        self._rewind_abandoned(queue)
+        batch: List[ReceivedMessage] = []
+        while max == 0 or len(batch) < max:
+            try:
+                received = self._poll_one(queue, timeout)
+            except Exception:
+                # A record ``pop`` cannot build (e.g. a malformed ``attempts``) is not tracked as in
+                # flight (see ``_poll_one``). Raising here would abandon the records already held,
+                # and the next call would rewind to them and hit the same record again: the
+                # partition could never be drained. Hand out what was taken instead, exactly as the
+                # single-record ``pop`` moves past it on its next call. With nothing taken yet there
+                # is nothing to lose, so the error surfaces.
+                if not batch:
+                    raise
+                _logger.exception(
+                    "Kafka record on %r could not be decoded; ending the batch at %d record(s).",
+                    queue,
+                    len(batch),
+                )
+                break
+            if received is None:
+                break
+            batch.append(received)
+        return batch
+
+    def _poll_one(self, queue: str, timeout: float) -> Optional[ReceivedMessage]:
+        wait = timeout if timeout and timeout > 0 else 1.0
         message = self._consumer(queue).poll(wait)
         if message is None or message.error() is not None:
             return None
@@ -330,7 +419,7 @@ class KafkaTransport(Transport):
                 route_urn=UNSUPPORTED_SCHEMA_ROUTE_PREFIX + quote(unsupported, safe=""),
                 key=self._key(message),
             )
-            self._pending[queue] = message
+            self._pending.setdefault(queue, []).append(message)
             return received
         if self._is_non_utf8(message):
             # The value cannot be decoded, so there is no envelope to retry or annotate: hand it
@@ -346,22 +435,81 @@ class KafkaTransport(Transport):
                 route_urn=NON_UTF8_ROUTE,
                 key=self._key(message),
             )
-            self._pending[queue] = message
+            self._pending.setdefault(queue, []).append(message)
             return received
-        body = self._reconcile(self._payload(message), headers)
+        payload = self._payload(message)
+        if self._has_non_numeric_attempts(payload):
+            # A foreign producer wrote a non-numeric ``attempts``. The runtime could not retry it
+            # (it needs an integer counter) and a failing handler would wedge the partition, so it
+            # is handed over under the reserved route like a non-UTF-8 record: dead-lettered raw,
+            # never given to a handler, and restored (not replayed) by ``redrive``.
+            _logger.warning(
+                "Kafka record on %r carries a non-numeric attempts; dead-lettering it raw.", queue
+            )
+            received = ReceivedMessage(
+                body=payload,
+                queue=queue,
+                handle=message,
+                route_urn=NON_NUMERIC_ATTEMPTS_ROUTE,
+                key=self._key(message),
+            )
+            self._pending.setdefault(queue, []).append(message)
+            return received
+        body = self._reconcile(payload, headers)
         received = ReceivedMessage(body=body, queue=queue, handle=message, key=self._key(message))
         # Track the record as in flight only once ``pop`` has built it. A decode error above
         # escapes before this point and must not leave the record pending: the next ``pop`` would
         # seek back to it and fail identically, wedging the partition forever.
-        self._pending[queue] = message
+        self._pending.setdefault(queue, []).append(message)
         return received
 
+    @staticmethod
+    def _partition_of(handle: Any) -> Tuple[Any, Any]:
+        # A handle without a position (a stand-in that is not a Kafka record) is its own bucket.
+        try:
+            return (handle.topic(), handle.partition())
+        except AttributeError:
+            return (None, None)
+
+    @staticmethod
+    def _offset_of(handle: Any) -> int:
+        try:
+            return int(handle.offset())
+        except AttributeError:
+            return -1
+
     def ack(self, message: ReceivedMessage) -> None:
-        if message.handle is None:
+        handle = message.handle
+        if handle is None:
             return
+        queue = message.queue
         # Settled: from here on the record is no longer "in flight", whatever the commit does.
-        self._pending.pop(message.queue, None)
-        self._consumer(message.queue).commit(message=message.handle, asynchronous=False)
+        pending = [h for h in self._pending.get(queue, []) if h is not handle]
+        if pending:
+            self._pending[queue] = pending
+        else:
+            self._pending.pop(queue, None)
+        settled = self._settled.get(queue, []) + [handle]
+        # The commit is a cumulative per-partition position: it may only reach as far as the lowest
+        # record on that partition that is still in flight.
+        partition = self._partition_of(handle)
+        floor = min(
+            (self._offset_of(h) for h in pending if self._partition_of(h) == partition), default=None
+        )
+        committable = [
+            h
+            for h in settled
+            if self._partition_of(h) == partition and (floor is None or self._offset_of(h) < floor)
+        ]
+        remaining = [h for h in settled if not any(h is c for c in committable)]
+        if remaining:
+            self._settled[queue] = remaining
+        else:
+            self._settled.pop(queue, None)
+        if not committable:
+            return
+        top = max(committable, key=self._offset_of)
+        self._consumer(queue).commit(message=top, asynchronous=False)
 
     def rewind(self, message: ReceivedMessage) -> None:
         """Seek the partition back to ``message``'s offset so the next ``pop`` returns it again
@@ -371,27 +519,48 @@ class KafkaTransport(Transport):
         if handle is None:
             return
         self._seek_back(message.queue, handle)
-        if self._pending.get(message.queue) is handle:
-            del self._pending[message.queue]
+        self._forget_from(message.queue, self._partition_of(handle), self._offset_of(handle))
+
+    def _forget_from(self, queue: str, partition: Tuple[Any, Any], offset: int) -> None:
+        """Drop the in-flight and deferred-settled records of ``partition`` at or after ``offset``:
+        the seek made the broker redeliver them."""
+        for book in (self._pending, self._settled):
+            kept = [
+                h
+                for h in book.get(queue, [])
+                if self._partition_of(h) != partition or self._offset_of(h) < offset
+            ]
+            if kept:
+                book[queue] = kept
+            else:
+                book.pop(queue, None)
 
     def _rewind_abandoned(self, queue: str) -> None:
-        """Re-seek a record that ``pop`` handed out but that was never acked or rewound.
+        """Re-seek the records that were handed out but never acked or rewound.
 
         That happens when the runtime's settlement raised (a failed retry / DLQ / release
-        ``publish``): ``poll`` has already advanced the in-memory position, so without this the
-        next ``pop`` (a restarted consume loop) would return the *following* record, and acking it
-        would commit past the unsettled one — losing it. Seeking back makes it redeliver instead.
+        ``publish``) or a drain-first consumer stopped midway: ``poll`` has already advanced the
+        in-memory position, so without this the next ``pop`` (a restarted consume loop) would
+        return the *following* record, and acking it would commit past the unsettled one — losing
+        it. Seeking back to the lowest such record per partition makes them redeliver instead.
         """
-        handle = self._pending.get(queue)
-        if handle is None:
+        pending = self._pending.get(queue)
+        if not pending:
             return
-        try:
-            self._seek_back(queue, handle)
-        except Exception:  # noqa: BLE001 - already logged, naming the record
-            # A seek can only fail here for a partition that is no longer assigned (rebalance); the
-            # group then resets the position to the committed offset, which is that record. Do not
-            # wedge the consumer on it.
-            pass
+        lowest: Dict[Tuple[Any, Any], Any] = {}
+        for handle in pending:
+            partition = self._partition_of(handle)
+            if partition not in lowest or self._offset_of(handle) < self._offset_of(lowest[partition]):
+                lowest[partition] = handle
+        for partition, handle in lowest.items():
+            try:
+                self._seek_back(queue, handle)
+            except Exception:  # noqa: BLE001 - already logged, naming the record
+                # A seek can only fail here for a partition that is no longer assigned (rebalance);
+                # the group then resets the position to the committed offset, which is that
+                # record. Do not wedge the consumer on it.
+                pass
+            self._forget_from(queue, partition, self._offset_of(handle))
         self._pending.pop(queue, None)
 
     def _seek_back(self, queue: str, handle: Any) -> None:

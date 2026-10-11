@@ -15,6 +15,7 @@ from urllib.parse import quote
 
 from babelqueue import BabelQueue, EnvelopeCodec, dead_letter
 from babelqueue.kafka_transport import NON_UTF8_ROUTE, KafkaDeliveryError, KafkaTransport
+from babelqueue.transport import NON_NUMERIC_ATTEMPTS_ROUTE
 from babelqueue.transport import ReceivedMessage, make_transport
 
 URN = "urn:babel:orders:created"
@@ -870,6 +871,93 @@ class KafkaDeliveryConfirmationTest(unittest.TestCase):
         self.assertEqual(producer.produced, [])
         self.assertEqual(consumer.commits, [0])
 
+    def test_non_numeric_attempts_is_dead_lettered_raw_without_running_the_handler(self):
+        bad = '{"job":"%s","attempts":"three","data":{"order_id":1}}' % URN
+        consumer = OffsetConsumer(
+            [
+                OffsetMessage(bad.encode("utf-8"), [], offset=0),
+                OffsetMessage(body().encode("utf-8").replace(URN.encode(), b"urn:babel:ok"), [], offset=1),
+            ]
+        )
+        producer = ReportingProducer()
+        app = self._app(producer, consumer, dead_letter=True)
+        failing = self._failing_handler(app)
+        ok: list = []
+
+        @app.handler("urn:babel:ok")
+        def _ok(data, meta):
+            ok.append(data)
+
+        with self.assertLogs("babelqueue.kafka", level="WARNING"):
+            app.consume(queue="orders", max_messages=1)
+            app.consume(queue="orders", max_messages=1)  # a second consume, not a restart loop
+
+        self.assertEqual(failing, [])  # the handler never saw the malformed record
+        self.assertEqual(producer.produced[0]["topic"], "orders.dlq")
+        self.assertEqual(producer.produced[0]["value"], bad.encode("utf-8"))  # raw, untouched
+        self.assertEqual(producer.confirmed[0], "orders.dlq")
+        self.assertEqual(consumer.commits, [0, 1])  # dead-lettered, committed, then moved on
+        self.assertEqual(consumer.seeks, [])
+        self.assertEqual(len(ok), 1)
+
+    # Every ``attempts`` value the runtime's ``int(envelope.get("attempts", 0))`` cannot read
+    # (null / "" / [] / {} are falsy, which a naive ``or 0`` once let through), plus a bool.
+    UNREADABLE_ATTEMPTS = (
+        "null", '""', "[]", "{}", "true", "false", '"three"', '"3.5"', "NaN", "Infinity", "1e999",
+    )
+    # Values the runtime reads fine: they must keep the normal route.
+    READABLE_ATTEMPTS = ('"3"', "3", "3.0", "0", '" 2 "')
+
+    def test_every_unreadable_attempts_is_dead_lettered_raw_without_running_the_handler(self):
+        for raw in self.UNREADABLE_ATTEMPTS:
+            with self.subTest(attempts=raw):
+                bad = ('{"job":"%s","attempts":%s,"data":{"order_id":1}}' % (URN, raw)).encode("utf-8")
+                good = body().encode("utf-8").replace(URN.encode(), b"urn:babel:ok")
+                consumer = OffsetConsumer(
+                    [OffsetMessage(bad, [], offset=0), OffsetMessage(good, [], offset=1)]
+                )
+                producer = ReportingProducer()
+                app = self._app(producer, consumer, dead_letter=True)
+                failing = self._failing_handler(app)
+                ok: list = []
+
+                @app.handler("urn:babel:ok")
+                def _ok(data, meta):
+                    ok.append(data)
+
+                with self.assertLogs("babelqueue.kafka", level="WARNING"):
+                    app.consume(queue="orders", max_messages=1)
+                    app.consume(queue="orders", max_messages=1)
+
+                self.assertEqual(failing, [])  # the handler never saw the record
+                self.assertEqual(producer.produced[0]["topic"], "orders.dlq")
+                self.assertEqual(producer.produced[0]["value"], bad)  # raw, untouched
+                self.assertEqual(consumer.commits, [0, 1])
+                self.assertEqual(consumer.seeks, [])
+                self.assertEqual(len(ok), 1)
+
+    def test_a_readable_or_absent_attempts_keeps_the_normal_route(self):
+        absent = '{"job":"%s","data":{"order_id":1}}' % URN
+        bodies = [absent] + ['{"job":"%s","attempts":%s}' % (URN, raw) for raw in self.READABLE_ATTEMPTS]
+        for text in bodies:
+            with self.subTest(body=text):
+                consumer = OffsetConsumer([OffsetMessage(text.encode("utf-8"), [], offset=0)])
+                message = transport(ReportingProducer(), consumer).pop("orders")
+                self.assertIsNotNone(message)
+                self.assertNotEqual(message.route_urn, NON_NUMERIC_ATTEMPTS_ROUTE)
+
+    def test_non_numeric_attempts_is_dropped_and_committed_without_a_dlq(self):
+        bad = '{"job":"%s","attempts":"three"}' % URN
+        consumer = OffsetConsumer([OffsetMessage(bad.encode("utf-8"), [], offset=0)])
+        producer = ReportingProducer()
+        app = self._app(producer, consumer)
+        failing = self._failing_handler(app)
+        with self.assertLogs("babelqueue.kafka", level="WARNING"):
+            app.consume(queue="orders", max_messages=1)
+        self.assertEqual(failing, [])
+        self.assertEqual(producer.produced, [])
+        self.assertEqual(consumer.commits, [0])
+
     def test_non_utf8_attempts_header_does_not_raise(self):
         record = FakeMessage(body(2).encode("utf-8"), headers=[("bq-attempts", b"\xff\xfe")])
         message = transport(consumer=FakeConsumer([record])).pop("orders")
@@ -1018,6 +1106,295 @@ class KafkaRedriveKeyTest(unittest.TestCase):
         consumer = FakeConsumer([FakeMessage(EnvelopeCodec.encode(dead).encode(), key=None)])
         result = redrive.redrive(transport(StrictProducer(), consumer), "orders.dlq", timeout=0)
         self.assertEqual(result.redriven, 1)
+
+
+class _BoundedConsumer(OffsetConsumer):
+    """An :class:`OffsetConsumer` that fails the test instead of looping forever: a drain that keeps
+    re-polling the same record trips the bound."""
+
+    def __init__(self, records, bound=40) -> None:
+        super().__init__(records)
+        self.polls = 0
+        self.bound = bound
+
+    def poll(self, timeout=None):
+        self.polls += 1
+        if self.polls > self.bound:
+            raise AssertionError("redrive did not terminate: the drain keeps re-polling")
+        return super().poll(timeout)
+
+
+class KafkaRedriveDrainTest(unittest.TestCase):
+    """``redrive`` drains the DLQ before it processes it, so a Kafka consumer holds several
+    un-acked records at once. Each must be redriven exactly once, and the cumulative commits must
+    never pass an unsettled record."""
+
+    @staticmethod
+    def _dead_record(offset, partition=0, key=None):
+        dead = dead_letter.annotate(EnvelopeCodec.decode(body()), "failed", "orders", 3, error="boom")
+        return OffsetMessage(
+            EnvelopeCodec.encode(dead).encode("utf-8"), [], offset=offset, topic="orders.dlq",
+            partition=partition, key=key,
+        )
+
+    def _setup(self, count, producer=None):
+        consumer = _BoundedConsumer([self._dead_record(i) for i in range(count)])
+        producer = producer if producer is not None else FakeProducer()
+        return transport(producer, consumer), producer, consumer
+
+    def test_max_zero_redrives_every_record_exactly_once_and_terminates(self):
+        from babelqueue import redrive
+
+        kafka, producer, consumer = self._setup(3)
+        result = redrive.redrive(kafka, "orders.dlq", timeout=0)
+        self.assertEqual(result.redriven, 3)
+        self.assertEqual([m["topic"] for m in producer.produced], ["orders"] * 3)
+        self.assertEqual(consumer.commits, [0, 1, 2])
+        self.assertEqual(consumer.committed_offset, 3)
+        self.assertEqual(consumer.seeks, [])
+
+    def test_max_two_redrives_two_then_the_rest_on_the_next_run(self):
+        from babelqueue import redrive
+
+        kafka, producer, consumer = self._setup(3)
+        first = redrive.redrive(kafka, "orders.dlq", max=2, timeout=0)
+        self.assertEqual(first.redriven, 2)
+        self.assertEqual(consumer.commits, [0, 1])
+        second = redrive.redrive(kafka, "orders.dlq", max=2, timeout=0)
+        self.assertEqual(second.redriven, 1)
+        self.assertEqual(consumer.commits, [0, 1, 2])
+        self.assertEqual(len(producer.produced), 3)
+        self.assertEqual(consumer.seeks, [])
+
+    def test_dry_run_restores_are_not_read_again(self):
+        from babelqueue import redrive
+
+        kafka, producer, consumer = self._setup(3)
+        result = redrive.redrive(kafka, "orders.dlq", dry_run=True, timeout=0)
+        self.assertEqual(result.skipped, 3)
+        self.assertEqual(result.redriven, 0)
+        self.assertEqual([m["topic"] for m in producer.produced], ["orders.dlq"] * 3)
+        self.assertEqual(consumer.commits, [0, 1, 2])
+
+    def test_a_failed_redrive_write_restores_the_record_and_loses_nothing(self):
+        from babelqueue import redrive
+
+        class FailsOnce(FakeProducer):
+            failed = False
+
+            def produce(self, topic, value=None, headers=None, timestamp=None, on_delivery=None, **kw):
+                if topic == "orders" and not self.failed:
+                    self.failed = True
+                    raise RuntimeError("broker refused the write")
+                super().produce(topic, value=value, headers=headers, timestamp=timestamp,
+                                on_delivery=on_delivery, **kw)
+
+        kafka, producer, consumer = self._setup(3, FailsOnce())
+        with self.assertRaises(RuntimeError):
+            redrive.redrive(kafka, "orders.dlq", timeout=0)
+        # Record 0 was put back on the DLQ and settled; records 1 and 2 were never settled, so the
+        # commit must stop at record 0.
+        self.assertEqual([m["topic"] for m in producer.produced], ["orders.dlq"])
+        self.assertEqual(consumer.commits, [0])
+        self.assertEqual(consumer.committed_offset, 1)
+
+        # The next run rewinds the two unsettled records and redrives them.
+        result = redrive.redrive(kafka, "orders.dlq", timeout=0)
+        self.assertEqual(result.redriven, 2)
+        self.assertEqual(consumer.seeks, [("orders.dlq", 0, 1)])
+        self.assertEqual(consumer.commits, [0, 1, 2])
+
+    def test_a_failed_restore_keeps_the_record_unsettled(self):
+        from babelqueue import redrive
+
+        class RefusesDlq(FakeProducer):
+            def produce(self, topic, value=None, headers=None, timestamp=None, on_delivery=None, **kw):
+                if topic == "orders.dlq":
+                    raise RuntimeError("broker refused the restore")
+                super().produce(topic, value=value, headers=headers, timestamp=timestamp,
+                                on_delivery=on_delivery, **kw)
+
+        kafka, _producer, consumer = self._setup(2, RefusesDlq())
+        with self.assertRaises(RuntimeError):
+            redrive.redrive(kafka, "orders.dlq", dry_run=True, timeout=0)
+        self.assertEqual(consumer.commits, [])
+        self.assertEqual(consumer.committed_offset, 0)
+
+    def test_the_drain_does_not_rewind_the_records_it_holds(self):
+        kafka, _producer, consumer = self._setup(3)
+        batch = kafka.pop_batch("orders.dlq", 0, 0)
+        self.assertEqual([m.handle.offset() for m in batch], [0, 1, 2])
+        self.assertEqual(consumer.seeks, [])
+
+    def test_unsettled_batch_records_are_rewound_to_the_lowest_by_the_next_pop(self):
+        kafka, _producer, consumer = self._setup(3)
+        kafka.pop_batch("orders.dlq", 0, 0)
+        again = kafka.pop("orders.dlq", 0)  # the batch was abandoned: nothing acked, nothing rewound
+        self.assertEqual(again.handle.offset(), 0)
+        self.assertEqual(consumer.seeks, [("orders.dlq", 0, 0)])
+
+    def test_batch_acks_never_commit_past_an_unsettled_record(self):
+        kafka, _producer, consumer = self._setup(3)
+        first, second, third = kafka.pop_batch("orders.dlq", 0, 0)
+        kafka.ack(second)
+        kafka.ack(third)
+        self.assertEqual(consumer.commits, [])  # record 0 is still unsettled
+        kafka.ack(first)
+        self.assertEqual(consumer.commits, [2])  # one cumulative commit once the prefix is settled
+        self.assertEqual(consumer.committed_offset, 3)
+
+    def test_in_order_batch_acks_commit_each_record(self):
+        kafka, _producer, consumer = self._setup(3)
+        first, second, third = kafka.pop_batch("orders.dlq", 0, 0)
+        kafka.ack(first)
+        kafka.ack(second)
+        self.assertEqual(consumer.commits, [0, 1])
+        kafka.ack(third)
+        self.assertEqual(consumer.commits, [0, 1, 2])
+
+    def test_an_unsettled_record_on_one_partition_does_not_block_another(self):
+        consumer = _BoundedConsumer(
+            [self._dead_record(0, partition=0), self._dead_record(0, partition=1)]
+        )
+        kafka = transport(FakeProducer(), consumer)
+        on_p0, on_p1 = kafka.pop_batch("orders.dlq", 0, 0)
+        kafka.ack(on_p1)
+        self.assertEqual(len(consumer.commits), 1)
+        self.assertEqual(consumer.seeks, [])
+        kafka.ack(on_p0)
+        self.assertEqual(len(consumer.commits), 2)
+
+    @staticmethod
+    def _bad_attempts_record(offset):
+        return OffsetMessage(
+            b'{"job":"urn:x","attempts":"three"}', [], offset=offset, topic="orders.dlq"
+        )
+
+    def test_a_non_numeric_attempts_is_flagged_and_restored_by_a_dry_run(self):
+        from babelqueue import redrive
+
+        records = [self._dead_record(0), self._bad_attempts_record(1), self._dead_record(2)]
+        consumer = _BoundedConsumer(records)
+        producer = FakeProducer()
+        kafka = transport(producer, consumer)
+
+        result = redrive.redrive(kafka, "orders.dlq", dry_run=True, timeout=0)
+        # Every record, the malformed one included, is restored onto the DLQ and settled.
+        self.assertEqual(result.skipped, 3)
+        self.assertEqual([m["topic"] for m in producer.produced], ["orders.dlq"] * 3)
+        self.assertEqual(consumer.commits, [0, 1, 2])
+        self.assertIn(b"three", producer.produced[1]["value"])
+
+    def test_a_non_numeric_attempts_is_delivered_under_the_reserved_route(self):
+        consumer = _BoundedConsumer([self._bad_attempts_record(0)])
+        message = transport(FakeProducer(), consumer).pop("orders.dlq", 0)
+        self.assertEqual(message.route_urn, NON_NUMERIC_ATTEMPTS_ROUTE)
+        self.assertEqual(message.body, '{"job":"urn:x","attempts":"three"}')  # verbatim
+
+    def test_redrive_restores_a_non_numeric_attempts_record_instead_of_replaying_it(self):
+        from babelqueue import redrive
+
+        records = [self._bad_attempts_record(0), self._dead_record(1), self._dead_record(2)]
+        consumer = _BoundedConsumer(records)
+        producer = FakeProducer()
+        kafka = transport(producer, consumer)
+
+        first = redrive.redrive(kafka, "orders.dlq", timeout=0)
+        # The two valid records go to the work topic; the malformed one goes back to the DLQ.
+        self.assertEqual(first.redriven, 2)
+        self.assertEqual(first.skipped, 1)
+        topics = [m["topic"] for m in producer.produced]
+        self.assertEqual(topics.count("orders.dlq"), 1)
+        self.assertEqual(len(topics), 3)
+        restored = [m for m in producer.produced if m["topic"] == "orders.dlq"][0]
+        self.assertIn(b"three", restored["value"])
+        self.assertEqual(consumer.commits, [0, 1, 2])
+        self.assertEqual(consumer.seeks, [])
+
+    def test_redrive_restores_every_unreadable_attempts_record(self):
+        from babelqueue import redrive
+
+        for raw in KafkaDeliveryConfirmationTest.UNREADABLE_ATTEMPTS:
+            with self.subTest(attempts=raw):
+                bad = OffsetMessage(
+                    ('{"job":"urn:x","attempts":%s}' % raw).encode("utf-8"),
+                    [],
+                    offset=0,
+                    topic="orders.dlq",
+                )
+                consumer = _BoundedConsumer([bad, self._dead_record(1), self._dead_record(2)])
+                producer = FakeProducer()
+                kafka = transport(producer, consumer)
+
+                result = redrive.redrive(kafka, "orders.dlq", timeout=0)
+
+                self.assertEqual(result.redriven, 2)
+                self.assertEqual(result.skipped, 1)
+                topics = [m["topic"] for m in producer.produced]
+                self.assertEqual(topics.count("orders.dlq"), 1)  # restored, not replayed
+                restored = [m for m in producer.produced if m["topic"] == "orders.dlq"][0]
+                self.assertEqual(restored["value"], bad.value())
+                self.assertNotIn("bq-attempts", dict(restored["headers"] or []))
+                self.assertEqual(consumer.commits, [0, 1, 2])
+                self.assertEqual(consumer.seeks, [])
+
+    def _failing_on(self, offsets):
+        """A transport whose ``_reconcile`` raises for the records at ``offsets`` (the safety net
+        for any other record ``pop`` cannot build)."""
+        real = KafkaTransport._reconcile
+        seen = {}
+
+        def reconcile(body_, headers):
+            seen["n"] = seen.get("n", -1) + 1
+            if seen["n"] in offsets:
+                raise ValueError("cannot decode")
+            return real(body_, headers)
+
+        return mock.patch.object(KafkaTransport, "_reconcile", staticmethod(reconcile))
+
+    def test_a_record_that_cannot_be_built_mid_batch_does_not_wedge_the_drain(self):
+        from babelqueue import redrive
+
+        consumer = _BoundedConsumer([self._dead_record(i) for i in range(3)])
+        kafka = transport(FakeProducer(), consumer)
+        with self._failing_on({1}):
+            first = redrive.redrive(kafka, "orders.dlq", timeout=0)
+            # The batch ends at the record that cannot be built; the one before it is redriven.
+            self.assertEqual(first.redriven, 1)
+            self.assertEqual(consumer.commits, [0])
+            # The next run makes progress instead of rewinding to record 0 and failing again.
+            second = redrive.redrive(kafka, "orders.dlq", timeout=0)
+        self.assertEqual(second.redriven, 1)
+        self.assertEqual(consumer.seeks, [])
+        self.assertEqual(consumer.commits, [0, 2])
+
+    def test_an_unbuildable_first_record_raises_then_the_drain_moves_on(self):
+        from babelqueue import redrive
+
+        consumer = _BoundedConsumer([self._dead_record(i) for i in range(3)])
+        kafka = transport(FakeProducer(), consumer)
+        with self._failing_on({0}):
+            with self.assertRaises(ValueError):
+                kafka.pop_batch("orders.dlq", 0, 0)
+            # Nothing was tracked as in flight, so the next run does not rewind: it carries on.
+            result = redrive.redrive(kafka, "orders.dlq", timeout=0)
+        self.assertEqual(result.redriven, 2)
+        self.assertEqual(consumer.seeks, [])
+        self.assertEqual(consumer.commits, [1, 2])
+
+    def test_batch_stops_at_max(self):
+        kafka, _producer, _consumer = self._setup(3)
+        self.assertEqual(len(kafka.pop_batch("orders.dlq", 2, 0)), 2)
+
+    def test_rewind_of_a_batch_record_drops_the_later_ones_it_will_redeliver(self):
+        kafka, _producer, consumer = self._setup(3)
+        first, second, _third = kafka.pop_batch("orders.dlq", 0, 0)
+        kafka.rewind(second)
+        self.assertEqual(consumer.seeks, [("orders.dlq", 0, 1)])
+        kafka.ack(first)  # record 0 is the only one still in flight
+        self.assertEqual(consumer.commits, [0])
+        self.assertEqual(kafka.pop("orders.dlq", 0).handle.offset(), 1)
+        self.assertEqual(consumer.seeks, [("orders.dlq", 0, 1)])  # no second rewind
 
 
 class KafkaSchemeTest(unittest.TestCase):

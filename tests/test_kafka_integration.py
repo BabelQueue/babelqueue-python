@@ -11,7 +11,8 @@ Scenarios: (1) a handler error is retried up to ``max_attempts`` and then dead-l
 byte-identical with no ``dead_letter`` block, never reaching a handler; (3) the record key
 (contract §6.5 "Record key on republish") survives the retry republish, the DLQ write, the redrive
 dry-run restore and the redrive itself, byte-for-byte: a null key stays null, an empty key stays
-empty, a non-empty key stays non-null. Every hop is read back from the broker with a raw consumer.
+empty, a non-empty key stays non-null. Every hop is read back from the broker with a raw consumer;
+(4) ``redrive`` with the default ``max`` drains a DLQ of several records, each redriven exactly once.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ import unittest
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-from babelqueue import BabelQueue, EnvelopeCodec
+from babelqueue import BabelQueue, EnvelopeCodec, dead_letter
 from babelqueue.kafka_transport import KafkaTransport
 from babelqueue.redrive import redrive
 
@@ -235,24 +236,55 @@ class KafkaLiveIntegrationTest(unittest.TestCase):
         # Dry run restores the record verbatim onto the DLQ (original + restore); the real
         # redrive then drains the restore (the group's committed offset is past the original) onto
         # a sandbox topic. A pop can return nothing while the consumer group is still joining, so
-        # each run is repeated until it saw a record (an empty run has no side effects). ``max=1``
-        # is deliberate: KafkaTransport.pop re-seeks an un-acked in-flight record, so an unbounded
-        # drain (max=0) would keep re-popping the same record.
+        # each run is repeated until it saw a record (an empty run has no side effects).
         ops = self._transport(f"{self.group}-ops")
         stop = time.monotonic() + DEADLINE_SECONDS
-        dry = redrive(ops, self.dlq, dry_run=True, max=1, timeout=2.0)
+        dry = redrive(ops, self.dlq, dry_run=True, timeout=2.0)
         while not dry.items and time.monotonic() < stop:
-            dry = redrive(ops, self.dlq, dry_run=True, max=1, timeout=2.0)
+            dry = redrive(ops, self.dlq, dry_run=True, timeout=2.0)
         self.assertEqual(len(dry.items), 1)
         restored = _read_records(self.dlq, 2)
         self._assert_same_key("dry-run restore", key, restored[1][1])
 
-        moved = redrive(ops, self.dlq, to_queue=sandbox, max=1, timeout=2.0)
+        moved = redrive(ops, self.dlq, to_queue=sandbox, timeout=2.0)
         while not moved.items and time.monotonic() < stop:
-            moved = redrive(ops, self.dlq, to_queue=sandbox, max=1, timeout=2.0)
+            moved = redrive(ops, self.dlq, to_queue=sandbox, timeout=2.0)
         self.assertEqual(moved.redriven, 1)
         redriven = _read_records(sandbox, 1)
         self._assert_same_key("redrive", key, redriven[0][1])
+
+    def test_redrive_drains_several_dead_lettered_records_exactly_once(self) -> None:
+        """The default ``max`` (0) drains the whole DLQ in one run: every record is redriven once
+        and the run ends. A drain-first redrive holds several un-acked records at once, so the
+        transport must not hand the first one out again on every pop."""
+        from confluent_kafka import Producer
+
+        sandbox = f"{self.queue}.sandbox"
+        _create_topics(sandbox)
+        total = 3
+        producer = Producer({"bootstrap.servers": BROKERS})
+        for order_id in range(total):
+            envelope = EnvelopeCodec.decode(
+                EnvelopeCodec.encode(EnvelopeCodec.make(URN, {"order_id": order_id}, queue=self.queue))
+            )
+            dead = dead_letter.annotate(envelope, "failed", self.queue, 3, error="boom")
+            producer.produce(
+                self.dlq,
+                value=EnvelopeCodec.encode(dead).encode("utf-8"),
+                headers=[("bq-job", URN.encode())],
+            )
+        producer.flush(30)
+
+        # A pop can return nothing while the consumer group is still joining, and a run may
+        # then see only part of the DLQ; keep running until all records moved. A record redriven
+        # twice would push the total past ``total``.
+        ops = self._transport(f"{self.group}-ops")
+        redriven = 0
+        stop = time.monotonic() + DEADLINE_SECONDS
+        while redriven < total and time.monotonic() < stop:
+            redriven += redrive(ops, self.dlq, to_queue=sandbox, timeout=2.0).redriven
+        self.assertEqual(redriven, total)
+        self.assertEqual(len(_read_records(sandbox, total)), total)
 
     def _assert_same_key(self, hop: str, expected: Optional[bytes], actual: Optional[bytes]) -> None:
         # None (null key) and b"" (empty key) are different values, so == also tells them apart.

@@ -36,7 +36,14 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from .codec import EnvelopeCodec
 from .replay import HEADER_REPLAY_BYPASS
-from .transport import HeaderPublisher, ReceivedMessage, Transport, publish_keeping_route
+from .transport import (
+    NON_NUMERIC_ATTEMPTS_ROUTE,
+    BatchPopper,
+    HeaderPublisher,
+    ReceivedMessage,
+    Transport,
+    publish_keeping_route,
+)
 
 Envelope = Mapping[str, Any]
 Select = Callable[[Envelope], bool]
@@ -78,16 +85,27 @@ def redrive(
 ) -> RedriveResult:
     """Move dead-lettered messages off ``dlq`` and replay them; see the module docstring."""
     # Drain up to ``max`` messages (or all available) before processing any of them.
-    batch: List[Tuple[ReceivedMessage, Optional[Dict[str, Any]]]] = []
-    while max == 0 or len(batch) < max:
-        message = transport.pop(dlq, timeout)
-        if message is None:
-            break
-        batch.append((message, _decoded(message.body)))
+    # A transport whose ``pop`` takes back an un-settled delivery (Kafka) hands the whole batch out
+    # in one call instead, so the earlier messages are not popped a second time while the drain runs.
+    if isinstance(transport, BatchPopper):
+        popped = transport.pop_batch(dlq, max, timeout)
+    else:
+        popped = []
+        while max == 0 or len(popped) < max:
+            message = transport.pop(dlq, timeout)
+            if message is None:
+                break
+            popped.append(message)
+    batch: List[Tuple[ReceivedMessage, Optional[Dict[str, Any]]]] = [
+        (message, _decoded(message.body)) for message in popped
+    ]
 
     result = RedriveResult()
     for message, envelope in batch:
-        if envelope is None:
+        # A record the transport flagged as non-numeric-``attempts`` is not redrivable either: a
+        # replay would reset it to a valid counter and quietly repair a foreign producer's bad
+        # envelope, so it is restored to the DLQ like any other poison body.
+        if envelope is None or message.route_urn == NON_NUMERIC_ATTEMPTS_ROUTE:
             publish_keeping_route(transport, dlq, message.body, message.route_urn, message.key)  # restore the poison body; never drop it
             transport.ack(message)
             result.skipped += 1

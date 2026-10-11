@@ -9,7 +9,26 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+- `BatchPopper` (optional transport capability, exported from `babelqueue`) with
+  `pop_batch(queue, max=0, timeout=1.0)`: take several deliveries at once and hold them un-settled.
+  `KafkaTransport` implements it; `redrive` uses it when a transport offers it.
+
 ### Fixed
+- **`redrive` no longer loops forever (default `max=0`) or repeats records (`max>1`) on Kafka.**
+  `redrive` drains the DLQ before it processes it, but `KafkaTransport.pop` first seeks back to the
+  previous un-acked record, so every pop returned the first record again. The drain now takes the
+  batch through `pop_batch` (one rewind up front, none between the polls), and `KafkaTransport`
+  tracks several in-flight records: acks are committed in offset order, so the cumulative commit
+  never passes a record that is still unsettled, and an abandoned batch is rewound to its lowest
+  offset by the next `pop`. The restore writes are not re-read in the same call. Other transports
+  and the single-record `pop`/`ack`/`rewind` behaviour are unchanged. No wire change.
+  A record whose envelope carries an `attempts` the runtime cannot read as an integer (a foreign
+  producer: `null`, `""`, a list/object, a bool, `"three"`, `NaN`/`Infinity`; an absent key is just 0) no longer raises out
+  of `pop` or the restore publish. `KafkaTransport.pop` hands it over under a reserved poison route
+  (like a non-UTF-8 record), so the runtime dead-letters it raw without running a handler (a failing
+  handler can no longer wedge the partition) and `redrive` restores it to the DLQ instead of
+  replaying it. The redundant `bq-attempts` header is left out of such a write.
 - **`redrive` now carries the DLQ record key onto the redriven record.** The restore writes back to
   the DLQ already kept the key; the redrive write to the work topic did not, so a replayed Kafka
   record lost its key (and per-key partition affinity). It now goes through

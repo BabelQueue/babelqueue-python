@@ -9,7 +9,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, Optional, Protocol, runtime_checkable
+from typing import Any, Deque, Dict, List, Optional, Protocol, runtime_checkable
 
 from .exceptions import BabelQueueError
 
@@ -169,6 +169,30 @@ class Rewinder(Protocol):
 
     def rewind(self, message: ReceivedMessage) -> None:
         """Position the consumer so ``message`` is delivered again by the next ``pop``."""
+        ...
+
+
+#: Reserved ``route_urn`` of a record whose envelope carries a non-numeric ``attempts`` (a foreign
+#: producer). It sits under the version-gated prefix, so the runtime dead-letters it directly, raw
+#: and never retried (retrying needs a numeric attempt counter); ``redrive`` restores it to the DLQ
+#: instead of replaying it to a work topic. Delivered by :class:`~babelqueue.kafka_transport.KafkaTransport`.
+NON_NUMERIC_ATTEMPTS_ROUTE = "babelqueue:unsupported-schema-version:non-numeric-attempts"
+
+
+@runtime_checkable
+class BatchPopper(Protocol):
+    """Optional :class:`Transport` capability: take several deliveries at once and hold them.
+
+    Needed by brokers whose :meth:`Transport.pop` treats a delivery that was neither acked nor
+    rewound as abandoned and takes it back on the next call (Kafka: the position is cumulative, so
+    an unsettled record must come back rather than be skipped). A drain-first consumer such as
+    :func:`babelqueue.redrive.redrive` pops every message before it settles any of them, and must
+    not have the earlier ones taken back by each following pop. :meth:`pop_batch` hands out the
+    whole batch in one call; the messages may then be settled in any order, and an implementation
+    must not let a commit pass one that is still unsettled."""
+
+    def pop_batch(self, queue: str, max: int = 0, timeout: float = 1.0) -> List[ReceivedMessage]:
+        """Up to ``max`` messages (all currently available when ``max`` is 0), held un-settled."""
         ...
 
 

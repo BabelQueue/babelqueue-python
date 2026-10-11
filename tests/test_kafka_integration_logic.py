@@ -37,7 +37,7 @@ class KafkaIntegrationLogicTest(unittest.TestCase):
             timeout=120,
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("5 passed", proc.stdout, proc.stdout)
+        self.assertIn("6 passed", proc.stdout, proc.stdout)
 
 
 if __name__ == "__main__":
