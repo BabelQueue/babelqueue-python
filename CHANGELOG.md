@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.17.0] - 2026-10-11
+
 ### Added
 - `SettlePublisher` (optional transport capability, exported from `babelqueue`) with
   `publish_settle(queue, body, route_urn="")`: the runtime's settle writes (retry republish,
