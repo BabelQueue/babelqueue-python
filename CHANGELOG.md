@@ -10,6 +10,7 @@ The envelope wire format is versioned separately by `meta.schema_version`
 ## [Unreleased]
 
 ### Changed
+- Tests only: the vendored conformance suite is now 1.3.0 (exact-case envelope keys, last-wins duplicates: new `invalid-wrong-case-job`, `wrong-case-keys-roundtrip` and `duplicate-keys-last-wins` fixtures). No production change; the Python core already behaved this way.
 - **Kafka: a poison record is dead-lettered wrapped (`dead_letter.reason: "poison"`), like the Go
   reference (§6.5, ADR-0009).** A value that is not valid UTF-8, not valid JSON, not a JSON object, or has
   a member of the wrong type (the exact set is listed in the next entry) used to reach `<topic>.dlq` as its raw

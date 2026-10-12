@@ -66,6 +66,25 @@
       "file": "fixtures/invalid-missing-urn.json",
       "valid": false,
       "reason": "no 'job' or 'urn' — the message has no identity"
+    },
+    {
+      "name": "invalid-wrong-case-job",
+      "file": "fixtures/invalid-wrong-case-job.json",
+      "valid": false,
+      "reason": "envelope keys are case-sensitive: 'JOB' is an unknown key, so there is no 'job' or 'urn' and the message has no identity"
+    },
+    {
+      "name": "duplicate-keys-last-wins",
+      "file": "fixtures/duplicate-keys-last-wins.json",
+      "valid": true,
+      "description": "A repeated envelope key follows last-wins and is never merged: the second 'job' and the second 'data' object replace the first (RFC 8259 leaves duplicates undefined; every SDK resolves them the same way).",
+      "expect": {
+        "urn": "urn:babel:orders:created",
+        "data": { "order_id": 1042 },
+        "attempts": 0,
+        "lang": "php",
+        "schema_version": 1
+      }
     }
   ],
   "idempotency": {
@@ -503,6 +522,20 @@
         "expect_attempts": 1,
         "expect_preserved": {
           "/data": {}
+        }
+      },
+      {
+        "name": "wrong-case-keys-roundtrip",
+        "file": "fixtures/wrong-case-keys-roundtrip.json",
+        "description": "Envelope keys are matched case-sensitively, so a wrongly cased key ('JOB', 'Data', 'meta.Queue') is an unknown key: it never overrides the canonical field and survives decode -> attempts+1 -> encode with the same value.",
+        "expect_attempts": 1,
+        "expect_preserved": {
+          "/job": "urn:babel:orders:created",
+          "/data": { "order_id": 1042 },
+          "/meta/queue": "orders",
+          "/JOB": "urn:babel:orders:shadow",
+          "/Data": { "order_id": 7 },
+          "/meta/Queue": "shadow"
         }
       }
     ]
