@@ -40,6 +40,7 @@ from .transport import (
     NON_NUMERIC_ATTEMPTS_ROUTE,
     BatchPopper,
     HeaderPublisher,
+    PoisonRoute,
     ReceivedMessage,
     Transport,
     publish_keeping_route,
@@ -97,12 +98,15 @@ def redrive(
                 break
             popped.append(message)
     batch: List[Tuple[ReceivedMessage, Optional[Dict[str, Any]]]] = [
-        (message, _decoded(message.body)) for message in popped
+        (message, None if isinstance(message.route_urn, PoisonRoute) else _decoded(message.body))
+        for message in popped
     ]
 
     result = RedriveResult()
     for message, envelope in batch:
-        # A record the transport flagged as non-numeric-``attempts`` is not redrivable either: a
+        # A record the transport flagged as poison (``PoisonRoute``: it never decoded into an envelope,
+        # whatever its ``job`` looks like) is restored to the DLQ as-is rather than replayed or re-wrapped,
+        # like the Go reference. A record the transport flagged as non-numeric-``attempts`` is not redrivable either: a
         # replay would reset it to a valid counter and quietly repair a foreign producer's bad
         # envelope, so it is restored to the DLQ like any other poison body.
         if envelope is None or message.route_urn == NON_NUMERIC_ATTEMPTS_ROUTE:

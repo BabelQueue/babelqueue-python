@@ -14,7 +14,13 @@ from unittest import mock
 from urllib.parse import quote
 
 from babelqueue import BabelQueue, EnvelopeCodec, dead_letter
-from babelqueue.kafka_transport import NON_UTF8_ROUTE, KafkaDeliveryError, KafkaTransport
+from babelqueue.kafka_transport import (
+    NON_UTF8_ROUTE,
+    POISON_ROUTE,
+    KafkaDeliveryError,
+    KafkaTransport,
+    PoisonRoute,
+)
 from babelqueue.transport import NON_NUMERIC_ATTEMPTS_ROUTE
 from babelqueue.transport import ReceivedMessage, make_transport
 
@@ -36,6 +42,18 @@ def header_map(headers):
 def _with_forbidden_key(raw: str) -> str:
     """``raw`` plus a forbidden top-level key (message-envelope.md §10), as a legacy producer sends."""
     return raw[:-1] + ',"timestamp":1}'
+
+
+def poison_dlq(case: unittest.TestCase, value: bytes, original_queue: str = "orders", attempts: int = 0) -> dict:
+    """Decode a poison DLQ record's body and assert its ``dead_letter`` block (§6.5, ADR-0009)."""
+    parsed = json.loads(value.decode("utf-8"))
+    block = parsed["dead_letter"]
+    case.assertEqual(block["reason"], "poison")
+    case.assertEqual(block["original_queue"], original_queue)
+    case.assertEqual(block["attempts"], attempts)
+    case.assertEqual(block["exception"], "BabelQueueError")
+    case.assertTrue(block["error"].startswith("Undecodable BabelQueue body: "))
+    return parsed
 
 
 def _assert_no_codec_warnings(case: unittest.TestCase, fn) -> None:
@@ -561,14 +579,15 @@ class KafkaRestartRedeliveryTest(unittest.TestCase):
         def _on(data, meta):
             seen.append(data)
 
-        with self.assertRaises(RuntimeError):
+        # The poison dead-letter write is refused: nothing is committed, the record comes back.
+        with self.assertLogs("babelqueue.app", level="ERROR"):
             app.consume(queue="orders", max_messages=1)
         self.assertEqual(consumer.commits, [])
 
         app.consume(queue="orders", max_messages=2)  # the DLQ is back
         self.assertEqual([m["topic"] for m in producer.produced], ["orders.dlq"])
-        dead = EnvelopeCodec.decode(producer.produced[0]["value"].decode("utf-8"))
-        self.assertIn("dead_letter", dead)
+        dead = poison_dlq(self, producer.produced[0]["value"])
+        self.assertEqual(dead["raw"], "not json at all")
         self.assertEqual(consumer.commits, [0, 1])
         self.assertEqual(len(seen), 1)
 
@@ -794,7 +813,7 @@ class KafkaDeliveryConfirmationTest(unittest.TestCase):
         self.assertEqual(consumer.commits, [])
         self.assertEqual(consumer.seeks, [("orders", 0, 0)])
 
-    def test_non_utf8_record_is_dead_lettered_raw_and_committed(self):
+    def test_non_utf8_record_is_dead_lettered_wrapped_and_committed(self):
         consumer = OffsetConsumer(
             [
                 OffsetMessage(self.BAD, [], offset=0),
@@ -813,15 +832,16 @@ class KafkaDeliveryConfirmationTest(unittest.TestCase):
             app.consume(queue="orders", max_messages=2)
 
         self.assertEqual(producer.produced[0]["topic"], "orders.dlq")
-        self.assertEqual(producer.produced[0]["value"], self.BAD)  # original bytes, untouched
+        dead = poison_dlq(self, producer.produced[0]["value"])
+        self.assertEqual(dead["raw"], "\ufffd\ufffd not utf-8 \ufffd")  # lossy, as the Go reference
         self.assertEqual(producer.confirmed[0], "orders.dlq")
         self.assertEqual(consumer.commits, [0, 1])
         self.assertEqual(len(seen), 1)  # the poison record never reached a handler
 
-    def test_non_utf8_record_with_valid_json_is_dead_lettered_raw_without_projected_headers(self):
-        # Valid JSON, but written Latin-1: the trace_id carries a byte that is not UTF-8. The header
-        # projection cannot encode it, which used to fail the DLQ write on every redelivery and
-        # lock the partition.
+    def test_non_utf8_record_with_valid_json_is_dead_lettered_wrapped_keeping_its_keys(self):
+        # Valid JSON, but written Latin-1: the trace_id carries a byte that is not UTF-8. The wrapped
+        # body (and the headers projected from it) must still be encodable, or the DLQ write would
+        # fail on every redelivery and lock the partition.
         envelope = EnvelopeCodec.decode(body())
         envelope["trace_id"] = "tr\u00e9-1"
         latin1 = json.dumps(envelope, ensure_ascii=False).encode("latin-1")
@@ -843,8 +863,10 @@ class KafkaDeliveryConfirmationTest(unittest.TestCase):
             app.consume(queue="orders", max_messages=2)
 
         self.assertEqual(producer.produced[0]["topic"], "orders.dlq")
-        self.assertEqual(producer.produced[0]["value"], latin1)
-        self.assertEqual(producer.produced[0]["headers"], [])
+        dead = poison_dlq(self, producer.produced[0]["value"])
+        self.assertEqual(dead["job"], URN)  # an object keeps its keys
+        self.assertEqual(dead["trace_id"], "tr\ufffd-1")
+        self.assertNotIn("raw", dead)
         self.assertEqual(consumer.commits, [0, 1])
 
     def test_non_utf8_dead_letter_delivery_error_does_not_commit(self):
@@ -859,7 +881,12 @@ class KafkaDeliveryConfirmationTest(unittest.TestCase):
 
         app.consume(queue="orders", max_messages=1)  # redelivered, the DLQ accepts it now
         self.assertEqual(consumer.commits, [0])
-        self.assertEqual([m["value"] for m in producer.produced], [self.BAD, self.BAD])
+        values = [m["value"] for m in producer.produced]
+        self.assertEqual(len(values), 2)
+        first, second = (poison_dlq(self, v) for v in values)
+        for parsed in (first, second):
+            parsed["dead_letter"].pop("failed_at")  # a timestamp, set at each write
+        self.assertEqual(first, second)  # the redelivered record is wrapped identically
 
     def test_non_utf8_record_is_dropped_and_committed_without_a_dlq(self):
         consumer = OffsetConsumer([OffsetMessage(self.BAD, [], offset=0)])
@@ -871,7 +898,7 @@ class KafkaDeliveryConfirmationTest(unittest.TestCase):
         self.assertEqual(producer.produced, [])
         self.assertEqual(consumer.commits, [0])
 
-    def test_non_numeric_attempts_is_dead_lettered_raw_without_running_the_handler(self):
+    def test_non_numeric_attempts_is_dead_lettered_wrapped_without_running_the_handler(self):
         bad = '{"job":"%s","attempts":"three","data":{"order_id":1}}' % URN
         consumer = OffsetConsumer(
             [
@@ -894,21 +921,24 @@ class KafkaDeliveryConfirmationTest(unittest.TestCase):
 
         self.assertEqual(failing, [])  # the handler never saw the malformed record
         self.assertEqual(producer.produced[0]["topic"], "orders.dlq")
-        self.assertEqual(producer.produced[0]["value"], bad.encode("utf-8"))  # raw, untouched
+        dead = poison_dlq(self, producer.produced[0]["value"])
+        self.assertEqual(dead["job"], URN)  # the object keeps its keys, attempts included
+        self.assertEqual(dead["attempts"], "three")
         self.assertEqual(producer.confirmed[0], "orders.dlq")
         self.assertEqual(consumer.commits, [0, 1])  # dead-lettered, committed, then moved on
         self.assertEqual(consumer.seeks, [])
         self.assertEqual(len(ok), 1)
 
-    # Every ``attempts`` value the runtime's ``int(envelope.get("attempts", 0))`` cannot read
-    # (null / "" / [] / {} are falsy, which a naive ``or 0`` once let through), plus a bool.
+    # Every top-level ``attempts`` the Go reference's typed decode rejects (an int64 member): any
+    # string (numeric or not), a bool, an array / object, a fraction or exponent, a non-JSON constant.
     UNREADABLE_ATTEMPTS = (
-        "null", '""', "[]", "{}", "true", "false", '"three"', '"3.5"', "NaN", "Infinity", "1e999",
+        '""', "[]", "{}", "true", "false", '"three"', '"3.5"', '"3"', '" 2 "', "3.0", "1.5", "NaN",
+        "Infinity", "1e999", "1e2",
     )
-    # Values the runtime reads fine: they must keep the normal route.
-    READABLE_ATTEMPTS = ('"3"', "3", "3.0", "0", '" 2 "')
+    # Values the typed decode accepts: they must keep the normal route (``null`` decodes as 0).
+    READABLE_ATTEMPTS = ("null", "3", "0", "-0")
 
-    def test_every_unreadable_attempts_is_dead_lettered_raw_without_running_the_handler(self):
+    def test_every_unreadable_attempts_is_dead_lettered_wrapped_without_running_the_handler(self):
         for raw in self.UNREADABLE_ATTEMPTS:
             with self.subTest(attempts=raw):
                 bad = ('{"job":"%s","attempts":%s,"data":{"order_id":1}}' % (URN, raw)).encode("utf-8")
@@ -931,7 +961,9 @@ class KafkaDeliveryConfirmationTest(unittest.TestCase):
 
                 self.assertEqual(failing, [])  # the handler never saw the record
                 self.assertEqual(producer.produced[0]["topic"], "orders.dlq")
-                self.assertEqual(producer.produced[0]["value"], bad)  # raw, untouched
+                dead = poison_dlq(self, producer.produced[0]["value"])
+                # an object keeps its keys; NaN / Infinity are not JSON, so those travel under ``raw``
+                self.assertTrue(dead.get("job") == URN or dead.get("raw") == bad.decode("utf-8"))
                 self.assertEqual(consumer.commits, [0, 1])
                 self.assertEqual(consumer.seeks, [])
                 self.assertEqual(len(ok), 1)
@@ -945,6 +977,22 @@ class KafkaDeliveryConfirmationTest(unittest.TestCase):
                 message = transport(ReportingProducer(), consumer).pop("orders")
                 self.assertIsNotNone(message)
                 self.assertNotEqual(message.route_urn, NON_NUMERIC_ATTEMPTS_ROUTE)
+                self.assertNotIsInstance(message.route_urn, PoisonRoute)
+
+    def test_a_null_attempts_is_not_poison_and_is_normalised_to_zero_for_the_runtime(self):
+        # Go decodes ``"attempts": null`` as 0; the runtime's retry path reads ``int(...)``, so the
+        # transport rewrites the null to the counter it stands for rather than hand it a None.
+        text = '{"job":"%s","attempts":null,"data":{"order_id":1}}' % URN
+        consumer = OffsetConsumer([OffsetMessage(text.encode("utf-8"), [], offset=0)])
+        message = transport(ReportingProducer(), consumer).pop("orders")
+        self.assertNotIsInstance(message.route_urn, PoisonRoute)
+        self.assertEqual(json.loads(message.body)["attempts"], 0)
+
+        consumer = OffsetConsumer(
+            [OffsetMessage(text.encode("utf-8"), [("bq-attempts", b"2")], offset=0)]
+        )
+        message = transport(ReportingProducer(), consumer).pop("orders")
+        self.assertEqual(json.loads(message.body)["attempts"], 2)
 
     def test_non_numeric_attempts_is_dropped_and_committed_without_a_dlq(self):
         bad = '{"job":"%s","attempts":"three"}' % URN
@@ -1028,14 +1076,14 @@ class KafkaKeyPreservationTest(unittest.TestCase):
                 self.assertEqual(record["topic"], "orders.dlq")
                 self.assertEqual(record["key"], key)
 
-    def test_non_utf8_raw_dead_letter_keeps_the_key(self):
+    def test_poison_dead_letter_keeps_the_key(self):
         bad = b"\xff\xfe not utf-8 \x80"
         for key in self.KEYS:
             with self.subTest(key=key):
                 with self.assertLogs("babelqueue.kafka", level="WARNING"):
                     record = self._run(bad, key, dead_letter=True)
                 self.assertEqual(record["topic"], "orders.dlq")
-                self.assertEqual(record["value"], bad)
+                poison_dlq(self, record["value"])
                 self.assertEqual(record["key"], key)
 
     def test_a_null_key_is_not_passed_to_produce(self):
@@ -1285,10 +1333,12 @@ class KafkaRedriveDrainTest(unittest.TestCase):
         self.assertEqual(consumer.commits, [0, 1, 2])
         self.assertIn(b"three", producer.produced[1]["value"])
 
-    def test_a_non_numeric_attempts_is_delivered_under_the_reserved_route(self):
+    def test_a_non_numeric_attempts_is_delivered_under_the_poison_route(self):
         consumer = _BoundedConsumer([self._bad_attempts_record(0)])
         message = transport(FakeProducer(), consumer).pop("orders.dlq", 0)
-        self.assertEqual(message.route_urn, NON_NUMERIC_ATTEMPTS_ROUTE)
+        # The Kafka transport no longer produces the shared non-numeric route: the record is poison.
+        self.assertEqual(message.route_urn, POISON_ROUTE)
+        self.assertIsInstance(message.route_urn, PoisonRoute)
         self.assertEqual(message.body, '{"job":"urn:x","attempts":"three"}')  # verbatim
 
     def test_redrive_restores_a_non_numeric_attempts_record_instead_of_replaying_it(self):
@@ -1308,6 +1358,30 @@ class KafkaRedriveDrainTest(unittest.TestCase):
         self.assertEqual(len(topics), 3)
         restored = [m for m in producer.produced if m["topic"] == "orders.dlq"][0]
         self.assertIn(b"three", restored["value"])
+        self.assertEqual(consumer.commits, [0, 1, 2])
+        self.assertEqual(consumer.seeks, [])
+
+    def test_redrive_restores_a_poison_routed_record_whose_job_still_reads_as_an_urn(self):
+        from babelqueue import redrive
+
+        # ``meta.id`` is a number: the typed decode rejects it, so the transport flags the record as
+        # poison. It still carries a ``job``, so a lenient re-decode would replay it; it must be
+        # restored to the DLQ byte for byte instead, like the Go reference.
+        poison = OffsetMessage(
+            b'{"job":"urn:x","meta":{"id":5},"data":{"order_id":1}}', [], offset=0, topic="orders.dlq"
+        )
+        consumer = _BoundedConsumer([poison, self._dead_record(1), self._dead_record(2)])
+        producer = FakeProducer()
+        kafka = transport(producer, consumer)
+
+        result = redrive.redrive(kafka, "orders.dlq", timeout=0)
+
+        self.assertEqual(result.redriven, 2)
+        self.assertEqual(result.skipped, 1)
+        topics = [m["topic"] for m in producer.produced]
+        self.assertEqual(topics.count("orders.dlq"), 1)  # restored, neither replayed nor re-wrapped
+        restored = [m for m in producer.produced if m["topic"] == "orders.dlq"][0]
+        self.assertEqual(restored["value"], poison.value())
         self.assertEqual(consumer.commits, [0, 1, 2])
         self.assertEqual(consumer.seeks, [])
 
@@ -1334,7 +1408,10 @@ class KafkaRedriveDrainTest(unittest.TestCase):
                 self.assertEqual(topics.count("orders.dlq"), 1)  # restored, not replayed
                 restored = [m for m in producer.produced if m["topic"] == "orders.dlq"][0]
                 self.assertEqual(restored["value"], bad.value())
-                self.assertNotIn("bq-attempts", dict(restored["headers"] or []))
+                # the headers are the plain projection of the untouched body: nothing was repaired
+                self.assertEqual(
+                    list(restored["headers"] or []), list(KafkaTransport._projection(bad.value().decode("utf-8")))
+                )
                 self.assertEqual(consumer.commits, [0, 1, 2])
                 self.assertEqual(consumer.seeks, [])
 
@@ -1352,35 +1429,31 @@ class KafkaRedriveDrainTest(unittest.TestCase):
 
         return mock.patch.object(KafkaTransport, "_reconcile", staticmethod(reconcile))
 
-    def test_a_record_that_cannot_be_built_mid_batch_does_not_wedge_the_drain(self):
+    def test_a_record_that_cannot_be_decoded_mid_batch_is_poison_and_does_not_wedge_the_drain(self):
         from babelqueue import redrive
 
         consumer = _BoundedConsumer([self._dead_record(i) for i in range(3)])
         kafka = transport(FakeProducer(), consumer)
-        with self._failing_on({1}):
-            first = redrive.redrive(kafka, "orders.dlq", timeout=0)
-            # The batch ends at the record that cannot be built; the one before it is redriven.
-            self.assertEqual(first.redriven, 1)
-            self.assertEqual(consumer.commits, [0])
-            # The next run makes progress instead of rewinding to record 0 and failing again.
-            second = redrive.redrive(kafka, "orders.dlq", timeout=0)
-        self.assertEqual(second.redriven, 1)
+        with self._failing_on({1}), self.assertLogs("babelqueue.kafka", level="WARNING"):
+            result = redrive.redrive(kafka, "orders.dlq", timeout=0)
+        # The undecodable record is delivered under the poison route (restored raw, counted skipped),
+        # not raised out of the batch: every record is settled and nothing is rewound.
+        self.assertEqual(result.redriven, 2)
+        self.assertEqual(result.skipped, 1)
         self.assertEqual(consumer.seeks, [])
-        self.assertEqual(consumer.commits, [0, 2])
+        self.assertEqual(consumer.commits, [0, 1, 2])
 
-    def test_an_unbuildable_first_record_raises_then_the_drain_moves_on(self):
+    def test_an_undecodable_first_record_is_poison_not_an_escape(self):
         from babelqueue import redrive
 
         consumer = _BoundedConsumer([self._dead_record(i) for i in range(3)])
         kafka = transport(FakeProducer(), consumer)
-        with self._failing_on({0}):
-            with self.assertRaises(ValueError):
-                kafka.pop_batch("orders.dlq", 0, 0)
-            # Nothing was tracked as in flight, so the next run does not rewind: it carries on.
+        with self._failing_on({0}), self.assertLogs("babelqueue.kafka", level="WARNING"):
             result = redrive.redrive(kafka, "orders.dlq", timeout=0)
         self.assertEqual(result.redriven, 2)
+        self.assertEqual(result.skipped, 1)
         self.assertEqual(consumer.seeks, [])
-        self.assertEqual(consumer.commits, [1, 2])
+        self.assertEqual(consumer.commits, [0, 1, 2])
 
     def test_batch_stops_at_max(self):
         kafka, _producer, _consumer = self._setup(3)
@@ -1397,6 +1470,275 @@ class KafkaRedriveDrainTest(unittest.TestCase):
         self.assertEqual(consumer.seeks, [("orders.dlq", 0, 1)])  # no second rewind
 
 
+class KafkaPoisonWrapTest(unittest.TestCase):
+    """§6.5 / ADR-0009: an undecodable body is dead-lettered to ``<topic>.dlq`` wrapped like the Go
+    reference (``dead_letter.reason == "poison"``), with the record key preserved."""
+
+    KEYS = (b"order-1042", b"", None)
+
+    def _poison(self, value, key=None, headers=(), dead_letter=True, **app_kw):
+        consumer = OffsetConsumer([OffsetMessage(value, list(headers), offset=0, key=key)])
+        producer = ReportingProducer()
+        app = BabelQueue(
+            transport=transport(producer, consumer), dead_letter=dead_letter, **app_kw
+        )
+        app._rewind_pause = 0.0  # noqa: SLF001
+        seen: list = []
+
+        @app.handler(URN)
+        def _on(data, meta):
+            seen.append(data)
+
+        with self.assertLogs("babelqueue.kafka", level="WARNING"):
+            app.consume(queue="orders", max_messages=1)
+        self.assertEqual(seen, [])  # a poison record never reaches a handler
+        self.assertEqual(consumer.commits, [0])
+        return producer.produced
+
+    def test_invalid_json_is_wrapped_under_raw_with_the_key_preserved(self):
+        for key in self.KEYS:
+            with self.subTest(key=key):
+                produced = self._poison(b"not json at all", key=key)
+                self.assertEqual([m["topic"] for m in produced], ["orders.dlq"])
+                self.assertEqual(produced[0]["key"], key)
+                dead = poison_dlq(self, produced[0]["value"])
+                self.assertEqual(dead["raw"], "not json at all")
+                self.assertEqual(set(dead), {"raw", "dead_letter"})
+
+    def test_the_wrapped_body_is_compact_json(self):
+        produced = self._poison(b"nope")
+        text = produced[0]["value"].decode("utf-8")
+        self.assertEqual(text, json.dumps(json.loads(text), ensure_ascii=False, separators=(",", ":")))
+
+    def test_a_json_object_keeps_its_keys_and_replaces_an_existing_dead_letter_block(self):
+        value = (
+            '{"job":"%s","attempts":"three","data":{"order_id":1},'
+            '"dead_letter":{"reason":"failed","original_queue":"elsewhere"}}' % URN
+        ).encode("utf-8")
+        produced = self._poison(value, key=b"k")
+        dead = poison_dlq(self, produced[0]["value"])
+        self.assertEqual(dead["job"], URN)
+        self.assertEqual(dead["data"], {"order_id": 1})
+        self.assertNotIn("raw", dead)
+        self.assertEqual(produced[0]["key"], b"k")
+
+    def test_non_object_roots_and_trailing_tokens_are_wrapped_under_raw(self):
+        for text in ("[1,2]", '"x"', "42", '{"job":"%s"} trailing' % URN, "", "   "):
+            with self.subTest(body=text):
+                produced = self._poison(text.encode("utf-8"))
+                dead = poison_dlq(self, produced[0]["value"])
+                self.assertEqual(dead["raw"], text)
+
+    def test_wrong_member_types_are_poison(self):
+        for text in (
+            '{"job":7}',
+            '{"job":"%s","data":[1]}' % URN,
+            '{"job":"%s","meta":"x"}' % URN,
+            '{"job":"%s","meta":{"created_at":"soon"},"attempts":"x"}' % URN,
+        ):
+            with self.subTest(body=text):
+                dead = poison_dlq(self, self._poison(text.encode("utf-8"))[0]["value"])
+                self.assertIn("job", dead)
+
+    def test_lone_surrogate_escapes_are_dead_lettered_never_left_to_wedge_the_partition(self):
+        # A ``\\ud800`` escape is valid JSON (Go accepts it and substitutes U+FFFD). Whatever the decode
+        # does with it, the record must end as a DLQ write, and that body must be writable as UTF-8.
+        for text in (
+            '{"\\ud800":1}',
+            '{"job":"\\ud800"}',
+            '{"data":{"\\udc00":"\\ud800"},"job":7}',
+            '{"\\ud800":[1,2],"attempts":"x"}',
+        ):
+            with self.subTest(body=text):
+                consumer = OffsetConsumer([OffsetMessage(text.encode("utf-8"), [], offset=0)])
+                producer = ReportingProducer()
+                app = BabelQueue(
+                    transport=transport(producer, consumer),
+                    dead_letter=True,
+                    on_unknown_urn="dead_letter",
+                )
+                app._rewind_pause = 0.0  # noqa: SLF001
+                app.consume(queue="orders", max_messages=1)
+                self.assertEqual(len(producer.produced), 1)
+                json.loads(producer.produced[0]["value"].decode("utf-8"))
+                self.assertEqual(consumer.committed_offset, 1)
+
+    def test_poison_is_dead_lettered_whatever_the_unknown_urn_strategy(self):
+        # Poison never decoded into an envelope, so ``on_unknown_urn`` has no say: with a DLQ configured it
+        # is written wrapped (reason ``poison``) and committed under every strategy, DELETE included.
+        for strategy in ("fail", "delete", "dead_letter", "release"):
+            for value in (b"not json at all", b"\xff\xfe bad \x80"):
+                with self.subTest(strategy=strategy, value=value):
+                    produced = self._poison(value, key=b"k", on_unknown_urn=strategy)
+                    self.assertEqual([m["topic"] for m in produced], ["orders.dlq"])
+                    self.assertEqual(produced[0]["key"], b"k")
+                    poison_dlq(self, produced[0]["value"])
+
+    def test_poison_is_still_dropped_without_a_dlq_under_every_strategy(self):
+        for strategy in ("fail", "delete", "release"):
+            with self.subTest(strategy=strategy):
+                self.assertEqual(self._poison(b"nope", dead_letter=False, on_unknown_urn=strategy), [])
+
+    def test_a_pathologically_nested_body_is_poison_never_a_wedged_partition(self):
+        # Deeper than the interpreter's recursion limit: ``json`` raises RecursionError, which must be
+        # poison (Go parses up to 10000 levels; this is a documented, interpreter-bound difference).
+        for depth in (990, 1100, 20000):
+            with self.subTest(depth=depth):
+                body = ('{"job":7,"data":{"x":%s%s}}' % ("[" * depth, "]" * depth)).encode("utf-8")
+                produced = self._poison(body)
+                self.assertEqual(len(produced), 1)
+                dead = json.loads(produced[0]["value"].decode("utf-8"))
+                self.assertEqual(dead["dead_letter"]["reason"], "poison")
+
+    def test_a_body_the_core_json_parser_rejects_after_the_scan_is_poison_not_an_empty_envelope(self):
+        # The core decoder turns a ValueError from json.loads into an EMPTY envelope. Where the shape scan
+        # passes a body that plain json.loads refuses (Python 3.11+: an unknown member holding an integer of
+        # more than 4300 digits), the record must be poison, never an empty envelope for the handler.
+        from unittest import mock
+
+        real = json.loads
+        body = b'{"job":"%s","data":{"k":1}}' % URN.encode("utf-8")
+
+        def refusing(text, *args, **kwargs):
+            if "object_pairs_hook" in kwargs:  # the shape scan's own call
+                return real(text, *args, **kwargs)
+            raise ValueError("Exceeds the limit (4300 digits) for integer string conversion")
+
+        consumer = OffsetConsumer([OffsetMessage(body, [], offset=0)])
+        producer = ReportingProducer()
+        handled = []
+        app = BabelQueue(transport=transport(producer, consumer), dead_letter=True)
+        app._rewind_pause = 0.0  # noqa: SLF001
+        app.register(URN, handled.append)
+        with mock.patch("babelqueue.kafka_transport.json.loads", side_effect=refusing), self.assertLogs(
+            "babelqueue.kafka", level="WARNING"
+        ):
+            app.consume(queue="orders", max_messages=1)
+        self.assertEqual(handled, [])
+        self.assertEqual([m["topic"] for m in producer.produced], ["orders.dlq"])
+        dead = real(producer.produced[0]["value"].decode("utf-8"))
+        self.assertEqual(dead["dead_letter"]["reason"], "poison")
+        self.assertEqual(consumer.committed_offset, 1)
+
+    def test_a_decode_that_raises_after_the_scan_is_poison_not_an_escape(self):
+        from unittest import mock
+
+        consumer = OffsetConsumer([OffsetMessage(b'{"job":"%s"}' % URN.encode("utf-8"), [], offset=0)])
+        producer = ReportingProducer()
+        app = BabelQueue(transport=transport(producer, consumer), dead_letter=True)
+        app._rewind_pause = 0.0  # noqa: SLF001
+        with mock.patch(
+            "babelqueue.kafka_transport.EnvelopeCodec.decode", side_effect=RecursionError("deep")
+        ), self.assertLogs("babelqueue.kafka", level="WARNING"):
+            app.consume(queue="orders", max_messages=1)
+        self.assertEqual([m["topic"] for m in producer.produced], ["orders.dlq"])
+
+    def test_member_names_are_matched_case_sensitively_like_the_core_decoder(self):
+        from babelqueue._envelope_shape import envelope_violation
+
+        # The contract schema spells the keys exactly; a differently-cased or folded name is an unknown
+        # member (checked for syntax only), never ``attempts`` / ``trace_id``.
+        self.assertIsNone(envelope_violation('{"ATTEMPTS":"x"}'))
+        self.assertIsNone(envelope_violation('{"attempt\\u017f":"x"}'))
+        self.assertIsNone(envelope_violation('{"JOB":5}'))
+        self.assertIsNone(envelope_violation('{"Meta":{"schema_version":"x"}}'))
+        self.assertIsNone(envelope_violation('{"meta":{"\\u017fchema_version":"x"}}'))
+        self.assertIsNone(envelope_violation('{"trace_\\u0131d":5}'))
+        # The exact spelling is still type-checked.
+        self.assertIsNotNone(envelope_violation('{"attempts":"x"}'))
+        self.assertIsNotNone(envelope_violation('{"meta":{"schema_version":"x"}}'))
+        self.assertIsNotNone(envelope_violation('{"trace_id":5}'))
+
+    def test_the_attempts_header_feeds_the_dead_letter_block(self):
+        produced = self._poison(b"nope", headers=[("bq-attempts", b"4")])
+        poison_dlq(self, produced[0]["value"], attempts=4)
+
+    def test_non_utf8_bytes_are_stored_lossily_under_raw(self):
+        produced = self._poison(b"\xff\xfe bad \x80", key=b"k")
+        dead = poison_dlq(self, produced[0]["value"])
+        self.assertEqual(dead["raw"], "�� bad �")
+        self.assertEqual(produced[0]["key"], b"k")
+
+    def test_poison_is_dropped_and_committed_without_a_dlq(self):
+        self.assertEqual(self._poison(b"nope", dead_letter=False), [])
+
+    def test_a_valid_object_without_a_urn_is_not_poison(self):
+        # A body that decodes but names no URN goes down the generic unknown-URN path (as in Go).
+        consumer = OffsetConsumer([OffsetMessage(b'{"data":{"x":1}}', [], offset=0)])
+        producer = ReportingProducer()
+        app = BabelQueue(
+            transport=transport(producer, consumer), dead_letter=True, on_unknown_urn="dead_letter"
+        )
+        app._rewind_pause = 0.0  # noqa: SLF001
+        app.consume(queue="orders", max_messages=1)
+        dead = json.loads(producer.produced[0]["value"].decode("utf-8"))
+        self.assertEqual(dead["dead_letter"]["reason"], "unknown_urn")
+
+    def test_the_version_gate_still_dead_letters_the_record_raw(self):
+        raw = b"not even json"
+        produced = self._poison(raw, headers=[("bq-schema-version", b"2")], key=b"k")
+        self.assertEqual(produced[0]["value"], raw)  # §6.7 step 2: no decode, no wrap
+        self.assertEqual(produced[0]["key"], b"k")
+
+    def _redrive_restore(self, dlq, value, key=b"k", headers=()):
+        from babelqueue import redrive
+
+        record = OffsetMessage(value, list(headers), offset=0, topic=dlq, key=key)
+        consumer = OffsetConsumer([record])
+        producer = ReportingProducer()
+        result = redrive.redrive(transport(producer, consumer), dlq, timeout=0)
+        self.assertEqual(result.redriven, 0)
+        return producer.produced
+
+    def test_redrive_restores_a_poison_record_byte_for_byte_whatever_the_dlq_is_named(self):
+        # The wrap is applied when the runtime writes the DLQ record, not by name: a DLQ that does not
+        # end in ".dlq" (``dead_letter_queue`` / ``dead_letter_suffix``) must still be restored raw.
+        cases = (
+            b"not-json",
+            b"a\xffb",
+            b'{"job":7,"x":1}',
+            b'{"job":"%s","attempts":"x"}' % URN.encode("utf-8"),
+        )
+        for dlq in ("orders-dead", "orders.dlq", "orders_failed"):
+            for value in cases:
+                with self.subTest(dlq=dlq, value=value):
+                    produced = self._redrive_restore(dlq, value)
+                    self.assertEqual([m["topic"] for m in produced], [dlq])
+                    self.assertEqual(produced[0]["value"], value)
+                    self.assertEqual(produced[0]["key"], b"k")
+
+    def test_a_poison_record_on_a_topic_ending_in_dlq_is_wrapped_by_the_runtime(self):
+        # The opposite direction of the name heuristic: a work topic that happens to end in ".dlq".
+        consumer = OffsetConsumer([OffsetMessage(b"nope", [], offset=0, topic="work.dlq", key=b"k")])
+        producer = ReportingProducer()
+        app = BabelQueue(transport=transport(producer, consumer), dead_letter=True)
+        app._rewind_pause = 0.0  # noqa: SLF001
+        with self.assertLogs("babelqueue.kafka", level="WARNING"):
+            app.consume(queue="work.dlq", max_messages=1)
+        self.assertEqual([m["topic"] for m in producer.produced], ["work.dlq.dlq"])
+        poison_dlq(self, producer.produced[0]["value"], original_queue="work.dlq")
+
+    def test_a_custom_dead_letter_queue_receives_the_wrapped_body(self):
+        produced = self._poison(b"nope", dead_letter_queue="orders-dead")
+        self.assertEqual([m["topic"] for m in produced], ["orders-dead"])
+        poison_dlq(self, produced[0]["value"])
+
+    def test_the_original_topic_header_names_the_original_queue(self):
+        produced = self._poison(b"nope", headers=[("bq-original-topic", b"billing")])
+        poison_dlq(self, produced[0]["value"], original_queue="billing")
+
+    def test_a_number_json_cannot_carry_falls_back_to_raw(self):
+        # ``1e400`` parses to infinity, which has no JSON form: the DLQ body must stay valid JSON.
+        text = '{"job":"%s","data":{"n":1e400}}' % URN
+        produced = self._poison(text.encode("utf-8") + b" trailing")
+        self.assertNotIn(b"Infinity", produced[0]["value"])
+        dead = poison_dlq(self, produced[0]["value"])
+        self.assertEqual(dead["raw"], text + " trailing")
+        text = '{"job":7,"data":{"n":1e400}}'
+        dead = poison_dlq(self, self._poison(text.encode("utf-8"))[0]["value"])
+        self.assertEqual(dead["raw"], text)
+
+
 class KafkaSchemeTest(unittest.TestCase):
     def test_make_transport_routes_kafka_scheme_lazily(self):
         # Construction is lazy (no client built), so it succeeds with no confluent-kafka.
@@ -1406,3 +1748,46 @@ class KafkaSchemeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PoisonTriggerSetTest(unittest.TestCase):
+    """The table-driven poison trigger set, shared byte for byte by every SDK. ``poison`` is what the
+    Go reference's typed ``Decode`` decides for each body; the Kafka transport must agree."""
+
+    @staticmethod
+    def _cases():
+        import os
+
+        path = os.path.join(os.path.dirname(__file__), "poison-trigger-set.json")
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def test_the_trigger_set_matches_the_go_reference(self):
+        cases = self._cases()
+        self.assertGreaterEqual(len(cases), 70)
+        for case in cases:
+            with self.subTest(name=case["name"]):
+                consumer = OffsetConsumer([OffsetMessage(case["body"].encode("utf-8"), [], offset=0)])
+                message = transport(ReportingProducer(), consumer).pop("orders")
+                self.assertIsNotNone(message)
+                if case["poison"]:
+                    self.assertIsInstance(message.route_urn, PoisonRoute)
+                    self.assertEqual(message.route_urn, POISON_ROUTE)
+                    self.assertEqual(message.body, case["body"])  # handed over raw
+                else:
+                    self.assertNotIsInstance(message.route_urn, PoisonRoute)
+                    self.assertNotEqual(message.route_urn, NON_NUMERIC_ATTEMPTS_ROUTE)
+
+    def test_a_typed_valid_but_non_conformant_envelope_is_routed_not_poisoned(self):
+        # Go's consume path never calls ``Accepts``: a non-string ``urn`` alias, a missing ``data``
+        # and an unknown ``schema_version`` all decode, so they reach the URN router.
+        for text in (
+            '{"urn":5,"data":{}}',
+            '{"job":"urn:x"}',
+            '{"job":"urn:x","meta":{"schema_version":2}}',
+            '{"job":"urn:x","meta":{"schema_version":0}}',
+        ):
+            with self.subTest(body=text):
+                consumer = OffsetConsumer([OffsetMessage(text.encode("utf-8"), [], offset=0)])
+                message = transport(ReportingProducer(), consumer).pop("orders")
+                self.assertNotIsInstance(message.route_urn, PoisonRoute)

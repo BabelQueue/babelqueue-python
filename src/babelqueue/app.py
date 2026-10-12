@@ -41,6 +41,7 @@ from .replay import HEADER_REPLAY_BYPASS, _replay_scope
 from .routing import UnknownUrnStrategy
 from .transport import (
     HeaderPublisher,
+    PoisonRoute,
     ReceivedMessage,
     Redeliverer,
     Rewinder,
@@ -476,6 +477,14 @@ class BabelQueue:
 
     def _route_unknown(self, urn: str, received: ReceivedMessage, envelope: Mapping[str, Any]) -> None:
         strategy = self.on_unknown_urn
+        # A Kafka poison record (§6.5: not valid UTF-8 / not a decodable body) is not an unknown URN: it
+        # never decoded into an envelope, so ``on_unknown_urn`` has no say. It is checked before the
+        # DELETE strategy and settled like the Go reference does -- dead-lettered (wrapped, reason
+        # ``poison``) and committed, or dropped only when no DLQ is configured. Other transports'
+        # version-gated deliveries keep their existing order below.
+        if isinstance(received.route_urn, PoisonRoute):
+            self._settle_version_gated(received)
+            return
         if strategy == UnknownUrnStrategy.DELETE:
             self._ack_settled(received)
             return

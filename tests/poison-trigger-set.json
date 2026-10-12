@@ -1,0 +1,392 @@
+[
+ {
+  "name": "empty",
+  "body": "",
+  "poison": true
+ },
+ {
+  "name": "whitespace only",
+  "body": "   ",
+  "poison": true
+ },
+ {
+  "name": "not json",
+  "body": "not-json",
+  "poison": true
+ },
+ {
+  "name": "truncated",
+  "body": "{\"job\":\"urn:a\"",
+  "poison": true
+ },
+ {
+  "name": "empty array",
+  "body": "[]",
+  "poison": true
+ },
+ {
+  "name": "array",
+  "body": "[1]",
+  "poison": true
+ },
+ {
+  "name": "string",
+  "body": "\"str\"",
+  "poison": true
+ },
+ {
+  "name": "number",
+  "body": "123",
+  "poison": true
+ },
+ {
+  "name": "boolean",
+  "body": "true",
+  "poison": true
+ },
+ {
+  "name": "null literal",
+  "body": "null",
+  "poison": false
+ },
+ {
+  "name": "empty object",
+  "body": "{}",
+  "poison": false
+ },
+ {
+  "name": "full valid",
+  "body": "{\"job\":\"urn:babel:orders:created\",\"trace_id\":\"t\",\"data\":{},\"meta\":{\"id\":\"i\",\"queue\":\"q\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1700000000000},\"attempts\":0}",
+  "poison": false
+ },
+ {
+  "name": "job number",
+  "body": "{\"job\":5}",
+  "poison": true
+ },
+ {
+  "name": "job null",
+  "body": "{\"job\":null}",
+  "poison": false
+ },
+ {
+  "name": "urn alias number",
+  "body": "{\"urn\":5}",
+  "poison": false
+ },
+ {
+  "name": "urn alias string",
+  "body": "{\"urn\":\"urn:x\"}",
+  "poison": false
+ },
+ {
+  "name": "urn alias padded",
+  "body": "{\"urn\":\"  urn:x  \"}",
+  "poison": false
+ },
+ {
+  "name": "trace_id number",
+  "body": "{\"trace_id\":7}",
+  "poison": true
+ },
+ {
+  "name": "data array",
+  "body": "{\"data\":[]}",
+  "poison": true
+ },
+ {
+  "name": "data string",
+  "body": "{\"data\":\"x\"}",
+  "poison": true
+ },
+ {
+  "name": "data null",
+  "body": "{\"data\":null}",
+  "poison": false
+ },
+ {
+  "name": "meta string",
+  "body": "{\"meta\":\"x\"}",
+  "poison": true
+ },
+ {
+  "name": "meta array",
+  "body": "{\"meta\":[]}",
+  "poison": true
+ },
+ {
+  "name": "meta null",
+  "body": "{\"meta\":null}",
+  "poison": false
+ },
+ {
+  "name": "meta.id number",
+  "body": "{\"meta\":{\"id\":5}}",
+  "poison": true
+ },
+ {
+  "name": "meta.queue number",
+  "body": "{\"meta\":{\"queue\":5}}",
+  "poison": true
+ },
+ {
+  "name": "meta.lang boolean",
+  "body": "{\"meta\":{\"lang\":true}}",
+  "poison": true
+ },
+ {
+  "name": "meta.created_at string",
+  "body": "{\"meta\":{\"created_at\":\"2026\"}}",
+  "poison": true
+ },
+ {
+  "name": "meta.created_at fractional",
+  "body": "{\"meta\":{\"created_at\":1.5}}",
+  "poison": true
+ },
+ {
+  "name": "meta.created_at integer",
+  "body": "{\"meta\":{\"created_at\":1700000000000}}",
+  "poison": false
+ },
+ {
+  "name": "meta.created_at exponent",
+  "body": "{\"meta\":{\"created_at\":1e3}}",
+  "poison": true
+ },
+ {
+  "name": "meta.created_at decimal zero",
+  "body": "{\"meta\":{\"created_at\":1.0}}",
+  "poison": true
+ },
+ {
+  "name": "meta.created_at int64 overflow",
+  "body": "{\"meta\":{\"created_at\":9223372036854775808}}",
+  "poison": true
+ },
+ {
+  "name": "meta.created_at int64 max",
+  "body": "{\"meta\":{\"created_at\":9223372036854775807}}",
+  "poison": false
+ },
+ {
+  "name": "meta.created_at negative",
+  "body": "{\"meta\":{\"created_at\":-1}}",
+  "poison": false
+ },
+ {
+  "name": "meta.created_at negative zero",
+  "body": "{\"meta\":{\"created_at\":-0}}",
+  "poison": false
+ },
+ {
+  "name": "meta.schema_version string",
+  "body": "{\"meta\":{\"schema_version\":\"1\"}}",
+  "poison": true
+ },
+ {
+  "name": "meta.schema_version two",
+  "body": "{\"meta\":{\"schema_version\":2}}",
+  "poison": false
+ },
+ {
+  "name": "meta.schema_version decimal zero",
+  "body": "{\"meta\":{\"schema_version\":1.0}}",
+  "poison": true
+ },
+ {
+  "name": "meta.schema_version null",
+  "body": "{\"meta\":{\"schema_version\":null}}",
+  "poison": false
+ },
+ {
+  "name": "meta.schema_version boolean",
+  "body": "{\"meta\":{\"schema_version\":true}}",
+  "poison": true
+ },
+ {
+  "name": "attempts fractional",
+  "body": "{\"attempts\":1.5}",
+  "poison": true
+ },
+ {
+  "name": "attempts string",
+  "body": "{\"attempts\":\"3\"}",
+  "poison": true
+ },
+ {
+  "name": "attempts integer",
+  "body": "{\"attempts\":2}",
+  "poison": false
+ },
+ {
+  "name": "attempts exponent",
+  "body": "{\"attempts\":1e0}",
+  "poison": true
+ },
+ {
+  "name": "attempts upper exponent",
+  "body": "{\"attempts\":1E2}",
+  "poison": true
+ },
+ {
+  "name": "attempts negative zero",
+  "body": "{\"attempts\":-0}",
+  "poison": false
+ },
+ {
+  "name": "attempts overflow",
+  "body": "{\"attempts\":9223372036854775808}",
+  "poison": true
+ },
+ {
+  "name": "attempts null",
+  "body": "{\"attempts\":null}",
+  "poison": false
+ },
+ {
+  "name": "dead_letter string",
+  "body": "{\"dead_letter\":\"x\"}",
+  "poison": true
+ },
+ {
+  "name": "dead_letter null",
+  "body": "{\"dead_letter\":null}",
+  "poison": false
+ },
+ {
+  "name": "dead_letter empty object",
+  "body": "{\"dead_letter\":{}}",
+  "poison": false
+ },
+ {
+  "name": "dead_letter.attempts string",
+  "body": "{\"dead_letter\":{\"attempts\":\"3\"}}",
+  "poison": true
+ },
+ {
+  "name": "dead_letter.reason number",
+  "body": "{\"dead_letter\":{\"reason\":5}}",
+  "poison": true
+ },
+ {
+  "name": "dead_letter.error number",
+  "body": "{\"dead_letter\":{\"error\":5}}",
+  "poison": true
+ },
+ {
+  "name": "dead_letter nullable strings",
+  "body": "{\"dead_letter\":{\"error\":null,\"exception\":null}}",
+  "poison": false
+ },
+ {
+  "name": "dead_letter.failed_at string",
+  "body": "{\"dead_letter\":{\"failed_at\":\"x\"}}",
+  "poison": true
+ },
+ {
+  "name": "dead_letter.failed_at fractional",
+  "body": "{\"dead_letter\":{\"failed_at\":1.5}}",
+  "poison": true
+ },
+ {
+  "name": "dead_letter.original_queue array",
+  "body": "{\"dead_letter\":{\"original_queue\":[]}}",
+  "poison": true
+ },
+ {
+  "name": "dead_letter.lang object",
+  "body": "{\"dead_letter\":{\"lang\":{}}}",
+  "poison": true
+ },
+ {
+  "name": "dead_letter full",
+  "body": "{\"dead_letter\":{\"error\":\"e\",\"exception\":\"x\",\"failed_at\":1,\"original_queue\":\"q\",\"attempts\":1,\"lang\":\"go\",\"reason\":\"r\"}}",
+  "poison": false
+ },
+ {
+  "name": "upper-case job key with number is an unknown member (names are case-sensitive)",
+  "body": "{\"JOB\":5}",
+  "poison": false
+ },
+ {
+  "name": "mixed-case meta.id key with number is an unknown member (names are case-sensitive)",
+  "body": "{\"Meta\":{\"ID\":5}}",
+  "poison": false
+ },
+ {
+  "name": "upper-case job key with string",
+  "body": "{\"JOB\":\"urn:x\"}",
+  "poison": false
+ },
+ {
+  "name": "trailing garbage",
+  "body": "{\"job\":\"x\"} trailing",
+  "poison": true
+ },
+ {
+  "name": "two objects",
+  "body": "{\"job\":\"x\"}{\"job\":\"y\"}",
+  "poison": true
+ },
+ {
+  "name": "unknown keys",
+  "body": "{\"x\":1}",
+  "poison": false
+ },
+ {
+  "name": "forbidden keys with odd types",
+  "body": "{\"timestamp\":\"x\",\"meta\":{\"max_retries\":\"x\",\"attempts\":\"y\",\"source\":5,\"ts\":\"z\"}}",
+  "poison": false
+ },
+ {
+  "name": "nested lookalikes in data",
+  "body": "{\"data\":{\"a\":[1,2,{\"b\":null}],\"meta\":5,\"job\":5},\"extra\":{\"meta\":5}}",
+  "poison": false
+ },
+ {
+  "name": "duplicate job string then number",
+  "body": "{\"job\":\"urn:x\",\"job\":5}",
+  "poison": true
+ },
+ {
+  "name": "duplicate job number then string",
+  "body": "{\"job\":5,\"job\":\"urn:x\"}",
+  "poison": true
+ },
+ {
+  "name": "byte order mark",
+  "body": "\ufeff{\"job\":\"x\"}",
+  "poison": true
+ },
+ {
+  "name": "leading zero number",
+  "body": "{\"attempts\":01}",
+  "poison": true
+ },
+ {
+  "name": "NaN literal",
+  "body": "{\"attempts\":NaN}",
+  "poison": true
+ },
+ {
+  "name": "single quotes",
+  "body": "{'a':1}",
+  "poison": true
+ },
+ {
+  "name": "meta duplicate-case key",
+  "body": "{\"meta\":{\"id\":\"a\",\"queue\":\"b\",\"lang\":\"c\",\"schema_version\":1,\"created_at\":1,\"ID\":\"dup\"}}",
+  "poison": false
+ },
+ {
+  "name": "attempts huge exponent",
+  "body": "{\"attempts\":1e400}",
+  "poison": true
+ },
+ {
+  "name": "data with huge number",
+  "body": "{\"data\":{\"n\":1e400}}",
+  "poison": true
+ }
+]

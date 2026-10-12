@@ -19,10 +19,18 @@ Settlement writes (retry republish, DLQ) go through ``publish_settle`` and wait 
 delivery report (``delivery_timeout``); a failure raises ``KafkaDeliveryError`` and the offset is
 not committed. ``publish`` itself stays fire-and-forget. Those writes also carry the consumed
 record's key unchanged (``ReceivedMessage.key``; null stays null, empty stays empty, never
-synthesised). A record value that is not valid UTF-8 is handed to the runtime under a
-reserved route so its original bytes are dead-lettered raw (written back with no projected headers;
-with the DLQ off, or ``UnknownUrnStrategy.DELETE``, it is dropped and committed). The runtime logs
-it as a version-gated message because it reuses that settle path; the route in the log names it.
+synthesised). A poison record (§6.5: a value that is not valid UTF-8, not valid JSON, not a JSON
+object other than ``null``, or a member of the wrong type, member names matched exactly as spelled: what the Go
+reference's typed ``Decode`` rejects, see :mod:`babelqueue._envelope_shape`) is handed to the runtime under a
+reserved route and dead-lettered directly, never retried, *wrapped* like the Go reference: a body that
+is one JSON object keeps its keys, anything else is carried as ``{"raw": "<body>"}``, and a
+``dead_letter`` block with ``reason: "poison"`` is added (the key is preserved; with the DLQ off it is
+dropped and committed; ``on_unknown_urn``, ``DELETE`` included, has no say). The record is handed over raw under a
+``PoisonRoute`` and wrapped by ``publish_settle`` only when it is written to a queue other than the one
+it was read from, so a ``redrive`` restore into the DLQ it popped it from (any DLQ name) is byte for
+byte and never double-wraps. The version gate (§6.7) still
+dead-letters its record raw. The runtime logs a poison record as a version-gated message because it
+reuses that settle path; the route in the log names it.
 
 This implements §6 of the broker-bindings contract. The envelope is unchanged
 (``schema_version`` stays 1); Apache Kafka is purely additive.
@@ -34,15 +42,18 @@ or ``KafkaTransport(producer=..., consumer_factory=...)``.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
+from . import dead_letter
 from .codec import SCHEMA_VERSION, EnvelopeCodec, parse_envelope
+from ._envelope_shape import envelope_violation
 from .exceptions import BabelQueueError
 from .transport import (
-    NON_NUMERIC_ATTEMPTS_ROUTE,
+    PoisonRoute,
     ReceivedMessage,
     Transport,
     truncate_declared_version,
@@ -54,6 +65,8 @@ _logger = logging.getLogger("babelqueue.kafka")
 #: same set in every SDK (GR-5). Deliberately not ``str.strip()``, which also strips U+001C-U+001F,
 #: U+0085, U+00A0, U+2028, U+3000 ...
 _BLANK_ASCII_PATTERN = re.compile(r"[ \t\n\x0b\x0c\r]*")
+#: Every surrogate code point except U+DC80..U+DCFF (those are ``surrogateescape``d non-UTF-8 bytes).
+_LONE_SURROGATE = re.compile("[\ud800-\udbff\udc00-\udc7f\udd00-\udfff]")
 #: Prefix of the reserved ``route_urn`` a version-gated message is delivered under. It is not a
 #: ``urn:babel:`` URN, so no handler can legitimately own it; the runtime dead-letters it
 #: directly (never retried, never decoded; the DLQ record is the incoming raw body). The
@@ -67,6 +80,13 @@ UNSUPPORTED_SCHEMA_ROUTE_PREFIX = "babelqueue:unsupported-schema-version:"
 #: :meth:`KafkaTransport.publish` encodes back to the exact original bytes.
 NON_UTF8_ROUTE = UNSUPPORTED_SCHEMA_ROUTE_PREFIX + "non-utf8-payload"
 
+#: Reserved ``route_urn`` of a record whose value is not a decodable BabelQueue body (invalid JSON, a
+#: non-object root, a member of the wrong type). Like the gated routes it is dead-lettered directly and
+#: never retried, but the DLQ record is the *wrapped* poison body built by
+#: :meth:`KafkaTransport._poison_body` (``dead_letter.reason == "poison"``), not the raw bytes.
+POISON_ROUTE = UNSUPPORTED_SCHEMA_ROUTE_PREFIX + "poison"
+
+
 #: How long (seconds) a settle-path publish waits for the broker to confirm the write.
 DEFAULT_DELIVERY_TIMEOUT = 30.0
 
@@ -79,16 +99,24 @@ class KafkaDeliveryError(BabelQueueError):
 
 def _runtime_attempts(env: Any) -> int:
     """The envelope's ``attempts`` exactly as the runtime's retry path reads it
-    (``int(envelope.get("attempts", 0))``): an absent key is 0. Raises ``ValueError`` for every
-    value that read would choke on — null, ``""``, a list/dict, ``"three"``, ``inf``/``nan`` — and
-    for a bool, which is no counter at all although ``int()`` happens to accept it."""
+    (``int(envelope.get("attempts", 0))``): an absent key or a null is 0 (Go decodes a null integer
+    as zero). Raises ``ValueError`` for every value that read would choke on — ``""``, a list/dict,
+    ``"three"``, ``inf``/``nan`` — and for a bool, which is no counter at all although ``int()``
+    happens to accept it."""
     value = env.get("attempts", 0)
+    if value is None:
+        return 0
     if isinstance(value, bool):
         raise ValueError("attempts is a bool")
     try:
         return int(value)
     except (TypeError, OverflowError) as exc:
         raise ValueError("attempts is not an integer") from exc
+
+
+def _reject_json_constant(name: str) -> Any:
+    """``json.loads`` hook: ``NaN`` / ``Infinity`` are not JSON, so a body carrying them is undecodable."""
+    raise ValueError("invalid JSON constant " + name)
 
 
 def _brokers_from_url(url: str) -> str:
@@ -166,7 +194,11 @@ class KafkaTransport(Transport):
         env = parse_envelope(body)
         if not env:
             return []
-        meta = env.get("meta") or {}
+        meta = env.get("meta")
+        if not isinstance(meta, dict):
+            # A wrongly-typed ``meta`` (a poison body keeps its keys when dead-lettered, §6.5) has no
+            # header view; it must not fail the write that settles the record.
+            meta = {}
 
         headers: Headers = []
 
@@ -217,7 +249,7 @@ class KafkaTransport(Transport):
                 except (ValueError, TypeError):
                     pass
                 break
-        if attempts == body_attempts:
+        if attempts == body_attempts and env.get("attempts", 0) is not None:
             return body
         env["attempts"] = attempts
         return EnvelopeCodec.encode(env)
@@ -265,18 +297,89 @@ class KafkaTransport(Transport):
         return key_of() if callable(key_of) else None
 
     @staticmethod
-    def _has_non_numeric_attempts(body: str) -> bool:
-        """Whether the body is an envelope whose ``attempts`` the runtime's retry path could
-        not read (see ``_runtime_attempts``), so such a record could never be retried. An absent
-        ``attempts`` is a plain 0, not a poison."""
-        env = parse_envelope(body)
-        if not env or "attempts" not in env:
-            return False
+    def _decode_failure(text: str) -> Optional[str]:
+        """Why ``text`` is not a decodable BabelQueue body, or ``None`` when it is.
+
+        The core decoder is lenient (``decode`` returns ``{}`` for a malformed or non-object body),
+        so poison is detected explicitly, with the trigger set of the Go reference's typed
+        ``Decode`` but case-sensitive member names, as the core decoder reads them (see :mod:`babelqueue._envelope_shape`). A well-typed but non-conformant envelope
+        is not poison: it is routed by its URN, as in Go.
+
+        The shape scan keeps unknown members out of its way, but the core decoder parses the whole
+        body with plain ``json.loads`` and turns a ``ValueError`` into an EMPTY envelope (on Python
+        3.11+, e.g. an unknown member holding an integer of more than 4300 digits). Such a body is
+        poison here too, so content is never silently dropped on the way to a handler."""
+        violation = envelope_violation(text)
+        if violation is not None:
+            return violation
         try:
-            _runtime_attempts(env)
-        except ValueError:
-            return True
-        return False
+            json.loads(text)
+        except ValueError as exc:
+            return "the core decoder cannot parse the body: " + str(exc)
+        return None
+
+    @staticmethod
+    def _header_value(headers: Any, wanted: str) -> Optional[str]:
+        """The text of the first record header named ``wanted`` (``None`` when absent)."""
+        for key, value in headers or []:
+            name = key.decode("utf-8", "replace") if isinstance(key, (bytes, bytearray)) else key
+            if name != wanted:
+                continue
+            if isinstance(value, (bytes, bytearray)):
+                return bytes(value).decode("utf-8", "replace")
+            return None if value is None else str(value)
+        return None
+
+    @classmethod
+    def _header_attempts(cls, headers: Any) -> int:
+        """The ``bq-attempts`` header as a non-negative int (0 when absent or unparseable)."""
+        raw = cls._header_value(headers, "bq-attempts")
+        if raw is None:
+            return 0
+        try:
+            return max(int(raw), 0)
+        except (ValueError, TypeError):
+            return 0
+
+    @classmethod
+    def _poison_body(cls, text: str, cause: str, original_queue: str, attempts: int) -> str:
+        """The DLQ body of a poison record, in the form of the Go reference (§6.5, ADR-0009): a body
+        that is exactly one JSON object keeps its keys, anything else is carried as the string value
+        of ``raw`` (bytes that are not UTF-8 are stored with U+FFFD substitutions); a ``dead_letter``
+        block with ``reason: "poison"`` replaces any existing one. A body whose keys cannot be written
+        back as valid JSON (a number past the double range such as ``1e400``) falls back to ``raw``."""
+        # Bytes that are not UTF-8 are carried as surrogateescape code points; the DLQ body must be
+        # encodable, so they become U+FFFD (the Go reference stores the lossy conversion too).
+        text = text.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+        try:
+            parsed = json.loads(text, parse_constant=_reject_json_constant)
+        except (ValueError, RecursionError):
+            parsed = None
+        candidates: List[Dict[str, Any]] = []
+        if isinstance(parsed, dict):
+            parsed.pop("dead_letter", None)
+            candidates.append(parsed)
+        candidates.append({"raw": text})
+        for record in candidates:
+            annotated = dead_letter.annotate(
+                record,
+                "poison",
+                original_queue,
+                attempts,
+                error="Undecodable BabelQueue body: " + cause,
+                exception=BabelQueueError.__name__,
+            )
+            try:
+                serialised = json.dumps(
+                    annotated, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+                )
+                # A lone surrogate (a ``\ud800`` escape in a key or value) serialises but cannot be
+                # written to the wire as UTF-8: fall back to the next candidate.
+                serialised.encode("utf-8")
+                return serialised
+            except (ValueError, RecursionError):
+                continue
+        raise AssertionError("unreachable: the raw fallback is always serialisable")  # pragma: no cover
 
     @staticmethod
     def _is_non_utf8(message: Any) -> bool:
@@ -308,6 +411,11 @@ class KafkaTransport(Transport):
         ``key`` is the consumed record's key (:attr:`ReceivedMessage.key`): it is written back
         unchanged, so a retry or DLQ record keeps the original key (``None`` stays a null key, an
         empty key stays empty, and no key is ever synthesised). §6."""
+        if isinstance(route_urn, PoisonRoute) and queue != route_urn.queue:
+            # The runtime dead-letters a poison record (§6.5): the DLQ body is the Go-form wrap.
+            body = self._poison_body(
+                body, route_urn.cause, route_urn.original_queue, route_urn.attempts
+            )
         kwargs = self._record_kwargs(body, raw_ok=True)
         if key is not None:
             kwargs["key"] = key
@@ -325,11 +433,22 @@ class KafkaTransport(Transport):
         except UnicodeEncodeError:
             if not raw_ok:
                 raise
-            return {"value": body.encode("utf-8", "surrogateescape"), "headers": []}
+            # Bytes that were not UTF-8 are carried as ``surrogateescape`` code points and restored
+            # byte for byte. A *lone* surrogate (a ``\\ud800`` JSON escape that survived the decode) is
+            # not restorable: it becomes U+FFFD, as the Go reference does when it parses the escape.
+            # Without this the settle write would raise and the record would be redelivered forever.
+            cleaned = _LONE_SURROGATE.sub("\ufffd", body)
+            return {"value": cleaned.encode("utf-8", "surrogateescape"), "headers": []}
         kwargs: Dict[str, Any] = {"value": body.encode("utf-8"), "headers": cls._projection(body)}
-        created_at = (parse_envelope(body).get("meta") or {}).get("created_at")
+        meta = parse_envelope(body).get("meta")
+        created_at = meta.get("created_at") if isinstance(meta, dict) else None
         if created_at:
-            kwargs["timestamp"] = int(created_at)
+            try:
+                kwargs["timestamp"] = int(created_at)
+            except (ValueError, TypeError, OverflowError):
+                # A poison body keeps its keys when wrapped (§6.5), so ``created_at`` can be anything:
+                # a record timestamp is optional and must not fail the write that settles it.
+                pass
         return kwargs
 
     def _produce_confirmed(self, producer: Any, queue: str, kwargs: Dict[str, Any]) -> None:
@@ -421,45 +540,49 @@ class KafkaTransport(Transport):
             )
             self._pending.setdefault(queue, []).append(message)
             return received
-        if self._is_non_utf8(message):
-            # The value cannot be decoded, so there is no envelope to retry or annotate: hand it
-            # over under the reserved route; the runtime dead-letters the raw bytes directly (and
-            # does not commit if that write is not confirmed) instead of letting ``pop`` raise.
-            _logger.warning(
-                "Kafka record on %r is not valid UTF-8; dead-lettering its raw bytes.", queue
-            )
-            received = ReceivedMessage(
-                body=self._payload(message),
-                queue=queue,
-                handle=message,
-                route_urn=NON_UTF8_ROUTE,
-                key=self._key(message),
-            )
-            self._pending.setdefault(queue, []).append(message)
-            return received
         payload = self._payload(message)
-        if self._has_non_numeric_attempts(payload):
-            # A foreign producer wrote a non-numeric ``attempts``. The runtime could not retry it
-            # (it needs an integer counter) and a failing handler would wedge the partition, so it
-            # is handed over under the reserved route like a non-UTF-8 record: dead-lettered raw,
-            # never given to a handler, and restored (not replayed) by ``redrive``.
-            _logger.warning(
-                "Kafka record on %r carries a non-numeric attempts; dead-lettering it raw.", queue
-            )
+        non_utf8 = self._is_non_utf8(message)
+        cause: Optional[str]
+        if non_utf8:
+            cause = "the value is not valid UTF-8"
+        else:
+            try:
+                cause = self._decode_failure(payload)
+            except Exception as exc:  # noqa: BLE001 - e.g. RecursionError on a pathologically nested body
+                cause = "the body could not be scanned (%s)" % type(exc).__name__
+        body = payload
+        if cause is None:
+            try:
+                body = self._reconcile(payload, headers)
+            except Exception as exc:  # noqa: BLE001 - any decode failure is poison, never a wedged partition
+                cause = "the body could not be decoded (%s)" % type(exc).__name__
+        if cause is not None:
+            # §6.5 poison: there is no envelope to retry or hand to a handler, so the record is handed
+            # over, raw, under a reserved route and dead-lettered directly (never retried; dropped when
+            # no DLQ is configured). The route carries what ``publish_settle`` needs to wrap the DLQ
+            # body like the Go reference (``dead_letter.reason == "poison"``, the original key); a
+            # restore to the queue the record was read from (``redrive``) stays byte for byte.
+            _logger.warning("Kafka record on %r is poison (%s); dead-lettering it.", queue, cause)
+            base = NON_UTF8_ROUTE if non_utf8 else POISON_ROUTE
             received = ReceivedMessage(
                 body=payload,
                 queue=queue,
                 handle=message,
-                route_urn=NON_NUMERIC_ATTEMPTS_ROUTE,
+                route_urn=PoisonRoute(
+                    base,
+                    queue,
+                    self._header_value(headers, "bq-original-topic") or queue,
+                    self._header_attempts(headers),
+                    cause,
+                ),
                 key=self._key(message),
             )
             self._pending.setdefault(queue, []).append(message)
             return received
-        body = self._reconcile(payload, headers)
         received = ReceivedMessage(body=body, queue=queue, handle=message, key=self._key(message))
-        # Track the record as in flight only once ``pop`` has built it. A decode error above
-        # escapes before this point and must not leave the record pending: the next ``pop`` would
-        # seek back to it and fail identically, wedging the partition forever.
+        # Track the record as in flight only once ``pop`` has built it. Any decode error above is
+        # routed as poison instead of escaping: an escape would leave the record uncommitted, so the
+        # next ``pop`` would seek back to it and fail identically, wedging the partition forever.
         self._pending.setdefault(queue, []).append(message)
         return received
 

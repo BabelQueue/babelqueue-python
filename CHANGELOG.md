@@ -9,6 +9,49 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Changed
+- **Kafka: a poison record is dead-lettered wrapped (`dead_letter.reason: "poison"`), like the Go
+  reference (§6.5, ADR-0009).** A value that is not valid UTF-8, not valid JSON, not a JSON object, or has
+  a member of the wrong type (the exact set is listed in the next entry) used to reach `<topic>.dlq` as its raw
+  bytes. It is now written as a body that keeps its keys when it is exactly one JSON object, otherwise
+  `{"raw": "<body>"}` (bytes that are not UTF-8 are stored with U+FFFD substitutions), plus a
+  `dead_letter` block (`reason: "poison"`, `original_queue`, `attempts` from the `bq-attempts` header, `lang`);
+  the record key is preserved. A poison record is still never retried and is dropped when no DLQ is
+  configured (the `on_unknown_urn` strategy, `DELETE` included, no longer matters: see below). The version-gate rejection (`bq-schema-version`, §6.7) still
+  dead-letters its record raw. The wrap is applied when the runtime writes the DLQ record (not when the
+  record is read), so a poison record that `redrive` restores into the DLQ it popped it from stays byte
+  for byte, whatever that DLQ is named. `original_queue` is the `bq-original-topic` header when present
+  (else the consumed topic), like the Java, .NET and Node consumers; a body whose numbers cannot be
+  written back as valid JSON (e.g. `1e400`) is carried as `{"raw": ...}` instead of producing an invalid DLQ body.
+  A body that decodes but names no URN is not poison (unknown-URN path, as before). Consumers of the DLQ
+  that expected the raw bytes of a malformed record must now read the wrapped body.
+- **Kafka: the poison trigger set now equals what the Go reference's typed `Decode` rejects.** Behaviour
+  change; the old Python-only rules (a lenient `attempts` read, `Accepts`-style conformance checks) are gone.
+  A record is poison when it is not valid UTF-8, not valid JSON (an empty or whitespace-only body, a BOM,
+  trailing data, leading zeros, `NaN` / `Infinity`, single quotes), or not a JSON object (a bare `null` is
+  not poison: it is an empty envelope and takes the unknown-URN path), or when a member has the wrong type:
+  `job`, `trace_id`, `meta.id|queue|lang` and `dead_letter.reason|error|exception|original_queue|lang`
+  must be a string or null; `meta.schema_version`, `meta.created_at`, `attempts` and
+  `dead_letter.failed_at|attempts` must be an int64 integer literal or null (a string such as `"3"` or
+  `"2026"`, a fraction or exponent such as `3.0` / `1e2`, a bool, an array and an object are poison);
+  `data`, `meta` and `dead_letter` must be an object or null; every number inside `data` must be a finite
+  double. Member names are matched exactly as spelled (case-sensitive, as the contract schema and the core decoder read them; a `JOB` or `Meta` member is an unknown member, not a typed one) and every duplicate key is checked. A record Go decodes
+  is no longer poison, even when it is not a conformant envelope: a non-string `urn` alias, an absent
+  `data`, `"attempts": null` (read as 0 and written back as 0) and `meta.schema_version: 2` are routed by URN
+  like any other record (Go's consume path never calls `Accepts`). The Kafka transport no longer
+  delivers records under the shared non-numeric-`attempts` route; they are plain poison now.
+  `redrive` restores a poison-routed record into the DLQ unchanged instead of replaying or re-wrapping it,
+  even when its `job` still reads as a URN. The only Python-specific limit is JSON nested deeper than
+  the interpreter's recursion limit (about 1000 levels, Go allows 10000), which is treated as poison.
+- Known, intentional differences from the Go reference for a poison record: `dead_letter.attempts` is the `bq-attempts` header (Go writes 0) and `original_queue` is the `bq-original-topic` header when present (Go writes the consumed topic); a float literal such as `1.0` / `1e2` is re-formatted when the body is re-encoded. The wire envelope and the `dead_letter` shape are unchanged.
+- **Kafka: any decode failure is poison; the partition is never left to wedge.** Member names are matched case-sensitively, exactly as the core decoder reads them (no `encoding/json`-style folding, no `str.casefold()`); the Go reference's case-insensitive read is a known difference that contradicts the contract schema and is tightened separately. Whatever `EnvelopeCodec.decode` raises after the shape scan (e.g. `RecursionError` at the interpreter's limit) is now routed as poison instead of escaping `pop` (which left the offset uncommitted and the partition redelivered forever); the poison wrapper falls back to `{"raw": ...}` on `RecursionError` or a body that cannot be written as UTF-8. A lone surrogate escape (`"\ud800"`) that survives into a retry/DLQ write is substituted by U+FFFD, as Go does, instead of raising `UnicodeEncodeError`. Invalid UTF-8 remains poison (Go substitutes U+FFFD and accepts it). The wire envelope and the `dead_letter` shape are unchanged.
+- **Kafka: a body the core JSON parser refuses is poison, not an empty envelope.** The core decoder turns a `ValueError` from `json.loads` into an empty envelope; where the shape scan accepts a body that plain `json.loads` rejects (Python 3.11+: an unknown member holding an integer of more than 4300 digits), the record would have reached a handler with its content dropped. It is now dead-lettered as poison. No change to the wire envelope or the `dead_letter` shape.
+- **Kafka: a poison record is dead-lettered whatever `on_unknown_urn` is.** The runtime checked the `DELETE` strategy before it recognised a poison record, so with `on_unknown_urn="delete"` a poison record was acknowledged and silently dropped even with a DLQ configured, where the Go reference writes it to `<topic>.dlq` with `dead_letter.reason: "poison"` and commits. A poison delivery (`PoisonRoute`) is now settled before the strategy is consulted: written wrapped to the DLQ and committed under `fail`, `delete`, `dead_letter` and `release`, and dropped only when no DLQ is configured (unchanged). The version-gate path and every other transport keep their behaviour. No change to the wire envelope or the `dead_letter` shape.
+
+### Fixed
+- Kafka: a wrongly-typed `meta` or `meta.created_at` in a wrapped poison body no longer fails the write
+  that settles it (header projection and record timestamp tolerate it).
+
 ## [1.18.0] - 2026-10-11
 
 ### Added

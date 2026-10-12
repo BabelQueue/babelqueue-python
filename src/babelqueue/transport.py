@@ -50,6 +50,33 @@ class ReceivedMessage:
     key: Optional[bytes] = None
 
 
+class PoisonRoute(str):
+    """The ``route_urn`` a poison record is delivered under (the reserved ``NON_UTF8_ROUTE`` / ``POISON_ROUTE`` of a transport that dead-letters undecodable records, today Kafka). It compares and hashes exactly like the
+    plain route string, so the runtime and ``redrive`` keep recognising the reserved routes, but it
+    also carries what is needed to build the wrapped DLQ body when the record is dead-lettered:
+    the consumed queue, the original queue, the ``bq-attempts`` header value and the failure cause.
+
+    The wrap is applied by :meth:`KafkaTransport.publish_settle`, and only when the record is written
+    to a queue other than the one it was consumed from. That is exactly the runtime's dead-letter
+    write; ``redrive`` restores a poison record to the DLQ it popped it from, which therefore stays
+    byte for byte, whatever that DLQ is named (``dead_letter_queue`` / ``dead_letter_suffix``)."""
+
+    queue: str
+    original_queue: str
+    attempts: int
+    cause: str
+
+    def __new__(
+        cls, route: str, queue: str, original_queue: str, attempts: int, cause: str
+    ) -> "PoisonRoute":
+        obj = super().__new__(cls, route)
+        obj.queue = queue
+        obj.original_queue = original_queue
+        obj.attempts = attempts
+        obj.cause = cause
+        return obj
+
+
 class Transport(ABC):
     """Minimal broker contract: publish a raw body, pop one, acknowledge it."""
 
