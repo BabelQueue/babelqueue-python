@@ -578,10 +578,11 @@ _UNSUPPORTED_SCHEMA_ROUTE_PREFIX = "babelqueue:unsupported-schema-version:"
 
 def _without_forbidden_keys(body: str) -> str:
     """``body`` unchanged, unless it carries a forbidden envelope key (message-envelope.md §10,
-    e.g. from a legacy producer) — then it is re-encoded without it (warned by the codec), so a
+    e.g. from a legacy producer) or a ``urn`` alias — then it is re-encoded without it (warned by the codec), so a
     raw-body re-publish never re-emits a key the decode boundary reported as dropped."""
     parsed = parse_envelope(body)
-    if not parsed or not has_forbidden_keys(parsed):
+    # ``urn`` is not a §10 key but ``encode`` rejects it and ADR-0031 (a)/(c) forbid re-emitting it.
+    if not parsed or not (has_forbidden_keys(parsed) or "urn" in parsed):
         return body
     # ``decode`` (not the raw parse) so the dropped keys — and a top-level ``urn`` alias, folded
     # into ``job`` — are gone before ``encode``, which rejects them (ADR-0031 (c)).

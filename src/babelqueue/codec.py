@@ -78,15 +78,21 @@ def parse_envelope(raw: Any) -> Dict[str, Any]:
 
 
 def has_forbidden_keys(envelope: Mapping[str, Any]) -> bool:
-    """Whether ``envelope`` carries any of the non-canonical keys of message-envelope.md §10."""
+    """Whether ``envelope`` carries any of the non-canonical keys of message-envelope.md §10.
+
+    The top-level ``urn`` alias is NOT included (it is not a §10 key: decode folds it into ``job``),
+    although ``encode`` also rejects it — a caller deciding whether a raw body needs normalising
+    before re-emit must check ``"urn" in envelope`` as well.
+    """
     return _has_forbidden_keys(envelope)
 
 
 def _is_blank(value: Any) -> bool:
-    """Missing, ``None``, empty or only ASCII whitespace (a non-string value is never blank)."""
-    if value is None:
-        return True
-    return isinstance(value, str) and value.strip(_ASCII_WHITESPACE) == ""
+    """Missing, ``None``, empty or only ASCII whitespace; a falsy non-string (``0``, ``false``,
+    ``[]``, ``{}``) is blank too, as in ``job or urn``. A truthy non-string is not blank."""
+    if isinstance(value, str):
+        return value.strip(_ASCII_WHITESPACE) == ""
+    return not value
 
 
 def _warn_dropped(pointer: str) -> None:
@@ -165,20 +171,21 @@ class EnvelopeCodec:
                     )
                 extra[key] = value
 
-        envelope = {
+        meta_block: Dict[str, Any] = {
+            "id": str(uuid.uuid4()),
+            "queue": queue,
+            "lang": SOURCE_LANG,
+            "schema_version": SCHEMA_VERSION,
+            "created_at": int(time.time() * 1000),
+        }
+        meta_block.update(extra)
+        envelope: Dict[str, Any] = {
             "job": urn,
             "trace_id": trace_id,
             "data": dict(data),
-            "meta": {
-                "id": str(uuid.uuid4()),
-                "queue": queue,
-                "lang": SOURCE_LANG,
-                "schema_version": SCHEMA_VERSION,
-                "created_at": int(time.time() * 1000),
-            },
+            "meta": meta_block,
             "attempts": 0,
         }
-        envelope["meta"].update(extra)
         return envelope
 
     @staticmethod
@@ -248,10 +255,10 @@ class EnvelopeCodec:
         A blank ``job`` (missing, empty or only ASCII whitespace) falls back to ``urn``.
         """
         job = envelope.get("job")
-        if not _is_blank(job):
-            return str(job)
+        if isinstance(job, str) and not _is_blank(job):
+            return job
         alias = envelope.get("urn")
-        return "" if _is_blank(alias) else str(alias)
+        return alias if isinstance(alias, str) and not _is_blank(alias) else ""
 
     @staticmethod
     def accepts(envelope: Mapping[str, Any]) -> bool:

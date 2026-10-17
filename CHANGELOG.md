@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**) — see the contract at [babelqueue.com](https://babelqueue.com).
 
-## [1.20.0] - 2026-10-17
+## [Unreleased]
 
 Conformance suite 1.4.0, [ADR-0031](https://babelqueue.com). The envelope is unchanged
 (`schema_version: 1`); this is a MINOR with one deliberate behaviour change (encode rejects).
@@ -33,6 +33,7 @@ Conformance suite 1.4.0, [ADR-0031](https://babelqueue.com). The envelope is unc
   envelope is safe. Code that built an envelope from a raw legacy body and relied on encode to clean it
   must decode it first (`EnvelopeCodec.encode(EnvelopeCodec.decode(raw))`).
 - `test_all_five_contract_keys_are_covered` is a subset check (the suite adds `/urn` cases).
+- Docs only: the note in the previous release that the Go reference's case-insensitive envelope-key read "is tightened separately" is now closed — Go core 1.14.0 reads envelope keys exactly (case-sensitive, last duplicate wins), so every SDK now decides poison on the same exact-case keys.
 
 ### Fixed
 - Raw-body re-encode paths now decode before they encode, so the new `encode` rejection cannot strand a
@@ -40,12 +41,6 @@ Conformance suite 1.4.0, [ADR-0031](https://babelqueue.com). The envelope is unc
   reconciliation (Kafka, Azure Service Bus and Artemis already decoded first). A body with a legacy
   `timestamp` or only a `urn` alias is re-emitted normalised (forbidden key dropped and warned, `urn`
   folded into `job`); unknown top-level and `meta` keys, including `meta.ext`, are preserved.
-
-## [Unreleased]
-
-### Changed
-
-- Docs only: the note in the previous release that the Go reference's case-insensitive envelope-key read "is tightened separately" is now closed — Go core 1.14.0 reads envelope keys exactly (case-sensitive, last duplicate wins), so every SDK now decides poison on the same exact-case keys.
 
 ## [1.19.0] - 2026-10-12
 

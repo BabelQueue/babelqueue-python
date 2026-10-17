@@ -141,13 +141,27 @@ class RuntimeRawReleaseTest(unittest.TestCase):
         self.assertEqual(out["meta"]["ext"], {"acme": {"tenant": "t1"}})
         self.assertEqual(out["meta"]["x_unknown_meta"], "kept")
 
-    def test_urn_only_body_is_released_without_raising(self) -> None:
+    def test_urn_only_body_is_released_with_urn_folded_into_job(self) -> None:
         def mutate(r: Dict[str, Any]) -> None:
             r["urn"] = r.pop("job")
 
         raw = self._unknown(mutate)
-        released = self._release(raw)
-        self.assertEqual(released, raw)  # no forbidden key -> verbatim
+        out = json.loads(self._release(raw) or "")
+        self.assertEqual(out["job"], "urn:babel:nobody:listens")
+        self.assertNotIn("urn", out)
+        self.assertEqual(out["x_unknown_top"], {"k": [1, 2]})
+        self.assertEqual(out["meta"]["x_unknown_meta"], "kept")
+
+    def test_job_plus_urn_body_is_released_without_urn_and_keeps_job(self) -> None:
+        def mutate(r: Dict[str, Any]) -> None:
+            r["urn"] = "urn:babel:other:alias"
+
+        raw = self._unknown(mutate)
+        with self.assertLogs("babelqueue.codec", level="WARNING"):
+            out = json.loads(self._release(raw) or "")
+        self.assertEqual(out["job"], "urn:babel:nobody:listens")
+        self.assertNotIn("urn", out)
+        self.assertEqual(out["x_unknown_top"], {"k": [1, 2]})
 
     def test_timestamp_plus_urn_only_body_folds_urn_into_job(self) -> None:
         def mutate(r: Dict[str, Any]) -> None:

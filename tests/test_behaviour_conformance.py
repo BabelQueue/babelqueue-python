@@ -419,6 +419,27 @@ class BlankJobTest(unittest.TestCase):
         self.assertFalse(EnvelopeCodec.accepts(env))
         self.assertEqual("", EnvelopeCodec.urn(env))
 
+    def test_falsy_non_string_job_is_never_a_urn(self) -> None:
+        for bad in (False, 0, [], {}, 1, True, ["urn:acme:a"]):
+            with self.subTest(job=repr(bad)):
+                self.assertEqual("", EnvelopeCodec.urn({"job": bad}))
+                env = EnvelopeCodec.make("urn:acme:a", {"n": 1}, queue="q", trace_id="t-1")
+                env["job"] = bad
+                self.assertFalse(EnvelopeCodec.accepts(env))
+
+    def test_falsy_non_string_job_falls_back_to_a_string_urn_alias(self) -> None:
+        for bad in (False, 0, [], {}):
+            with self.subTest(job=repr(bad)):
+                self.assertEqual("urn:acme:b", EnvelopeCodec.urn({"job": bad, "urn": "urn:acme:b"}))
+                env = EnvelopeCodec.decode(self._raw(job=bad, urn="urn:acme:b"))
+                self.assertEqual("urn:acme:b", env["job"])
+                self.assertTrue(EnvelopeCodec.accepts(env))
+
+    def test_non_string_urn_alias_is_never_a_urn(self) -> None:
+        for bad in (1, True, ["urn:acme:b"], {"k": 1}):
+            with self.subTest(urn=repr(bad)):
+                self.assertEqual("", EnvelopeCodec.urn({"urn": bad}))
+
     def test_reencode_of_a_decoded_envelope_never_raises(self) -> None:
         env = EnvelopeCodec.decode(self._raw(job="urn:acme:a", urn="urn:acme:b", timestamp=1))
         EnvelopeCodec.encode(env)
