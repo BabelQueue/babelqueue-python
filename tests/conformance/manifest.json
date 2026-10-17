@@ -477,7 +477,7 @@
     ]
   },
   "roundtrip": {
-    "description": "Forward-compatible re-emit (message-envelope.md §4/§8: consumers MUST ignore unknown keys; GR-5). Each case is a decode -> attempts+1 -> encode chain, i.e. what every SDK does on retry/redrive/relay. Decode `file` with the SDK core (it MUST be accepted), increment `attempts` by one, re-encode, then parse the output JSON and assert: `attempts` == `expect_attempts`, and for every entry of `expect_preserved` the value at that RFC 6901 JSON pointer is deep-equal to the given value (same JSON type — an object is never an array). Unknown keys MUST NOT be dropped, renamed or retyped. Key order and whitespace are NOT asserted. `producer_schema_valid: false` marks a consumer-tolerance fixture that intentionally does not pass the producer JSON Schema (like urn-alias); the SDK MUST still accept and re-emit it.",
+    "description": "Forward-compatible re-emit (message-envelope.md §4/§8: consumers MUST ignore unknown keys; GR-5). Each case is a decode -> attempts+1 -> encode chain, i.e. what every SDK does on retry/redrive/relay. Decode `file` with the SDK core (it MUST be accepted), increment `attempts` by one, re-encode, then parse the output JSON and assert: `attempts` == `expect_attempts`, and for every entry of `expect_preserved` the value at that RFC 6901 JSON pointer is deep-equal to the given value (same JSON type — an object is never an array). Unknown keys MUST NOT be dropped, renamed or retyped. Key order and whitespace are NOT asserted. `producer_schema_valid: false` marks a consumer-tolerance fixture that intentionally does not pass the producer JSON Schema (like urn-alias); the SDK MUST still accept and re-emit it. Optional `expect_absent_after_reencode` (conformance 1.4.0, ADR-0031): a list of RFC 6901 pointers, none of which may exist in the re-encoded output (evaluated on the same re-encoded document as `expect_preserved`); a case without the field behaves as before, and a runner that does not know the field ignores it. A case that resolves the URN from `urn` (a missing or blank `job`) expects no warning, because `urn` is then the source of the identity, not a dropped forbidden key.",
     "cases": [
       {
         "name": "unknown-meta-roundtrip",
@@ -537,6 +537,43 @@
           "/Data": { "order_id": 7 },
           "/meta/Queue": "shadow"
         }
+      },
+      {
+        "name": "meta-ext-vendor-roundtrip",
+        "file": "fixtures/meta-ext-vendor-roundtrip.json",
+        "description": "A vendor extension block under meta.ext.<vendor> (ADR-0031 (d)) with nested objects and arrays, for two vendors, survives decode -> attempts+1 -> encode unchanged, key for key.",
+        "expect_attempts": 1,
+        "expect_preserved": {
+          "/job": "urn:acme:a",
+          "/meta/ext/acme": { "tier": "gold", "flags": [1, 2], "limits": { "burst": 10 } },
+          "/meta/ext/globex": { "region": "eu-west-1" },
+          "/meta/lang": "php"
+        }
+      },
+      {
+        "name": "urn-only-roundtrip",
+        "file": "fixtures/urn-only-roundtrip.json",
+        "description": "ADR-0031 (c): an envelope with `urn` and no `job` is accepted, the URN is read from `urn`, and the re-emit carries it as `job` with no `urn` key. No warning is expected (`urn` is the source of the identity). producer_schema_valid is false because the producer schema requires `job`.",
+        "producer_schema_valid": false,
+        "expect_attempts": 1,
+        "expect_preserved": {
+          "/job": "urn:acme:b"
+        },
+        "expect_absent_after_reencode": [
+          "/urn"
+        ]
+      },
+      {
+        "name": "blank-ascii-job-urn-fallback",
+        "file": "fixtures/blank-ascii-job-urn-fallback.json",
+        "description": "ADR-0031 (c), user decision 2026-10-17: a `job` that is empty or only ASCII whitespace (space, \\t, \\n, \\v, \\f, \\r) counts as absent, so the URN falls back to `urn` and the re-emit writes it as `job` with no `urn` key. Fixture `job` is two spaces. No warning is expected. SDKs that do not yet implement ADR-0031 (c) fail this case until their SDK phase lands.",
+        "expect_attempts": 1,
+        "expect_preserved": {
+          "/job": "urn:acme:b"
+        },
+        "expect_absent_after_reencode": [
+          "/urn"
+        ]
       }
     ]
   },
@@ -561,7 +598,7 @@
     ]
   },
   "forbidden_keys": {
-    "description": "Non-canonical keys (message-envelope.md §10). Policy K-15 for R0: decode WARNS, it does not reject (old producers keep working); encode NEVER emits them. For each case: decode `file` — it MUST succeed (`expect: warn`) AND the SDK MUST surface at least one warning (via its logger / warning hook) naming `forbidden_key`. The forbidden key MUST NOT be captured into the unknown-key extras, so re-encoding the decoded message (no other change) MUST NOT contain any pointer in `expect_absent_after_reencode`. All other fields round-trip as usual.",
+    "description": "Non-canonical keys (message-envelope.md §10). Policy K-15 for R0: decode WARNS, it does not reject (old producers keep working); encode NEVER emits them. For each case: decode `file` — it MUST succeed (`expect: warn`) AND the SDK MUST surface at least one warning (via its logger / warning hook) naming `forbidden_key`. The forbidden key MUST NOT be captured into the unknown-key extras, so re-encoding the decoded message (no other change) MUST NOT contain any pointer in `expect_absent_after_reencode`. All other fields round-trip as usual. Policy update (ADR-0031 (c), conformance 1.4.0): the decode warning is a MUST, and encode of a forbidden key is rejected (see `encode_reject`); decode stays lenient. Optional `expect_preserved` (1.4.0): an object {\"<RFC 6901 pointer>\": <value>}; every pointer MUST hold the given value (same JSON type) in the re-encoded document, evaluated at the same moment as `expect_absent_after_reencode`. A case without the field behaves as before, and a runner that does not know the field ignores it. The two `urn` cases below fix the `job`+`urn` rules: `job` wins and `urn` is dropped with a warning naming the `/urn` pointer in the same form the SDK's existing forbidden-key warnings use; `job` is blank only for the closed ASCII whitespace set, so a `job` of U+2003 is NOT blank and does NOT fall back to `urn`. These two fixtures are not `accepts()`-negative: `accepts()` does not check URN syntax, so it stays true (Go's runner does not assert it). SDKs that do not yet implement ADR-0031 (c) fail these cases until their SDK phase lands; the cases are never skipped.",
     "cases": [
       {
         "name": "forbidden-key-timestamp",
@@ -607,6 +644,236 @@
         "expect_absent_after_reencode": [
           "/meta/ts"
         ]
+      },
+      {
+        "name": "forbidden-key-job-and-urn",
+        "file": "fixtures/forbidden-key-job-and-urn.json",
+        "description": "ADR-0031 (c): `job` and `urn` both present. `job` wins, `urn` is dropped from the decoded message with a warning naming /urn, and the re-emit has /job unchanged and no /urn.",
+        "forbidden_key": "/urn",
+        "expect": "warn",
+        "expect_absent_after_reencode": [
+          "/urn"
+        ],
+        "expect_preserved": {
+          "/job": "urn:acme:a"
+        }
+      },
+      {
+        "name": "forbidden-key-job-nonascii-space-and-urn",
+        "file": "fixtures/forbidden-key-job-nonascii-space-and-urn.json",
+        "description": "ADR-0031 (c), negative: `job` is only U+2003 (EM SPACE), which is outside the closed ASCII blank set, so `job` is not blank: it wins, `urn` is dropped with a warning naming /urn, and there is NO fallback to `urn`. Re-emit keeps /job as U+2003 and has no /urn.",
+        "forbidden_key": "/urn",
+        "expect": "warn",
+        "expect_absent_after_reencode": [
+          "/urn"
+        ],
+        "expect_preserved": {
+          "/job": "\u2003"
+        }
+      }
+    ]
+  },
+  "extension_write": {
+    "description": "Producer `meta` write API (ADR-0031 (b); Go WithMeta, Python make(meta=), Node MakeOptions.meta, PHP make(meta:), Java make(urn, data, queue, traceId, Map meta), .NET Make(meta:)). For each case call the SDK's producer API with `urn`, `queue`, `data` and the `meta` entries (one flat meta key per entry; a vendor block is supplied as the whole `ext` value), then run two checks. (1) Encode the message, parse the output JSON and assert every `expect_envelope` pointer (RFC 6901) equals the given value, with JSON type distinction ({} != [], true != 1); the entries sit next to the core meta keys, which stay as the SDK generated them. (2) Re-emit chain: decode that output, increment `attempts` by one, re-encode, parse, and assert every `expect_envelope` pointer again (so extension keys survive a retry/redrive hop) and that /attempts == 1. Per-message fields (meta.id, trace_id, meta.created_at) are not asserted by value. Key order and whitespace are not asserted. A runner that does not know this block skips it.",
+    "cases": [
+      {
+        "name": "flat-scalar-key",
+        "description": "A single flat extension key with a boolean value lands in meta next to the core keys.",
+        "urn": "urn:acme:orders:created",
+        "queue": "orders",
+        "data": { "order_id": 1042 },
+        "meta": { "vendor_flag": true },
+        "expect_envelope": {
+          "/job": "urn:acme:orders:created",
+          "/data": { "order_id": 1042 },
+          "/meta/queue": "orders",
+          "/meta/schema_version": 1,
+          "/meta/vendor_flag": true
+        }
+      },
+      {
+        "name": "vendor-block-under-ext",
+        "description": "The recommended shape (ADR-0031 (d)): a vendor block under meta.ext.<vendor>, with nested objects and arrays, supplied as the whole `ext` value.",
+        "urn": "urn:acme:orders:created",
+        "queue": "orders",
+        "data": { "order_id": 1042 },
+        "meta": { "ext": { "acme": { "tier": "gold", "flags": [1, 2], "limits": { "burst": 10 } } } },
+        "expect_envelope": {
+          "/meta/ext/acme": { "tier": "gold", "flags": [1, 2], "limits": { "burst": 10 } },
+          "/meta/queue": "orders"
+        }
+      },
+      {
+        "name": "two-vendors-in-one-ext",
+        "description": "Two vendor blocks supplied together in one `ext` value both survive; neither overwrites the other.",
+        "urn": "urn:acme:orders:created",
+        "queue": "orders",
+        "data": { "order_id": 1042 },
+        "meta": { "ext": { "acme": { "tier": "gold" }, "globex": { "region": "eu-west-1" } } },
+        "expect_envelope": {
+          "/meta/ext/acme": { "tier": "gold" },
+          "/meta/ext/globex": { "region": "eu-west-1" }
+        }
+      },
+      {
+        "name": "several-flat-keys-mixed-types",
+        "description": "Several flat keys of different JSON types (string, integer, array, empty object) keep name, value and type.",
+        "urn": "urn:acme:orders:created",
+        "queue": "orders",
+        "data": { "order_id": 1042 },
+        "meta": { "vendor_region": "eu-west-1", "vendor_count": 3, "vendor_tags": ["a", "b"], "vendor_ctx": {} },
+        "expect_envelope": {
+          "/meta/vendor_region": "eu-west-1",
+          "/meta/vendor_count": 3,
+          "/meta/vendor_tags": ["a", "b"],
+          "/meta/vendor_ctx": {}
+        }
+      },
+      {
+        "name": "non-ascii-value",
+        "description": "A non-ASCII string value in an extension key round-trips byte-for-byte (UTF-8, no escaping loss).",
+        "urn": "urn:acme:orders:created",
+        "queue": "orders",
+        "data": { "order_id": 1042 },
+        "meta": { "ext": { "acme": { "note": "ğüşiöç \u00e9 \ud83d\ude00" } } },
+        "expect_envelope": {
+          "/meta/ext/acme/note": "ğüşiöç \u00e9 \ud83d\ude00"
+        }
+      }
+    ]
+  },
+  "encode_reject": {
+    "description": "Encode MUST reject (ADR-0031 (b), (c)): an `error` in Go, an exception in every other language; never a silent drop and never a mere warning. Every case has `expect: \"reject\"`. Build the message from `urn`, `queue`, `data` and the optional input fields below, then call the producer/encode path; the call MUST fail, and no envelope JSON may be produced. Input fields: `meta` = entries passed through the producer `meta` write API (object, keys unique); `meta_entries` = the same entries as an ordered list of [key, value] pairs, for a REPEATED key, which a JSON object cannot express (SDKs whose write API takes one map per call, i.e. every SDK except Go, cannot express a repeat and skip those cases); `extras_top` and `extras_meta` = entries the runner places directly into the message's preserved unknown-key container at top level or under meta, by whatever test access the SDK has (in-package access, a constructor taking extras, reflection), standing for extras carried over from an inbound message; this is how top-level `timestamp`/`urn` are exercised, since the write API offers no top-level keys. `offending_key` names the key (RFC 6901 pointer) and is informational: a runner MAY assert that the error message mentions it, it is not required. Core meta keys (id, queue, lang, schema_version, created_at) and the forbidden keys of message-envelope.md §10 are the rejected sets. A runner that does not know this block skips it.",
+    "cases": [
+      {
+        "name": "reject-top-level-timestamp",
+        "description": "Forbidden top-level `timestamp` arriving through preserved top-level extras.",
+        "urn": "urn:acme:orders:created",
+        "queue": "orders",
+        "data": { "order_id": 1042 },
+        "extras_top": { "timestamp": 1749132727 },
+        "offending_key": "/timestamp",
+        "expect": "reject"
+      },
+      {
+        "name": "reject-top-level-urn",
+        "description": "Forbidden top-level `urn` arriving through preserved top-level extras; the message carries `job` already, so `urn` can only be a leftover alias.",
+        "urn": "urn:acme:orders:created",
+        "queue": "orders",
+        "data": { "order_id": 1042 },
+        "extras_top": { "urn": "urn:acme:orders:created" },
+        "offending_key": "/urn",
+        "expect": "reject"
+      },
+      {
+        "name": "reject-meta-max-retries",
+        "description": "Forbidden meta.max_retries passed to the meta write API.",
+        "urn": "urn:acme:orders:created",
+        "queue": "orders",
+        "data": { "order_id": 1042 },
+        "meta": { "max_retries": 3 },
+        "offending_key": "/meta/max_retries",
+        "expect": "reject"
+      },
+      {
+        "name": "reject-meta-attempts",
+        "description": "Forbidden meta.attempts (a draft shadow of top-level `attempts`) passed to the meta write API.",
+        "urn": "urn:acme:orders:created",
+        "queue": "orders",
+        "data": { "order_id": 1042 },
+        "meta": { "attempts": 1 },
+        "offending_key": "/meta/attempts",
+        "expect": "reject"
+      },
+      {
+        "name": "reject-meta-source",
+        "description": "Forbidden meta.source passed to the meta write API.",
+        "urn": "urn:acme:orders:created",
+        "queue": "orders",
+        "data": { "order_id": 1042 },
+        "meta": { "source": "billing" },
+        "offending_key": "/meta/source",
+        "expect": "reject"
+      },
+      {
+        "name": "reject-meta-ts",
+        "description": "Forbidden meta.ts passed to the meta write API.",
+        "urn": "urn:acme:orders:created",
+        "queue": "orders",
+        "data": { "order_id": 1042 },
+        "meta": { "ts": 1749132727 },
+        "offending_key": "/meta/ts",
+        "expect": "reject"
+      },
+      {
+        "name": "reject-forbidden-meta-key-in-extras",
+        "description": "A forbidden meta key arriving through preserved meta extras (not the write API) is rejected too: encode applies to the message being encoded, whatever its origin.",
+        "urn": "urn:acme:orders:created",
+        "queue": "orders",
+        "data": { "order_id": 1042 },
+        "extras_meta": { "max_retries": 3 },
+        "offending_key": "/meta/max_retries",
+        "expect": "reject"
+      },
+      {
+        "name": "reject-core-meta-id",
+        "description": "Collision with core meta key `id`: the core never silently overwrites a core key.",
+        "urn": "urn:acme:orders:created",
+        "queue": "orders",
+        "data": { "order_id": 1042 },
+        "meta": { "id": "00000000-0000-4000-8000-000000000000" },
+        "offending_key": "/meta/id",
+        "expect": "reject"
+      },
+      {
+        "name": "reject-core-meta-queue",
+        "description": "Collision with core meta key `queue`.",
+        "urn": "urn:acme:orders:created",
+        "queue": "orders",
+        "data": { "order_id": 1042 },
+        "meta": { "queue": "shadow" },
+        "offending_key": "/meta/queue",
+        "expect": "reject"
+      },
+      {
+        "name": "reject-core-meta-lang",
+        "description": "Collision with core meta key `lang`.",
+        "urn": "urn:acme:orders:created",
+        "queue": "orders",
+        "data": { "order_id": 1042 },
+        "meta": { "lang": "cobol" },
+        "offending_key": "/meta/lang",
+        "expect": "reject"
+      },
+      {
+        "name": "reject-core-meta-schema-version",
+        "description": "Collision with core meta key `schema_version`.",
+        "urn": "urn:acme:orders:created",
+        "queue": "orders",
+        "data": { "order_id": 1042 },
+        "meta": { "schema_version": 2 },
+        "offending_key": "/meta/schema_version",
+        "expect": "reject"
+      },
+      {
+        "name": "reject-core-meta-created-at",
+        "description": "Collision with core meta key `created_at`.",
+        "urn": "urn:acme:orders:created",
+        "queue": "orders",
+        "data": { "order_id": 1042 },
+        "meta": { "created_at": 0 },
+        "offending_key": "/meta/created_at",
+        "expect": "reject"
+      },
+      {
+        "name": "reject-repeated-key",
+        "description": "The same extension key supplied twice is rejected, not merged and not last-write-wins, so independent libraries that both write the key fail loudly. Expressible only where the write API takes entries one at a time (Go WithMeta); other SDKs skip this case.",
+        "urn": "urn:acme:orders:created",
+        "queue": "orders",
+        "data": { "order_id": 1042 },
+        "meta_entries": [["ext", { "acme": { "tier": "gold" } }], ["ext", { "globex": { "region": "eu-west-1" } }]],
+        "offending_key": "/meta/ext",
+        "expect": "reject"
       }
     ]
   },
