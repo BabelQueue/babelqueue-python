@@ -458,8 +458,9 @@ class BabelQueue:
         self._stop.wait(self._rewind_pause)
 
     def _release_unprocessed(self, received: ReceivedMessage) -> None:
-        """Release a message whose handler never completed (shutdown): unchanged body, no
-        backoff, and the runtime adds no ``attempts`` increment. A broker that counts
+        """Release a message whose handler never completed (shutdown): unchanged body
+        (normalised only if it carries a forbidden key or a ``urn`` alias), no backoff, and the
+        runtime adds no ``attempts`` increment. A broker that counts
         deliveries still counts it: on SQS the release bumps ``ApproximateReceiveCount``, so the
         redelivered envelope reads one more attempt (and a ``RedrivePolicy`` sees it too)."""
         self._release(received, received.body, 0.0)
