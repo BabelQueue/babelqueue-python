@@ -51,6 +51,9 @@ _META = {
     "schema_version": _INTEGER,
     "created_at": _INTEGER,
 }
+#: The core ``meta`` keys of message-envelope.md section 4 (the single copy; the producer ``meta``
+#: write API of the codec rejects a collision with any of them, ADR-0031 (b)).
+CORE_META_KEYS = frozenset(_META)
 _DEAD_LETTER = {
     "reason": _STRING,
     "error": _STRING,

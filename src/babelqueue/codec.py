@@ -16,15 +16,17 @@ import time
 import uuid
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-from .exceptions import BabelQueueError
+from ._envelope_shape import CORE_META_KEYS
+from .exceptions import BabelQueueError, EnvelopeKeyError
 
 SCHEMA_VERSION = 1
 SOURCE_LANG = "python"
 
 #: Non-canonical keys (message-envelope.md §10), as ``(container, key)`` pairs where the
 #: container is ``None`` for the top level or ``"meta"``. Policy K-15: decode WARNS and drops
-#: them (old producers keep working); encode NEVER emits them. Encode currently drops them with
-#: a warning; K-15 (a) / R1-E0 will turn that into a rejection (an error) in a future MINOR.
+#: them (old producers keep working); encode NEVER emits them and REJECTS an envelope that
+#: carries one (ADR-0031 (c)). The top-level ``urn`` alias is not in this table: it is an inbound
+#: alias that decode folds into ``job`` (see :meth:`EnvelopeCodec.decode`), but encode rejects it.
 FORBIDDEN_KEYS: Tuple[Tuple[Optional[str], str], ...] = (
     (None, "timestamp"),
     ("meta", "max_retries"),
@@ -32,6 +34,10 @@ FORBIDDEN_KEYS: Tuple[Tuple[Optional[str], str], ...] = (
     ("meta", "source"),
     ("meta", "ts"),
 )
+
+#: The closed ASCII whitespace set that makes a ``job`` "blank" (cross-SDK parity, GR-5): never a
+#: bare ``str.strip()``, which also strips Unicode spaces such as U+2003.
+_ASCII_WHITESPACE = " \t\n\v\f\r"
 
 #: Logger every forbidden-key warning is reported through (one record per dropped key).
 logger = logging.getLogger("babelqueue.codec")
@@ -52,11 +58,7 @@ def strip_forbidden_keys(envelope: Dict[str, Any]) -> List[str]:
         del target[key]
         pointer = "/" + key if container is None else f"/{container}/{key}"
         dropped.append(pointer)
-        logger.warning(
-            "Dropped forbidden envelope key %s from the envelope "
-            "(non-canonical, message-envelope.md §10).",
-            pointer,
-        )
+        _warn_dropped(pointer)
     return dropped
 
 
@@ -80,6 +82,32 @@ def has_forbidden_keys(envelope: Mapping[str, Any]) -> bool:
     return _has_forbidden_keys(envelope)
 
 
+def _is_blank(value: Any) -> bool:
+    """Missing, ``None``, empty or only ASCII whitespace (a non-string value is never blank)."""
+    if value is None:
+        return True
+    return isinstance(value, str) and value.strip(_ASCII_WHITESPACE) == ""
+
+
+def _warn_dropped(pointer: str) -> None:
+    logger.warning(
+        "Dropped forbidden envelope key %s from the envelope "
+        "(non-canonical, message-envelope.md §10).",
+        pointer,
+    )
+
+
+def _first_encode_violation(envelope: Mapping[str, Any]) -> Optional[str]:
+    """RFC 6901 pointer of the first key encode refuses to write, or ``None``."""
+    for container, key in FORBIDDEN_KEYS:
+        target = envelope if container is None else envelope.get(container)
+        if isinstance(target, Mapping) and key in target:
+            return "/" + key if container is None else f"/{container}/{key}"
+    if "urn" in envelope:
+        return "/urn"
+    return None
+
+
 def _has_forbidden_keys(envelope: Mapping[str, Any]) -> bool:
     for container, key in FORBIDDEN_KEYS:
         target = envelope if container is None else envelope.get(container)
@@ -101,12 +129,18 @@ class EnvelopeCodec:
         *,
         queue: str = "default",
         trace_id: Optional[str] = None,
+        meta: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Build the canonical envelope for a ``(urn, data)`` pair.
 
         ``trace_id`` is reused when given (trace continuation), otherwise a fresh
         UUID is minted. ``attempts`` starts at 0 and is the top-level transport
         counter (kept out of the immutable ``meta`` block).
+
+        ``meta`` (ADR-0031 (b)) adds producer-supplied entries (e.g. ``{"ext": {"acme": 1}}``) to
+        the ``meta`` block next to the core keys. An entry whose key is a core ``meta`` key
+        (``id``, ``queue``, ``lang``, ``schema_version``, ``created_at``) or a forbidden ``meta``
+        key (message-envelope.md §10) raises :class:`~babelqueue.exceptions.EnvelopeKeyError`.
         """
         urn = (urn or "").strip()
         if not urn:
@@ -117,7 +151,21 @@ class EnvelopeCodec:
 
         trace_id = (trace_id or "").strip() or str(uuid.uuid4())
 
-        return {
+        extra: Dict[str, Any] = {}
+        if meta is not None:
+            if not isinstance(meta, Mapping):
+                raise BabelQueueError("The producer meta must be a mapping of string keys to values.")
+            forbidden_meta = {key for container, key in FORBIDDEN_KEYS if container == "meta"}
+            for key, value in meta.items():
+                if key in CORE_META_KEYS or key in forbidden_meta:
+                    raise EnvelopeKeyError(
+                        f"/meta/{key}",
+                        f"The producer meta key /meta/{key} is reserved or forbidden "
+                        "(core meta keys and message-envelope.md §10 keys cannot be set).",
+                    )
+                extra[key] = value
+
+        envelope = {
             "job": urn,
             "trace_id": trace_id,
             "data": dict(data),
@@ -130,6 +178,8 @@ class EnvelopeCodec:
             },
             "attempts": 0,
         }
+        envelope["meta"].update(extra)
+        return envelope
 
     @staticmethod
     def from_message(message: Any, queue: str = "default") -> Dict[str, Any]:
@@ -152,20 +202,20 @@ class EnvelopeCodec:
     def encode(envelope: Mapping[str, Any]) -> str:
         """Encode the envelope as compact UTF-8 JSON (unescaped unicode/slashes).
 
-        Forbidden keys (message-envelope.md §10) are never emitted: if the mapping carries any,
-        they are dropped (with a warning) from a copy — the caller's mapping is not mutated.
-
-        Transitional: K-15 (a) asks encode to *reject* forbidden keys. Dropping is the interim
-        behaviour until R1-E0, when this call will raise instead — do not rely on encode to
-        clean an envelope; strip it yourself (:func:`strip_forbidden_keys`) if you build one
-        from a legacy source.
+        Forbidden keys (message-envelope.md §10) are never emitted: an envelope that carries one
+        (top-level ``timestamp``; ``meta.max_retries`` / ``meta.attempts`` / ``meta.source`` /
+        ``meta.ts``) or the inbound-only top-level ``urn`` alias raises
+        :class:`~babelqueue.exceptions.EnvelopeKeyError` (ADR-0031 (c)) and nothing is written.
+        Envelopes produced by :meth:`decode` are always safe to re-encode: decode already drops
+        those keys. Unknown, non-forbidden keys are kept as-is.
         """
-        if _has_forbidden_keys(envelope):
-            copy = dict(envelope)
-            if isinstance(copy.get("meta"), Mapping):
-                copy["meta"] = dict(copy["meta"])
-            strip_forbidden_keys(copy)
-            envelope = copy
+        pointer = _first_encode_violation(envelope)
+        if pointer is not None:
+            raise EnvelopeKeyError(
+                pointer,
+                f"Refusing to encode the forbidden envelope key {pointer} "
+                "(non-canonical, message-envelope.md §10).",
+            )
         return json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
 
     @staticmethod
@@ -175,15 +225,33 @@ class EnvelopeCodec:
         Unknown keys are kept as-is (forward compatibility). Forbidden keys
         (message-envelope.md §10) are dropped and reported as warnings on :data:`logger`
         (policy K-15: warn, never reject), so re-encoding never re-emits them.
+
+        The ``urn`` alias is folded into ``job`` (ADR-0031 (c)): when ``job`` is missing, empty or
+        only ASCII whitespace, the ``urn`` value becomes ``job`` (silently); when both carry a
+        value, ``job`` wins and ``urn`` is dropped with a warning naming ``/urn``. The decoded
+        envelope never keeps a ``urn`` key.
         """
         decoded = parse_envelope(raw)
         strip_forbidden_keys(decoded)
+        if "urn" in decoded:
+            if _is_blank(decoded.get("job")):
+                decoded["job"] = decoded.pop("urn")
+            else:
+                del decoded["urn"]
+                _warn_dropped("/urn")
         return decoded
 
     @staticmethod
     def urn(envelope: Mapping[str, Any]) -> str:
-        """The message URN: canonical ``job``, with ``urn`` accepted as an alias."""
-        return str(envelope.get("job") or envelope.get("urn") or "")
+        """The message URN: canonical ``job``, with ``urn`` accepted as an alias.
+
+        A blank ``job`` (missing, empty or only ASCII whitespace) falls back to ``urn``.
+        """
+        job = envelope.get("job")
+        if not _is_blank(job):
+            return str(job)
+        alias = envelope.get("urn")
+        return "" if _is_blank(alias) else str(alias)
 
     @staticmethod
     def accepts(envelope: Mapping[str, Any]) -> bool:

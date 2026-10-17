@@ -52,6 +52,29 @@ The envelope is identical to every other SDK's:
 }
 ```
 
+### Extension metadata, forbidden keys and the `urn` alias (1.20.0, ADR-0031)
+
+```python
+# Producer meta: extra keys next to the core meta keys (recommended shape: meta.ext.<vendor>).
+envelope = EnvelopeCodec.make(
+    "urn:babel:orders:created", {"order_id": 1042},
+    queue="orders", meta={"ext": {"acme": {"tier": "gold"}}},
+)
+```
+
+- `meta=` is keyword-only. A key that collides with a core meta key (`id`, `queue`, `lang`,
+  `schema_version`, `created_at`) or with a forbidden key (`max_retries`, `attempts`, `source`, `ts`)
+  raises `EnvelopeKeyError` (a `BabelQueueError`; its `pointer` names the key, e.g. `/meta/ts`).
+- Unknown top-level and `meta` keys of an inbound message survive a decode -> `attempts + 1` -> encode
+  hop (retry, redrive, dead-letter), so a vendor `meta.ext` block is never lost.
+- `EnvelopeCodec.encode` **rejects** an envelope that carries a forbidden key (top-level `timestamp`;
+  `meta.max_retries`, `meta.attempts`, `meta.source`, `meta.ts`) or the inbound-only top-level `urn`
+  alias: it raises `EnvelopeKeyError` instead of dropping the key with a warning. `decode` is unchanged
+  (it still warns and drops), so a decoded envelope can always be re-encoded.
+- `decode` folds `urn` into `job`: a `job` that is missing, empty or only ASCII whitespace (space, `\t`,
+  `\n`, `\v`, `\f`, `\r`) falls back to `urn`; when both carry a value, `job` wins and `urn` is dropped
+  with a warning naming `/urn`. The decoded envelope never keeps a `urn` key.
+
 ### Typed messages (optional)
 
 ```python

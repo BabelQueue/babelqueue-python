@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**) — see the contract at [babelqueue.com](https://babelqueue.com).
 
+## [1.20.0] - 2026-10-17
+
+Conformance suite 1.4.0, [ADR-0031](https://babelqueue.com). The envelope is unchanged
+(`schema_version: 1`); this is a MINOR with one deliberate behaviour change (encode rejects).
+
+### Added
+- `EnvelopeCodec.make(urn, data, *, queue, trace_id, meta=None)`: a producer `meta` write API. The entries
+  land in `meta` next to the core keys (recommended shape `meta.ext.<vendor>`). A collision with a core
+  meta key or a forbidden key raises the new `EnvelopeKeyError` (subclass of `BabelQueueError`, with a
+  `pointer` attribute). `_envelope_shape.CORE_META_KEYS` is the single copy of the core key list.
+- `decode` folds the `urn` alias into `job` (ADR-0031 (c)): a `job` that is missing, empty or only ASCII
+  whitespace (`" \t\n\v\f\r"`; a U+2003 `job` is NOT blank) falls back to `urn` silently; when both carry
+  a value, `job` wins and `urn` is dropped with a warning naming `/urn`. `accepts()` / `urn()` follow the
+  same rule. The decoded envelope never keeps a `urn` key.
+- Tests: the runner now implements the 1.4.0 fields (`expect_preserved` on `forbidden_keys`;
+  `expect_absent_after_reencode`, `apply_dead_letter`, `expect_dead_letter` on `roundtrip`, the latter via
+  `dead_letter.annotate`) plus the `extension_write` and `encode_reject` sections, with a runner
+  self-test proving violations are reported.
+
+### Changed
+- **Behaviour change: `EnvelopeCodec.encode` raises `EnvelopeKeyError`** for an envelope carrying a
+  forbidden key (message-envelope.md section 10) or a top-level `urn`, instead of dropping it with a
+  warning (policy K-15 (a)). Nothing is written. `decode` still warns and drops, so re-encoding a decoded
+  envelope is safe. Code that built an envelope from a raw legacy body and relied on encode to clean it
+  must decode it first (`EnvelopeCodec.encode(EnvelopeCodec.decode(raw))`).
+- `test_all_five_contract_keys_are_covered` is a subset check (the suite adds `/urn` cases).
+
 ## [Unreleased]
 
 ### Changed

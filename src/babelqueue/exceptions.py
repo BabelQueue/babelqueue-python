@@ -7,6 +7,21 @@ class BabelQueueError(Exception):
     """Base for every recoverable BabelQueue error (bad config, empty URN, ...)."""
 
 
+class EnvelopeKeyError(BabelQueueError):
+    """An envelope key the codec refuses to write (ADR-0031 (b), (c)).
+
+    Raised by :meth:`~babelqueue.codec.EnvelopeCodec.make` when the ``meta`` entries collide with a
+    core ``meta`` key (``id``, ``queue``, ``lang``, ``schema_version``, ``created_at``) or carry a
+    forbidden key, and by :meth:`~babelqueue.codec.EnvelopeCodec.encode` when the envelope holds a
+    forbidden key of message-envelope.md section 10 (including the top-level ``urn`` alias).
+    ``pointer`` is the RFC 6901 pointer of the first offending key (e.g. ``"/meta/ts"``).
+    """
+
+    def __init__(self, pointer: str, message: str) -> None:
+        super().__init__(message)
+        self.pointer = pointer
+
+
 class UnknownUrnError(BabelQueueError):
     """A consumed message carries a URN with no mapped handler (strategy "fail")."""
 
