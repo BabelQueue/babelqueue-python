@@ -477,7 +477,7 @@
     ]
   },
   "roundtrip": {
-    "description": "Forward-compatible re-emit (message-envelope.md §4/§8: consumers MUST ignore unknown keys; GR-5). Each case is a decode -> attempts+1 -> encode chain, i.e. what every SDK does on retry/redrive/relay. Decode `file` with the SDK core (it MUST be accepted), increment `attempts` by one, re-encode, then parse the output JSON and assert: `attempts` == `expect_attempts`, and for every entry of `expect_preserved` the value at that RFC 6901 JSON pointer is deep-equal to the given value (same JSON type — an object is never an array). Unknown keys MUST NOT be dropped, renamed or retyped. Key order and whitespace are NOT asserted. `producer_schema_valid: false` marks a consumer-tolerance fixture that intentionally does not pass the producer JSON Schema (like urn-alias); the SDK MUST still accept and re-emit it. Optional `expect_absent_after_reencode` (conformance 1.4.0, ADR-0031): a list of RFC 6901 pointers, none of which may exist in the re-encoded output (evaluated on the same re-encoded document as `expect_preserved`); a case without the field behaves as before, and a runner that does not know the field ignores it. A case that resolves the URN from `urn` (a missing or blank `job`) expects no warning, because `urn` is then the source of the identity, not a dropped forbidden key.",
+    "description": "Forward-compatible re-emit (message-envelope.md §4/§8: consumers MUST ignore unknown keys; GR-5). Each case is a decode -> attempts+1 -> encode chain, i.e. what every SDK does on retry/redrive/relay. Decode `file` with the SDK core (it MUST be accepted), increment `attempts` by one, re-encode, then parse the output JSON and assert: `attempts` == `expect_attempts`, and for every entry of `expect_preserved` the value at that RFC 6901 JSON pointer is deep-equal to the given value (same JSON type — an object is never an array). Unknown keys MUST NOT be dropped, renamed or retyped. Key order and whitespace are NOT asserted. `producer_schema_valid: false` marks a consumer-tolerance fixture that intentionally does not pass the producer JSON Schema (like urn-alias); the SDK MUST still accept and re-emit it. Optional `expect_absent_after_reencode` (conformance 1.4.0, ADR-0031): a list of RFC 6901 pointers, none of which may exist in the re-encoded output (evaluated on the same re-encoded document as `expect_preserved`); a case without the field behaves as before, and a runner that does not know the field ignores it. Optional `apply_dead_letter` (conformance 1.4.0): `{ \"reason\", \"original_queue\" }`. When present, after the attempts+1 step the runner moves the message to the dead-letter queue with the SDK's own DLQ helper (the one the worker uses on retry exhaustion; message-envelope.md section 10b, error-handling.md section 6), `reason` being one of `failed`, `unknown_urn`, `poison`, then parses the dead-letter copy instead of the plain re-encode; every assertion of the case (`expect_attempts`, `expect_preserved`, `expect_absent_after_reencode`) is evaluated on that copy. Fields the helper needs beyond these two (error message, exception type, timestamp) are runner-chosen and not asserted. Optional `expect_dead_letter` (a map of `dead_letter` sub-field to expected value) is evaluated only when `apply_dead_letter` was applied, on that copy: the `dead_letter` object MUST exist and each listed sub-field MUST deep-equal the value. A runner that does not know these fields ignores them and runs the case as a plain roundtrip. Every roundtrip case expects decode to emit no warning (no fixture here carries a forbidden key, and `urn` is the source of the identity, not a dropped key, when `job` is missing or blank).",
     "cases": [
       {
         "name": "unknown-meta-roundtrip",
@@ -549,6 +549,23 @@
           "/meta/ext/globex": { "region": "eu-west-1" },
           "/meta/lang": "php"
         }
+      },
+      {
+        "name": "dead-letter-roundtrip",
+        "file": "fixtures/dead-letter-roundtrip.json",
+        "description": "ADR-0031 / message-envelope.md section 8 rule 7: a DLQ move is a re-emit, so unknown keys survive it. The runner decodes `file`, increments `attempts` (the failed delivery), then moves the message to the dead-letter queue with the SDK's own DLQ helper using `apply_dead_letter` and parses the dead-letter copy. Unknown `meta.*` keys (`vendor_flag`, `ext.acme`), the top-level `extra_top` and the identity keys come back unchanged, and the `dead_letter` block carries the requested `reason` and `original_queue`. Other `dead_letter` fields (`error`, `exception`, `failed_at`, `attempts`, `lang`) are chosen by the SDK and not asserted. A runner that does not know `apply_dead_letter` runs this as a plain decode -> attempts+1 -> encode chain, which also passes.",
+        "apply_dead_letter": { "reason": "failed", "original_queue": "orders" },
+        "expect_attempts": 3,
+        "expect_preserved": {
+          "/job": "urn:acme:a",
+          "/trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+          "/meta/id": "f1e2d3c4-b5a6-4789-90ab-cdef01234567",
+          "/meta/vendor_flag": true,
+          "/meta/ext/acme": { "tier": "gold", "flags": [1, 2] },
+          "/extra_top": 1,
+          "/data": { "order_id": 1042 }
+        },
+        "expect_dead_letter": { "reason": "failed", "original_queue": "orders" }
       },
       {
         "name": "urn-only-roundtrip",
@@ -731,7 +748,7 @@
       },
       {
         "name": "non-ascii-value",
-        "description": "A non-ASCII string value in an extension key round-trips byte-for-byte (UTF-8, no escaping loss).",
+        "description": "A non-ASCII string value in an extension key is value-equal after parse (UTF-8; a runner compares the parsed value, so `\\uXXXX` escaping of the output is accepted).",
         "urn": "urn:acme:orders:created",
         "queue": "orders",
         "data": { "order_id": 1042 },
