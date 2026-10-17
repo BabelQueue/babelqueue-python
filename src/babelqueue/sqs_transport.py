@@ -213,8 +213,11 @@ class SqsTransport(Transport):
         native = rc - 1
         if native <= int(env.get("attempts", 0)):
             return body
-        env["attempts"] = native
-        return EnvelopeCodec.encode(env)
+        # Re-encode from the *decoded* body: ``encode`` rejects forbidden keys / a ``urn`` alias,
+        # which the raw parse above keeps (ADR-0031).
+        reencoded = EnvelopeCodec.decode(body)
+        reencoded["attempts"] = native
+        return EnvelopeCodec.encode(reencoded)
 
     # -- Transport ----------------------------------------------------------
 

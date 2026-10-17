@@ -583,7 +583,9 @@ def _without_forbidden_keys(body: str) -> str:
     parsed = parse_envelope(body)
     if not parsed or not has_forbidden_keys(parsed):
         return body
-    return EnvelopeCodec.encode(parsed)
+    # ``decode`` (not the raw parse) so the dropped keys — and a top-level ``urn`` alias, folded
+    # into ``job`` — are gone before ``encode``, which rejects them (ADR-0031 (c)).
+    return EnvelopeCodec.encode(EnvelopeCodec.decode(body))
 
 
 def _handler_wants_envelope(fn: Handler) -> bool:

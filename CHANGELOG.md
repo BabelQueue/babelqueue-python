@@ -34,6 +34,13 @@ Conformance suite 1.4.0, [ADR-0031](https://babelqueue.com). The envelope is unc
   must decode it first (`EnvelopeCodec.encode(EnvelopeCodec.decode(raw))`).
 - `test_all_five_contract_keys_are_covered` is a subset check (the suite adds `/urn` cases).
 
+### Fixed
+- Raw-body re-encode paths now decode before they encode, so the new `encode` rejection cannot strand a
+  legacy body: the runtime's raw-body RELEASE re-publish (`app.py`), and the SQS and Pulsar attempts
+  reconciliation (Kafka, Azure Service Bus and Artemis already decoded first). A body with a legacy
+  `timestamp` or only a `urn` alias is re-emitted normalised (forbidden key dropped and warned, `urn`
+  folded into `job`); unknown top-level and `meta` keys, including `meta.ext`, are preserved.
+
 ## [Unreleased]
 
 ### Changed

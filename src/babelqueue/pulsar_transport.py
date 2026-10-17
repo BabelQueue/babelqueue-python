@@ -241,7 +241,7 @@ class PulsarTransport(Transport):
 
         * Routing: a non-blank ``bq-job`` property is the URN the app routes on. It is returned
           as ``route_urn`` (set on :attr:`ReceivedMessage.route_urn`); the body's ``job`` /
-          ``urn`` is never rewritten, so the handler, retries and the dead-letter record keep the
+          ``urn`` is never rewritten for routing, so the handler, retries and the dead-letter record keep the
           producer's original body. A body with no URN gets no ``route_urn`` — it stays
           non-conformant and is rejected whatever ``bq-job`` says.
         * Attempts: a valid ``bq-attempts`` property replaces the body's value (the body's is
@@ -282,8 +282,12 @@ class PulsarTransport(Transport):
 
         out = body
         if has_int_attempts and current != attempts:
-            env["attempts"] = attempts
-            out = EnvelopeCodec.encode(env)
+            # Re-encode from the *decoded* body: ``encode`` rejects forbidden keys / a ``urn`` alias,
+            # which the raw parse above keeps (ADR-0031).
+            env["attempts"] = attempts  # the routing-mismatch hook below sees the reconciled value
+            reencoded = EnvelopeCodec.decode(body)
+            reencoded["attempts"] = attempts
+            out = EnvelopeCodec.encode(reencoded)
 
         if route_urn and route_urn != body_urn and on_routing_mismatch is not None:
             if EnvelopeCodec.accepts(env):
