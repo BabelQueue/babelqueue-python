@@ -254,8 +254,9 @@ class PulsarTransport(Transport):
           still rejected by ``EnvelopeCodec.accepts``.
         * ``on_routing_mismatch(property_urn, body_urn, envelope)`` is called when the property
           and the body name different URNs — only for an envelope the consumer accepts and after
-          attempts are reconciled (as in the Java and .NET consumers), so it sees what the
-          handler will get. The hook is optional, separate from any error handling, and any
+          attempts are reconciled (as in the Java and .NET consumers). It receives the raw
+          parsed body, not the decoded envelope the handler gets, so a ``urn`` alias or a
+          forbidden key the decode would drop is still present. The hook is optional, separate from any error handling, and any
           exception it raises is swallowed — it never affects the message flow.
         """
         properties = properties or {}
