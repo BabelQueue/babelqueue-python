@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.20.0] - 2026-10-17
+
 Conformance suite 1.4.0, [ADR-0031](https://babelqueue.com). The envelope is unchanged
 (`schema_version: 1`); this is a MINOR with one deliberate behaviour change (encode rejects).
 
