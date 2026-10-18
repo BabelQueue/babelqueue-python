@@ -25,8 +25,10 @@ class PayloadConformanceTest(unittest.TestCase):
         cases = section["cases"]
         self.assertTrue(cases)
         for case in cases:
-            valid = validate_schema(schema, case["data"]) is None
-            self.assertEqual(case["valid"], valid, f"case {case['name']}")
+            # One subTest per case so a failure is attributable to its case id (results.json).
+            with self.subTest(case=case["name"]):
+                valid = validate_schema(schema, case["data"]) is None
+                self.assertEqual(case["valid"], valid, f"case {case['name']}")
 
 
 if __name__ == "__main__":

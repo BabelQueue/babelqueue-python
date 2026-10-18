@@ -28,7 +28,7 @@ import re
 from typing import Any, Dict, Optional
 from urllib.parse import quote, urlsplit
 
-from .codec import SCHEMA_VERSION, EnvelopeCodec, parse_envelope
+from .codec import ASCII_WHITESPACE, SCHEMA_VERSION, EnvelopeCodec, parse_envelope
 from .transport import ReceivedMessage, Transport, truncate_declared_version
 
 _logger = logging.getLogger("babelqueue.asb")
@@ -36,7 +36,7 @@ _logger = logging.getLogger("babelqueue.asb")
 #: A blank ``bq-schema-version``: empty or only ASCII whitespace (space, \t, \n, \v, \f, \r) — the
 #: same set in every SDK (GR-5). Deliberately not ``str.strip()``, which also strips U+001C-U+001F,
 #: U+0085, U+00A0, U+2028, U+3000 ...
-_BLANK_ASCII_PATTERN = re.compile(r"[ \t\n\x0b\x0c\r]*")
+_BLANK_ASCII_PATTERN = re.compile("[" + re.escape(ASCII_WHITESPACE) + "]*")
 #: Prefix of the reserved ``route_urn`` a version-gated message is delivered under. It is not a
 #: ``urn:babel:`` URN, so no handler can legitimately own it; the runtime dead-letters it
 #: directly (never retried, never decoded; the DLQ record is the incoming raw body). The
@@ -149,7 +149,7 @@ class AsbTransport(Transport):
         if dc <= 1:
             return body
         native = dc - 1
-        env = EnvelopeCodec.decode(body)
+        env = EnvelopeCodec.decode_lenient(body)
         if not env or native <= int(env.get("attempts", 0)):
             return body
         env["attempts"] = native

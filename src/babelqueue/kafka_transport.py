@@ -49,7 +49,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 from . import dead_letter
-from .codec import SCHEMA_VERSION, EnvelopeCodec, parse_envelope
+from .codec import ASCII_WHITESPACE, SCHEMA_VERSION, EnvelopeCodec, parse_envelope
 from ._envelope_shape import envelope_violation
 from .exceptions import BabelQueueError
 from .transport import (
@@ -64,7 +64,7 @@ _logger = logging.getLogger("babelqueue.kafka")
 #: A blank ``bq-schema-version``: empty or only ASCII whitespace (space, \t, \n, \v, \f, \r) — the
 #: same set in every SDK (GR-5). Deliberately not ``str.strip()``, which also strips U+001C-U+001F,
 #: U+0085, U+00A0, U+2028, U+3000 ...
-_BLANK_ASCII_PATTERN = re.compile(r"[ \t\n\x0b\x0c\r]*")
+_BLANK_ASCII_PATTERN = re.compile("[" + re.escape(ASCII_WHITESPACE) + "]*")
 #: Every surrogate code point except U+DC80..U+DCFF (those are ``surrogateescape``d non-UTF-8 bytes).
 _LONE_SURROGATE = re.compile("[\ud800-\udbff\udc00-\udc7f\udd00-\udfff]")
 #: Prefix of the reserved ``route_urn`` a version-gated message is delivered under. It is not a
@@ -224,7 +224,7 @@ class KafkaTransport(Transport):
     def _reconcile(body: str, headers: Any) -> str:
         """Set attempts to the authoritative bq-attempts header (falling back to the body's own
         attempts when the header is absent/unparseable — a non-BabelQueue producer). §6.5."""
-        env = EnvelopeCodec.decode(body)
+        env = EnvelopeCodec.decode_lenient(body)
         if not env:
             return body
         try:

@@ -41,7 +41,7 @@ import re
 from typing import Any, Dict, Optional, Set
 from urllib.parse import parse_qs, quote, urlsplit
 
-from .codec import SCHEMA_VERSION, EnvelopeCodec, parse_envelope
+from .codec import ASCII_WHITESPACE, SCHEMA_VERSION, EnvelopeCodec, parse_envelope
 from .transport import ReceivedMessage, Transport, truncate_declared_version
 
 #: SQS's upper bound for ``ChangeMessageVisibility`` (12 hours).
@@ -52,7 +52,7 @@ logger = logging.getLogger("babelqueue.sqs")
 #: A blank ``bq-schema-version``: empty or only ASCII whitespace (space, \t, \n, \v, \f, \r) — the
 #: same set in every SDK (GR-5). Deliberately not ``str.strip()``, which also strips U+001C-U+001F,
 #: U+0085, U+00A0, U+2028, U+3000 ...
-_BLANK_ASCII_PATTERN = re.compile(r"[ \t\n\x0b\x0c\r]*")
+_BLANK_ASCII_PATTERN = re.compile("[" + re.escape(ASCII_WHITESPACE) + "]*")
 #: Prefix of the reserved ``route_urn`` a version-gated message is delivered under. It is not a
 #: ``urn:babel:`` URN, so no handler can legitimately own it; the runtime dead-letters it
 #: directly (never retried, never decoded; the DLQ record is the incoming raw body). The
@@ -215,7 +215,7 @@ class SqsTransport(Transport):
             return body
         # Re-encode from the *decoded* body: ``encode`` rejects forbidden keys / a ``urn`` alias,
         # which the raw parse above keeps (ADR-0031).
-        reencoded = EnvelopeCodec.decode(body)
+        reencoded = EnvelopeCodec.decode_lenient(body)
         reencoded["attempts"] = native
         return EnvelopeCodec.encode(reencoded)
 

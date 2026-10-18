@@ -1,6 +1,8 @@
 """Runs the behavioural sections of the shared cross-SDK conformance suite
 (``roundtrip``, ``extension_write``, ``encode_reject``, ``data_shape``, ``forbidden_keys``,
-``payload_schema_unicode``).
+``payload_schema_unicode``) and the conformance 1.5.0 sections (``trim``, ``job_type``,
+``traceparent``, ``redis_layout``, ``delay``, ``backoff``) plus the previously unexercised
+``idempotency``, ``redis`` and ``rabbitmq`` blocks.
 
 These sections are mandatory: unlike the optional broker sections, a missing section fails
 the run instead of skipping it. Pointers are RFC 6901 and equality is type-strict and deep
@@ -10,21 +12,37 @@ the run instead of skipping it. Pointers are RFC 6901 and equality is type-stric
 from __future__ import annotations
 
 import contextlib
+import inspect
 import json
 import logging
+import time
 import unittest
+from importlib.util import find_spec
+from unittest import mock
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Mapping, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple
 
-from babelqueue import BabelQueue, EnvelopeCodec
+from test_kafka_transport import FakeConsumer, FakeProducer
+from test_redis_transport import FakeRedis
+from test_sqs_transport import FakeSQS
+
+from babelqueue import BabelQueue, BabelQueueError, EnvelopeCodec
 from babelqueue.dead_letter import annotate
 from babelqueue.exceptions import EnvelopeKeyError
+from babelqueue.idempotency import InMemoryStore
+from babelqueue.idempotency import wrap as idempotency_wrap
+from babelqueue.kafka_transport import KafkaTransport
+from babelqueue.pika_transport import PikaTransport
+from babelqueue.redis_transport import RedisTransport
 from babelqueue.schema import validate_schema
+from babelqueue.sqs_transport import SqsTransport
+from babelqueue.transport import ReceivedMessage
 
 SUITE = Path(__file__).parent / "conformance"
 MANIFEST = json.loads((SUITE / "manifest.json").read_text(encoding="utf-8"))
 
 _MISSING = object()
+_HAS_OTEL = find_spec("opentelemetry.trace") is not None
 
 
 def _pointer(doc: Any, pointer: str) -> Any:
@@ -415,9 +433,64 @@ class BlankJobTest(unittest.TestCase):
         self.assertIn("Dropped forbidden envelope key /urn from the envelope", logs.output[0])
 
     def test_blank_job_without_urn_is_rejected(self) -> None:
-        env = EnvelopeCodec.decode(self._raw(job="  "))
-        self.assertFalse(EnvelopeCodec.accepts(env))
+        # ADR-0032 section 6: neither a valid job nor a valid urn -> decode raises.
+        with self.assertRaises(BabelQueueError):
+            EnvelopeCodec.decode(self._raw(job="  "))
+
+    def test_decode_raises_when_there_is_no_valid_identity(self) -> None:
+        shapes = (
+            {},
+            {"job": None},
+            {"job": 0},
+            {"job": False, "urn": 0},
+            {"job": [], "urn": []},
+            {"job": {}, "urn": {}},
+            {"job": "  ", "urn": "\t\n"},
+            {"job": 7, "urn": ["urn:acme:b"]},
+            {"urn": True},
+        )
+        for fields in shapes:
+            with self.subTest(fields=repr(fields)):
+                with self.assertRaises(BabelQueueError):
+                    EnvelopeCodec.decode(self._raw(**fields))
+
+    def test_decode_still_returns_empty_for_unreadable_input(self) -> None:
+        for raw in ("not-json", "[]", "7", "null", ""):
+            with self.subTest(raw=raw):
+                self.assertEqual({}, EnvelopeCodec.decode(raw))
+
+    def test_decode_lenient_keeps_the_identity_less_envelope_instead_of_raising(self) -> None:
+        env = EnvelopeCodec.decode_lenient(self._raw(job=0))
         self.assertEqual("", EnvelopeCodec.urn(env))
+        self.assertFalse(EnvelopeCodec.accepts(env))
+        self.assertEqual({}, EnvelopeCodec.decode_lenient("not-json"))
+        ok = EnvelopeCodec.decode_lenient(self._raw(job=0, urn="urn:acme:b"))
+        self.assertEqual("urn:acme:b", ok["job"])
+
+    def test_non_string_job_warning_only_claims_a_fallback_when_a_urn_exists(self) -> None:
+        with _captured_warnings() as with_urn:
+            EnvelopeCodec.decode(self._raw(job=0, urn="urn:acme:b"))
+        self.assertEqual(1, len(with_urn))
+        self.assertIn("falling back to urn", with_urn[0])
+        with _captured_warnings() as without_urn:
+            EnvelopeCodec.decode_lenient(self._raw(job=0))
+        self.assertEqual(1, len(without_urn))
+        self.assertNotIn("falling back", without_urn[0])
+        self.assertIn("/job", without_urn[0])
+
+    def test_trim_is_linear_on_a_huge_ascii_whitespace_input(self) -> None:
+        # Regression lock: a regex / char loop with backtracking would blow up here. The bound is
+        # deliberately generous (measured ~3 ms each) so it never flakes on a slow runner.
+        pad = " " * 200_000
+        started = time.perf_counter()
+        env = EnvelopeCodec.make(f"{pad}urn:acme:a{pad}", {"n": 1}, trace_id=f"{pad}t-1{pad}")
+        self.assertEqual("urn:acme:a", env["job"])
+        self.assertEqual("t-1", env["trace_id"])
+        self.assertTrue(EnvelopeCodec.accepts(env))
+        decoded = EnvelopeCodec.decode(self._raw(job=pad, urn="urn:acme:b", trace_id=pad))
+        self.assertEqual("urn:acme:b", decoded["job"])
+        self.assertFalse(EnvelopeCodec.accepts(decoded))
+        self.assertLess(time.perf_counter() - started, 5.0)
 
     def test_falsy_non_string_job_is_never_a_urn(self) -> None:
         for bad in (False, 0, [], {}, 1, True, ["urn:acme:a"]):
@@ -431,7 +504,11 @@ class BlankJobTest(unittest.TestCase):
         for bad in (False, 0, [], {}):
             with self.subTest(job=repr(bad)):
                 self.assertEqual("urn:acme:b", EnvelopeCodec.urn({"job": bad, "urn": "urn:acme:b"}))
-                env = EnvelopeCodec.decode(self._raw(job=bad, urn="urn:acme:b"))
+                # ADR-0032 section 6: the non-string job is ignored AND the decoder warns.
+                with _captured_warnings() as warnings:
+                    env = EnvelopeCodec.decode(self._raw(job=bad, urn="urn:acme:b"))
+                self.assertEqual(1, len(warnings))
+                self.assertIn("/job", warnings[0])
                 self.assertEqual("urn:acme:b", env["job"])
                 self.assertTrue(EnvelopeCodec.accepts(env))
 
@@ -439,6 +516,20 @@ class BlankJobTest(unittest.TestCase):
         for bad in (1, True, ["urn:acme:b"], {"k": 1}):
             with self.subTest(urn=repr(bad)):
                 self.assertEqual("", EnvelopeCodec.urn({"urn": bad}))
+
+    def test_unicode_space_is_not_trimmed_by_make(self) -> None:
+        # ADR-0032 section 5: only the ASCII set is whitespace; U+00A0 / U+2003 / U+3000 stay.
+        for ch in ("\u00a0", "\u2003", "\u3000"):
+            with self.subTest(char=hex(ord(ch))):
+                env = EnvelopeCodec.make(f"{ch}urn:acme:a{ch}", {"n": 1}, trace_id=f"{ch}t-1{ch}")
+                self.assertEqual(f"{ch}urn:acme:a{ch}", env["job"])
+                self.assertEqual(f"{ch}t-1{ch}", env["trace_id"])
+                self.assertTrue(EnvelopeCodec.accepts(env))
+
+    def test_ascii_whitespace_is_trimmed_by_make_but_unicode_next_to_it_is_kept(self) -> None:
+        env = EnvelopeCodec.make(" \t\u00a0urn:acme:a\u3000\n ", {"n": 1}, trace_id=" \vt-1\f")
+        self.assertEqual("\u00a0urn:acme:a\u3000", env["job"])
+        self.assertEqual("t-1", env["trace_id"])
 
     def test_reencode_of_a_decoded_envelope_never_raises(self) -> None:
         env = EnvelopeCodec.decode(self._raw(job="urn:acme:a", urn="urn:acme:b", timestamp=1))
@@ -507,6 +598,668 @@ class PayloadSchemaUnicodeConformanceTest(unittest.TestCase):
                 results.append((case["name"], valid))
                 self.assertEqual(case["valid"], valid, f"case {case['name']}")
         self.assertEqual(len(results), len(section["cases"]))
+
+
+
+# --------------------------------------------------------------------------------------------
+# Case ids, case-level skips and the sections added by conformance 1.5.0 (ADR-0032).
+# --------------------------------------------------------------------------------------------
+
+_NOT_CASES = ("description", "schema")
+
+
+def iter_cases(manifest: Mapping[str, Any], section: str) -> List[Tuple[str, Any]]:
+    """Every ``(case id, case body)`` of a manifest section (ADR-0032 case-id rule).
+
+    A section's ``cases`` array gives one case per element, identified by its ``name`` or else
+    ``<section>#<index>``; a sub-key with its own ``cases`` array gives ``<sub-key>/<name>`` (or
+    ``<sub-key>/<index>``); any other object sub-key is a single case keyed by the sub-key;
+    ``description`` and ``schema`` are never cases. The manifest top-level ``cases`` array is
+    the section named ``cases`` (the value is a plain list there).
+    """
+    value = manifest[section]
+    found: List[Tuple[str, Any]] = []
+    if isinstance(value, list):
+        for index, case in enumerate(value):
+            found.append((str(case.get("name") or f"{section}#{index}"), case))
+        return found
+    cases = value.get("cases")
+    if isinstance(cases, list):
+        for index, case in enumerate(cases):
+            found.append((str(case.get("name") or f"{section}#{index}"), case))
+    for key, sub in value.items():
+        if key in _NOT_CASES or key == "cases" or not isinstance(sub, dict):
+            continue
+        sub_cases = sub.get("cases")
+        if isinstance(sub_cases, list):
+            for index, case in enumerate(sub_cases):
+                found.append((f"{key}/{case.get('name') or index}", case))
+        else:
+            found.append((key, sub))
+    return found
+
+
+KNOWN_GAPS_FILE = Path(__file__).resolve().parents[1] / "conformance-known-gaps.json"
+
+
+def _known_gaps() -> Dict[str, Dict[str, str]]:
+    """Known gaps: ``section -> case id -> reason``, read from ``conformance-known-gaps.json``.
+
+    A known gap is an honest ``fail`` in ``results.json``, never a ``skip``. The case is still
+    RUN: ``_run_cases`` records the real outcome in :data:`GAP_RESULTS` instead of failing the
+    unit test, ``run_section`` reports it from there, and a gap case that now passes is a failing
+    subtest ("stale gap") as well as a ``pass`` the completeness gate
+    (``scripts/check_conformance_results.py``) rejects. A fail is accepted only when listed here.
+    """
+    document = json.loads(KNOWN_GAPS_FILE.read_text(encoding="utf-8"))
+    gaps: Dict[str, Dict[str, str]] = {}
+    for entry in document["gaps"]:
+        gaps.setdefault(entry["section"], {})[entry["case"]] = entry["reason"]
+    return gaps
+
+
+KNOWN_GAPS: Dict[str, Dict[str, str]] = _known_gaps()
+
+#: ``(section, case id) -> None`` when a known-gap case passed, else the observed failure message.
+#: Filled by :func:`_run_cases`; read by ``run_section`` in ``test_conformance.py``.
+GAP_RESULTS: Dict[Tuple[str, str], Optional[str]] = {}
+
+
+def _ensure(condition: bool, message: str) -> None:
+    if not condition:
+        raise AssertionError(message)
+
+
+def _identity(raw: str) -> Tuple[Any, List[str]]:
+    """Decode ``raw`` and return ``(resolved urn or None, decode warnings)``.
+
+    ``None`` means decode raised :class:`BabelQueueError` — ADR-0032 section 6: neither a valid
+    ``job`` nor a valid ``urn``. Nothing else is accepted as "no identity": a decode that returns
+    an identity-less envelope is a failure of the rule, not a pass.
+    """
+    with _captured_warnings() as warnings:
+        try:
+            env = EnvelopeCodec.decode(raw)
+        except BabelQueueError:
+            return None, warnings
+    _ensure(env != {}, "decode of a readable object must not yield an empty envelope")
+    return EnvelopeCodec.urn(env), warnings
+
+
+def _eval_trim(case: Mapping[str, Any]) -> None:
+    mode = case["mode"]
+    if mode == "make":
+        extra = {"trace_id": case["trace_id"]} if "trace_id" in case else {}
+        if case["expect"] == "reject":
+            try:
+                EnvelopeCodec.make(case["urn"], {}, **extra)
+            except BabelQueueError:
+                return
+            raise AssertionError("make must reject a URN that is empty after ASCII trim")
+        env = EnvelopeCodec.make(case["urn"], {}, **extra)
+        for field, expected in case["expect"].items():
+            _ensure(_strict_equal(env[field], expected), f"{field}: {env[field]!r} != {expected!r}")
+    elif mode == "decode":
+        raw = (SUITE / case["file"]).read_text(encoding="utf-8")
+        urn, warnings = _identity(raw)
+        if case["valid"]:
+            _ensure(urn == case["expect"]["urn"], f"urn: {urn!r} != {case['expect']['urn']!r}")
+            _ensure(
+                bool(warnings) == case["expect_warning"],
+                f"warning expected={case['expect_warning']} got={warnings}",
+            )
+        else:
+            _ensure(urn is None, f"no valid identity expected, resolved {urn!r}")
+    elif mode == "accepts":
+        raw = (SUITE / case["file"]).read_text(encoding="utf-8")
+        env = EnvelopeCodec.decode(raw)
+        if case.get("expect_decode_ok"):
+            _ensure(env != {}, "decode must still succeed")
+        verdict = EnvelopeCodec.accepts(env)
+        _ensure(verdict == case["expect_accepts"], f"accepts: {verdict} != {case['expect_accepts']}")
+    elif mode == "reemit":
+        raw = (SUITE / case["file"]).read_text(encoding="utf-8")
+        out = json.loads(_retry_once(raw))
+        _ensure(
+            _strict_equal(out.get("attempts"), case["expect_attempts"]),
+            f"/attempts: {out.get('attempts')!r} != {case['expect_attempts']!r}",
+        )
+        problems = _preserved_violations(out, case["expect_preserved"])
+        _ensure(not problems, "; ".join(problems))
+    else:  # pragma: no cover - guards against a new, unhandled mode
+        raise AssertionError(f"unknown trim mode {mode!r}")
+
+
+def _eval_job_type(case: Mapping[str, Any]) -> None:
+    raw = (SUITE / case["file"]).read_text(encoding="utf-8")
+    urn, warnings = _identity(raw)
+    if case["valid"]:
+        _ensure(urn == case["expect"]["urn"], f"urn: {urn!r} != {case['expect']['urn']!r}")
+        _ensure(
+            bool(warnings) == case["expect_warning"],
+            f"warning expected={case['expect_warning']} got={warnings}",
+        )
+    else:
+        _ensure(urn is None, f"no valid identity expected, resolved {urn!r}")
+
+
+def _eval_traceparent(case: Mapping[str, Any]) -> None:
+    from opentelemetry.trace import get_current_span
+
+    from babelqueue import otel
+    from babelqueue.headers import _headers_scope
+
+    header = case["traceparent"]
+    with _headers_scope({} if header is None else {otel.HEADER_TRACEPARENT: header}):
+        ctx = otel._remote_parent_from_headers()
+    source = "traceparent"
+    if ctx is None:
+        source = "trace_id"
+        ctx = otel._parent_context(case["trace_id"])
+    span_context = get_current_span(ctx).get_span_context()
+    actual: Dict[str, Any] = {
+        "source": source,
+        "trace_id_hex": format(span_context.trace_id, "032x"),
+    }
+    expect = case["expect"]
+    if source == "traceparent":
+        actual["parent_span_id"] = format(span_context.span_id, "016x")
+        actual["flags"] = format(int(span_context.trace_flags), "02x")
+    for field, expected in expect.items():
+        _ensure(actual.get(field) == expected, f"{field}: {actual.get(field)!r} != {expected!r}")
+
+
+class _RecordingRedis(FakeRedis):
+    """FakeRedis that records the KEYS of every Lua script the transport evaluates."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.eval_keys: List[List[str]] = []
+
+    def eval(self, script: Any, numkeys: Any, *args: Any) -> Any:
+        self.eval_keys.append([str(k) for k in args[:numkeys]])
+        return super().eval(script, numkeys, *args)
+
+
+def _eval_redis_layout(case: Mapping[str, Any]) -> None:
+    client = _RecordingRedis()
+    transport = RedisTransport(
+        "redis://x", client=client, laravel_compat=True, key_prefix=case["key_prefix"]
+    )
+    queue = case["queue"]
+    transport.publish(queue, EnvelopeCodec.encode(EnvelopeCodec.make("urn:acme:a", {"n": 1})))
+    message = transport.pop(queue, timeout=0)
+    _ensure(message is not None, "the published job must be reservable")
+    assert message is not None
+    transport.release(message, 30)
+    # publish evals [ready, notify]; pop evals [ready, reserved, notify]; release [delayed, reserved].
+    publish_keys, release_keys = client.eval_keys[0], client.eval_keys[-1]
+    actual = {
+        "ready": publish_keys[0],
+        "notify": publish_keys[1],
+        "delayed": release_keys[0],
+        "reserved": release_keys[1],
+    }
+    for name, expected in case["expect"].items():
+        _ensure(actual[name] == expected, f"{name} key: {actual[name]!r} != {expected!r}")
+
+
+def _eval_release_visibility(case: Mapping[str, Any]) -> None:
+    fake = FakeSQS()
+    transport = SqsTransport("sqs://", client=fake)
+    transport.publish("orders", EnvelopeCodec.encode(EnvelopeCodec.make("urn:acme:a", {"n": 1})))
+    message = transport.pop("orders", timeout=0)
+    _ensure(message is not None, "the published message must be receivable")
+    assert message is not None
+    transport.redeliver(message, message.body, case["delay_seconds"])
+    _ensure(len(fake.visibility_changes) == 1, "release must issue one ChangeMessageVisibility")
+    timeout = fake.visibility_changes[0]["VisibilityTimeout"]
+    expected = case["expect"]["visibility_timeout"]
+    _ensure(timeout == expected, f"VisibilityTimeout: {timeout!r} != {expected!r}")
+
+
+def _eval_idempotency_dedup_key(case: Mapping[str, Any]) -> None:
+    env = json.loads((SUITE / case["envelope_file"]).read_text(encoding="utf-8"))
+    _ensure(
+        env["meta"]["id"] == case["expected_key"], "expected_key must be the fixture's meta.id"
+    )
+    store = InMemoryStore()
+    calls: List[str] = []
+    handler = idempotency_wrap(store, lambda data, meta: calls.append(meta["id"]))
+    handler(env["data"], env["meta"])
+    handler(env["data"], env["meta"])
+    _ensure(calls == [case["expected_key"]], f"handler ran {calls!r}")
+    _ensure(store.seen(case["expected_key"]), "the seen-set must be keyed on meta.id verbatim")
+    _ensure(not store.seen(env["trace_id"]), "trace_id must not be the dedupe key")
+
+
+def _eval_idempotency_sequence(case: Mapping[str, Any]) -> None:
+    store = InMemoryStore()
+    invocations: List[str] = []
+    outcomes: List[str] = []
+
+    def effect(data: Any, meta: Any) -> None:
+        invocations.append(meta["id"])
+        if outcomes.pop(0) == "throw":
+            raise RuntimeError("handler failed")
+
+    handler = idempotency_wrap(store, effect)
+    for index, delivery in enumerate(case["deliveries"]):
+        if delivery.get("forget_before"):
+            store.forget(delivery["meta_id"])
+        before = len(invocations)
+        outcomes.append(delivery.get("outcome", "ok"))
+        try:
+            handler({}, {"id": delivery["meta_id"]})
+        except RuntimeError:
+            pass
+        outcomes.clear()
+        ran = len(invocations) > before
+        _ensure(
+            ran == (delivery["expect_effect"] == "run"),
+            f"delivery {index}: expected {delivery['expect_effect']}, handler ran={ran}",
+        )
+    _ensure(
+        len(invocations) == case["expected_effects"],
+        f"effects: {len(invocations)} != {case['expected_effects']}",
+    )
+
+
+def _eval_redis_payload_identity(case: Mapping[str, Any]) -> None:
+    raw = (SUITE / case["envelope_file"]).read_text(encoding="utf-8")
+    client = _RecordingRedis()
+    transport = RedisTransport("redis://x", client=client)
+    transport.publish("orders", raw)
+    _ensure(client.lists["orders"] == [raw], "the queue element must be the envelope, unwrapped")
+    message = transport.pop("orders", timeout=0)
+    _ensure(message is not None and message.body == raw, "reserve must return identical bytes")
+
+
+class _FakeBasicProperties:
+    def __init__(self, **kwargs: Any) -> None:
+        self.__dict__.update(kwargs)
+
+
+class _FakePika:
+    BasicProperties = _FakeBasicProperties
+
+
+def _eval_rabbitmq_property_projection(case: Mapping[str, Any]) -> None:
+    raw = (SUITE / case["envelope_file"]).read_text(encoding="utf-8")
+    transport = PikaTransport.__new__(PikaTransport)
+    transport._pika = _FakePika()
+    props = transport._properties(raw)
+    for name, expected in case["properties"].items():
+        _ensure(getattr(props, name) == expected, f"{name}: {getattr(props, name)!r} != {expected!r}")
+    for name, expected in case["headers"].items():
+        actual = props.headers.get(name)
+        _ensure(_strict_equal(actual, expected), f"header {name}: {actual!r} != {expected!r}")
+
+
+# -- delay (SQS section 3.4) and backoff (Kafka sections 6.4/6.5) -------------------------------
+# These probe the transports' PUBLIC surface for the features the contract requires:
+#   SqsTransport.publish(queue, body, delay_seconds=N)      -> SendMessage DelaySeconds
+#   KafkaTransport(retry_tiers_ms=[...]).publish_delayed(queue, body, delay_ms)
+#   KafkaTransport.redeliver(message, body, delay_seconds)  -> retry-topic republish
+# None exists yet, so each such case fails with an explicit message and is listed in
+# conformance-known-gaps.json. Whoever implements a feature must use (or update) these call
+# shapes AND delete the gap entries in the same change: a case that passes while still listed is
+# a stale gap and fails both the unit test and the completeness gate.
+
+
+def _eval_sqs_delay(case: Mapping[str, Any]) -> None:
+    fake = FakeSQS()
+    transport = SqsTransport("sqs://", client=fake, fifo=case["queue_type"] == "fifo")
+    body = EnvelopeCodec.encode(EnvelopeCodec.make("urn:acme:a", {"n": 1}))
+    expect = case["expect"]
+    parameters = inspect.signature(transport.publish).parameters
+    accepts_delay = "delay_seconds" in parameters or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+    )
+    _ensure(accepts_delay, "SqsTransport.publish has no delay_seconds path")
+    try:
+        transport.publish("orders", body, delay_seconds=case["delay_seconds"])  # type: ignore[call-arg]
+    except BabelQueueError:
+        _ensure(expect == "reject", "a valid delay must not be rejected")
+        _ensure(not fake.sent, "a rejected delay must not send anything")
+        return
+    _ensure(expect != "reject", f"delay {case['delay_seconds']} must raise BabelQueueError")
+    _ensure(len(fake.sent) == 1, "publish must issue one SendMessage")
+    actual = fake.sent[0].get("DelaySeconds")
+    _ensure(
+        actual == expect["delay_seconds_attribute"],
+        f"DelaySeconds: {actual!r} != {expect['delay_seconds_attribute']!r}",
+    )
+
+
+def _kafka_transport(case: Mapping[str, Any]) -> Tuple[KafkaTransport, FakeProducer]:
+    producer = FakeProducer()
+    transport = KafkaTransport(
+        producer=producer,
+        consumer_factory=lambda _queue: FakeConsumer(),
+        retry_tiers_ms=list(case["retry_tiers_ms"]),
+    )
+    return transport, producer
+
+
+def _check_retry_record(case: Mapping[str, Any], producer: FakeProducer) -> None:
+    expect = case["expect"]
+    _ensure(len(producer.produced) == 1, f"expected one retry-topic record, got {len(producer.produced)}")
+    record = producer.produced[0]
+    index = list(case["retry_tiers_ms"]).index(expect["tier_ms"])
+    # The contract fixes the `<topic>.retry.<n>` shape, not whether <n> counts from 0 or 1.
+    allowed = {f"{case['work_topic']}.retry.{index}", f"{case['work_topic']}.retry.{index + 1}"}
+    _ensure(record["topic"] in allowed, f"retry topic {record['topic']!r} is not the {expect['tier_ms']} ms tier")
+    headers = {
+        key: (value.decode("utf-8") if isinstance(value, bytes) else str(value))
+        for key, value in (record["headers"] or [])
+    }
+    for name, value in expect["headers"].items():
+        _ensure(headers.get(name) == value, f"header {name}: {headers.get(name)!r} != {value!r}")
+
+
+def _eval_kafka_tier(case: Mapping[str, Any]) -> None:
+    transport, producer = _kafka_transport(case)
+    publish_delayed = getattr(transport, "publish_delayed", None)
+    _ensure(publish_delayed is not None, "KafkaTransport has no retry-tier publish path (publish_delayed)")
+    assert publish_delayed is not None
+    body = EnvelopeCodec.encode(EnvelopeCodec.make("urn:acme:a", {"n": 1}))
+    if case["expect"] == "reject":
+        try:
+            publish_delayed(case["work_topic"], body, case["delay_ms"])
+        except BabelQueueError:
+            _ensure(not producer.produced, "a rejected delay must not produce a record")
+            return
+        raise AssertionError(f"delay {case['delay_ms']} ms must raise BabelQueueError")
+    publish_delayed(case["work_topic"], body, case["delay_ms"])
+    _check_retry_record(case, producer)
+
+
+def _eval_kafka_retry_republish(case: Mapping[str, Any]) -> None:
+    transport, producer = _kafka_transport(case)
+    redeliver = getattr(transport, "redeliver", None)
+    _ensure(redeliver is not None, "KafkaTransport has no tiered release path (redeliver)")
+    assert redeliver is not None
+    envelope = EnvelopeCodec.make("urn:acme:a", {"n": 1})
+    envelope["attempts"] = case["attempts"]
+    message = ReceivedMessage(body=EnvelopeCodec.encode(envelope), queue=case["work_topic"])
+    # `Redeliverer.redeliver` receives the envelope the runtime would republish, `attempts`
+    # already advanced (App._retry_or_dead_letter); the transport must not advance it again.
+    envelope["attempts"] = case["attempts"] + 1
+    body = EnvelopeCodec.encode(envelope)
+    delay_seconds = case["release_delay_ms"] / 1000
+    if case["expect"] == "reject":
+        try:
+            redeliver(message, body, delay_seconds)
+        except BabelQueueError:
+            _ensure(not producer.produced, "a rejected release must not produce a record")
+            return
+        raise AssertionError("a release with no retry tiers must raise BabelQueueError")
+    redeliver(message, body, delay_seconds)
+    _check_retry_record(case, producer)
+    sent = json.loads(producer.produced[0]["value"])
+    _ensure(
+        sent["attempts"] == case["expect"]["body_attempts"],
+        f"body attempts: {sent['attempts']!r} != {case['expect']['body_attempts']!r}",
+    )
+
+
+def _eval_delay(case: Mapping[str, Any]) -> None:
+    # Cases carrying `queue_type` are the section 3.4 publish-delay cases; the rest are releases.
+    (_eval_sqs_delay if "queue_type" in case else _eval_release_visibility)(case)
+
+
+def _eval_backoff(case: Mapping[str, Any]) -> None:
+    (_eval_kafka_retry_republish if "release_delay_ms" in case else _eval_kafka_tier)(case)
+
+
+def _run_cases(
+    test: unittest.TestCase,
+    section: str,
+    evaluate: Callable[[Mapping[str, Any]], None],
+    *,
+    select: Callable[[str], bool] = lambda case_id: True,
+) -> None:
+    """One ``subTest(case=<id>)`` per case id of ``section``.
+
+    A known-gap case is run like any other; its real outcome goes to :data:`GAP_RESULTS` and a
+    assertion failure does not fail the test (it is an accepted, documented gap; any other
+    exception is an evaluator or implementation bug and propagates). A known-gap case that
+    PASSES is a stale gap and fails its subtest.
+    """
+    ran = 0
+    gaps = KNOWN_GAPS.get(section, {})
+    for case_id, case in iter_cases(MANIFEST, section):
+        if not select(case_id):
+            continue
+        ran += 1
+        if case_id not in gaps:
+            with test.subTest(case=case_id):
+                evaluate(case)
+            continue
+        try:
+            evaluate(case)
+        except AssertionError as exc:  # only an assertion is the expected outcome; bugs propagate
+            GAP_RESULTS[(section, case_id)] = f"{type(exc).__name__}: {exc}"
+        else:
+            GAP_RESULTS[(section, case_id)] = None
+            with test.subTest(case=case_id):
+                test.fail(f"stale gap: {section}/{case_id} passes; remove it from {KNOWN_GAPS_FILE.name}")
+    test.assertGreater(ran, 0, f"conformance section {section!r} ran no case")
+
+
+class TrimConformanceTest(unittest.TestCase):
+    def test_trim_cases(self) -> None:
+        _run_cases(self, "trim", _eval_trim)
+
+    def test_every_mode_is_covered(self) -> None:
+        modes = {case["mode"] for _, case in iter_cases(MANIFEST, "trim")}
+        self.assertEqual({"make", "decode", "accepts", "reemit"}, modes)
+
+
+class JobTypeConformanceTest(unittest.TestCase):
+    def test_job_type_cases(self) -> None:
+        _run_cases(self, "job_type", _eval_job_type)
+
+    def test_a_non_string_job_is_warned_about_and_a_blank_one_is_not(self) -> None:
+        by_name = {case_id: case for case_id, case in iter_cases(MANIFEST, "job_type")}
+        self.assertTrue(by_name["null-job-ignored-falls-back-to-urn"]["expect_warning"])
+        self.assertFalse(by_name["empty-string-job-falls-back-without-warning"]["expect_warning"])
+
+
+class RunnerCaseIdTest(unittest.TestCase):
+    def test_case_id_counts_match_the_manifest(self) -> None:
+        expected = {"trim": 35, "job_type": 11, "traceparent": 14, "delay": 9, "backoff": 10,
+                    "redis_layout": 3, "idempotency": 7, "redis": 1, "rabbitmq": 1}
+        for section, count in expected.items():
+            with self.subTest(section=section):
+                self.assertEqual(count, len(iter_cases(MANIFEST, section)))
+
+    def test_known_gaps_name_only_real_case_ids_with_a_reason(self) -> None:
+        for section, gaps in KNOWN_GAPS.items():
+            self.assertIn(section, MANIFEST["sections"])
+            ids = {case_id for case_id, _ in iter_cases(MANIFEST, section)}
+            for case_id, reason in gaps.items():
+                with self.subTest(section=section, case=case_id):
+                    self.assertIn(case_id, ids)
+                    self.assertRegex(reason, r"section[s]? \d")
+                    self.assertIn("r1 follow-up plan", reason)
+
+    def test_known_gap_entries_are_unique(self) -> None:
+        document = json.loads(KNOWN_GAPS_FILE.read_text(encoding="utf-8"))
+        keys = [(entry["section"], entry["case"]) for entry in document["gaps"]]
+        self.assertEqual(len(keys), len(set(keys)))
+        self.assertEqual(sum(len(c) for c in KNOWN_GAPS.values()), len(keys))
+
+    def test_release_visibility_and_wire_cases_are_never_known_gaps(self) -> None:
+        # Only the unimplemented features are gaps; the release-visibility cases are implemented.
+        gaps = KNOWN_GAPS["delay"]
+        for case_id, _ in iter_cases(MANIFEST, "delay"):
+            if case_id.startswith("release_visibility/"):
+                self.assertNotIn(case_id, gaps)
+
+
+@unittest.skipUnless(_HAS_OTEL, "the traceparent section needs the opentelemetry-api package")
+class TraceparentConformanceTest(unittest.TestCase):
+    def test_traceparent_cases(self) -> None:
+        _run_cases(self, "traceparent", _eval_traceparent)
+
+
+class RedisLayoutConformanceTest(unittest.TestCase):
+    def test_redis_layout_cases(self) -> None:
+        _run_cases(self, "redis_layout", _eval_redis_layout)
+
+
+class DelayConformanceTest(unittest.TestCase):
+    def test_delay_cases(self) -> None:
+        _run_cases(self, "delay", _eval_delay)
+
+
+class BackoffConformanceTest(unittest.TestCase):
+    def test_backoff_cases(self) -> None:
+        _run_cases(self, "backoff", _eval_backoff)
+
+
+class GapMechanismTest(unittest.TestCase):
+    """The known-gap bookkeeping itself: gaps are run, failures recorded, passes are stale."""
+
+    def _probe(self, outcome: Callable[[], None]) -> Tuple[unittest.TestResult, Optional[str]]:
+        case_id, gap_case = iter_cases(MANIFEST, "trim")[0]
+
+        def evaluate(case: Mapping[str, Any]) -> None:
+            if case is gap_case:
+                outcome()
+
+        class Probe(unittest.TestCase):
+            def runTest(self) -> None:  # noqa: N802 - unittest hook
+                _run_cases(self, "trim", evaluate)
+
+        result = unittest.TestResult()
+        with mock.patch.dict(KNOWN_GAPS, {"trim": {case_id: "r"}}), mock.patch.dict(GAP_RESULTS):
+            Probe().run(result)
+            recorded = GAP_RESULTS.get(("trim", case_id), "<not run>")
+        return result, recorded
+
+    def test_a_failing_gap_case_is_recorded_and_does_not_fail_the_test(self) -> None:
+        def outcome() -> None:
+            raise AssertionError("not implemented")
+
+        result, recorded = self._probe(outcome)
+        self.assertEqual([], result.failures + result.errors)
+        self.assertEqual("AssertionError: not implemented", recorded)
+
+    def test_a_passing_gap_case_is_a_stale_gap(self) -> None:
+        result, recorded = self._probe(lambda: None)
+        self.assertIsNone(recorded)
+        self.assertEqual(1, len(result.failures))
+        self.assertIn("stale gap", result.failures[0][1])
+
+    def test_a_non_assertion_error_in_a_gap_case_is_not_swallowed(self) -> None:
+        def outcome() -> None:
+            raise TypeError("evaluator bug")
+
+        result, recorded = self._probe(outcome)
+        self.assertEqual(1, len(result.errors))
+        self.assertIn("TypeError: evaluator bug", result.errors[0][1])
+        self.assertEqual("<not run>", recorded)
+
+    def test_sqs_delay_evaluator_does_not_relabel_a_publish_internal_type_error(self) -> None:
+        def publish(self: SqsTransport, queue: str, body: str, delay_seconds: int = 0) -> None:
+            raise TypeError("bug inside publish")
+
+        case = next(c for _, c in iter_cases(MANIFEST, "delay") if "queue_type" in c)
+        with mock.patch.object(SqsTransport, "publish", publish), self.assertRaises(TypeError):
+            _eval_sqs_delay(case)
+
+    def test_retry_republish_accepts_a_contract_conformant_redeliver(self) -> None:
+        # A Redeliverer-conformant tier release: the body it is given is already advanced, so it
+        # republishes it as-is and takes `bq-attempts` from it. The evaluator must pass this.
+        def redeliver(self: KafkaTransport, message: ReceivedMessage, body: str, delay: float) -> None:
+            delay_ms = int(delay * 1000)
+            tier = next((t for t in self._retry_tiers_ms if t >= delay_ms), None)
+            if tier is None:
+                raise BabelQueueError("no retry tier")
+            attempts = json.loads(body)["attempts"]
+            self._producer.produce(
+                f"{message.queue}.retry.{self._retry_tiers_ms.index(tier)}",
+                value=body,
+                headers=[
+                    ("bq-attempts", str(attempts).encode()),
+                    ("bq-original-topic", message.queue.encode()),
+                    ("bq-delay", str(delay_ms).encode()),
+                ],
+            )
+
+        def init(self: KafkaTransport, *, producer: Any, consumer_factory: Any, retry_tiers_ms: Any) -> None:
+            self._producer = producer
+            self._retry_tiers_ms = retry_tiers_ms
+
+        cases = [c for _, c in iter_cases(MANIFEST, "backoff") if "release_delay_ms" in c]
+        self.assertEqual(3, len(cases))
+        with (
+            mock.patch.object(KafkaTransport, "redeliver", redeliver, create=True),
+            mock.patch.object(KafkaTransport, "__init__", init),
+        ):
+            for case in cases:
+                with self.subTest(case=case["name"]):
+                    _eval_kafka_retry_republish(case)
+
+    def test_retry_republish_rejects_a_redeliver_that_advances_attempts_twice(self) -> None:
+        def redeliver(self: KafkaTransport, message: ReceivedMessage, body: str, delay: float) -> None:
+            envelope = json.loads(body)
+            envelope["attempts"] += 1
+            self._producer.produce(
+                f"{message.queue}.retry.0",
+                value=json.dumps(envelope),
+                headers=[("bq-attempts", str(envelope["attempts"]).encode()),
+                         ("bq-original-topic", message.queue.encode()),
+                         ("bq-delay", str(int(delay * 1000)).encode())],
+            )
+
+        def init(self: KafkaTransport, *, producer: Any, consumer_factory: Any, retry_tiers_ms: Any) -> None:
+            self._producer = producer
+
+        case = next(c for _, c in iter_cases(MANIFEST, "backoff") if c.get("name") == "first-retry")
+        with (
+            mock.patch.object(KafkaTransport, "redeliver", redeliver, create=True),
+            mock.patch.object(KafkaTransport, "__init__", init),
+            self.assertRaisesRegex(AssertionError, "attempts"),
+        ):
+            _eval_kafka_retry_republish(case)
+
+    def test_every_known_gap_case_really_fails_today(self) -> None:
+        # Each listed case, run straight through its section's evaluator, must still fail.
+        evaluators = {"delay": _eval_delay, "backoff": _eval_backoff}
+        for section, gaps in KNOWN_GAPS.items():
+            for case_id, case in iter_cases(MANIFEST, section):
+                if case_id not in gaps:
+                    continue
+                with self.subTest(section=section, case=case_id), self.assertRaises(AssertionError):
+                    evaluators[section](case)
+
+
+class IdempotencyConformanceTest(unittest.TestCase):
+    def test_idempotency_cases(self) -> None:
+        for case_id, case in iter_cases(MANIFEST, "idempotency"):
+            with self.subTest(case=case_id):
+                if case_id == "dedup_key":
+                    _eval_idempotency_dedup_key(case)
+                else:
+                    _eval_idempotency_sequence(case)
+
+
+class RedisConformanceTest(unittest.TestCase):
+    def test_payload_identity(self) -> None:
+        for case_id, case in iter_cases(MANIFEST, "redis"):
+            with self.subTest(case=case_id):
+                _eval_redis_payload_identity(case)
+
+
+class RabbitmqConformanceTest(unittest.TestCase):
+    def test_property_projection(self) -> None:
+        for case_id, case in iter_cases(MANIFEST, "rabbitmq"):
+            with self.subTest(case=case_id):
+                _eval_rabbitmq_property_projection(case)
 
 
 if __name__ == "__main__":

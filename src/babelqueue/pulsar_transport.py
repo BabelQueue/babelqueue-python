@@ -47,7 +47,7 @@ import re
 from urllib.parse import quote, unquote
 from typing import Any, Callable, Dict, Optional, Tuple
 
-from .codec import SCHEMA_VERSION, EnvelopeCodec, parse_envelope
+from .codec import ASCII_WHITESPACE, SCHEMA_VERSION, EnvelopeCodec, parse_envelope
 from .transport import ReceivedMessage, Transport
 
 #: ``bq-attempts`` is valid only as a run of ASCII digits (no sign, no whitespace) ...
@@ -55,7 +55,7 @@ _ATTEMPTS_PATTERN = re.compile(r"[0-9]+")
 #: A blank ``bq-schema-version``: empty or only ASCII whitespace (space, \t, \n, \v, \f, \r) — the
 #: same set in every SDK (GR-5). Deliberately not ``str.strip()``, which also strips U+001C-U+001F,
 #: U+0085, U+00A0, U+2028, U+3000 ...
-_BLANK_ASCII_PATTERN = re.compile(r"[ \t\n\x0b\x0c\r]*")
+_BLANK_ASCII_PATTERN = re.compile("[" + re.escape(ASCII_WHITESPACE) + "]*")
 #: ... that fits a signed 32-bit int, matching the Java and .NET consumers (GR-5).
 _MAX_ATTEMPTS = 2**31 - 1
 #: Prefix of the reserved ``route_urn`` a version-gated message is delivered under. It is not a
@@ -264,7 +264,7 @@ class PulsarTransport(Transport):
         if not env:
             return body, ""
 
-        routed = str(properties.get("bq-job") or "").strip()
+        routed = str(properties.get("bq-job") or "").strip(ASCII_WHITESPACE)
         body_urn = EnvelopeCodec.urn(env)
         route_urn = routed if routed and body_urn else ""
 
@@ -286,7 +286,7 @@ class PulsarTransport(Transport):
             # Re-encode from the *decoded* body: ``encode`` rejects forbidden keys / a ``urn`` alias,
             # which the raw parse above keeps (ADR-0031).
             env["attempts"] = attempts  # the routing-mismatch hook below sees the reconciled value
-            reencoded = EnvelopeCodec.decode(body)
+            reencoded = EnvelopeCodec.decode_lenient(body)
             reencoded["attempts"] = attempts
             out = EnvelopeCodec.encode(reencoded)
 

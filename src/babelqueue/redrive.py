@@ -169,10 +169,10 @@ def redrive(
 def _decoded(body: str) -> Optional[Dict[str, Any]]:
     """Decode a DLQ body, or None when it is not a redrivable envelope.
 
-    ``EnvelopeCodec.decode`` returns ``{}`` for malformed/non-object input; an object with no
+    ``EnvelopeCodec.decode_lenient`` returns ``{}`` for malformed/non-object input; an object with no
     string ``job`` is likewise not redrivable.
     """
-    envelope = EnvelopeCodec.decode(body)
+    envelope = EnvelopeCodec.decode_lenient(body)
     if not envelope or not isinstance(envelope.get("job"), str):
         return None
     return envelope

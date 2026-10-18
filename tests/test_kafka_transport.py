@@ -1628,7 +1628,7 @@ class KafkaPoisonWrapTest(unittest.TestCase):
         app = BabelQueue(transport=transport(producer, consumer), dead_letter=True)
         app._rewind_pause = 0.0  # noqa: SLF001
         with mock.patch(
-            "babelqueue.kafka_transport.EnvelopeCodec.decode", side_effect=RecursionError("deep")
+            "babelqueue.kafka_transport.EnvelopeCodec.decode_lenient", side_effect=RecursionError("deep")
         ), self.assertLogs("babelqueue.kafka", level="WARNING"):
             app.consume(queue="orders", max_messages=1)
         self.assertEqual([m["topic"] for m in producer.produced], ["orders.dlq"])

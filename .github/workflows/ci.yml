@@ -160,18 +160,45 @@ jobs:
         run: pytest tests/test_kafka_integration.py -v
 
   conformance:
-    name: Conformance suite in sync
+    name: Conformance suite in sync + results.json
     runs-on: ubuntu-latest
+    env:
+      # The pinned conformance release (ADR-0032). Bump together with tests/conformance/.
+      BQ_CONFORMANCE_VERSION: 1.5.0
+      # sha256 of that release's fetch.sh: the script runs on the runner, so it is pinned rather
+      # than trusted from a mutable tag. Bump together with BQ_CONFORMANCE_VERSION.
+      BQ_FETCH_SH_SHA256: 8bb6ba567b288fb0ac71a70fd17041b2503df119e01998d76fdad372570bf849
     steps:
       - uses: actions/checkout@v7
-      - name: Verify vendored conformance matches the canonical suite
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Verify the vendored suite against the release asset
         run: |
-          git clone --depth 1 --branch v1.4.0 https://github.com/BabelQueue/conformance.git "$RUNNER_TEMP/conformance"
-          diff -u "$RUNNER_TEMP/conformance/CONFORMANCE_VERSION" "tests/conformance/CONFORMANCE_VERSION"
-          diff -ru "$RUNNER_TEMP/conformance/manifest.json" "tests/conformance/manifest.json"
-          diff -ru "$RUNNER_TEMP/conformance/fixtures"      "tests/conformance/fixtures"
-          diff -ru "$RUNNER_TEMP/conformance/schema"        "tests/conformance/schema"
-          echo "Vendored conformance is in sync with the canonical suite."
+          # fetch.sh comes from the pinned tag; it downloads babelqueue-conformance-<v>.tar.gz,
+          # verifies it against the release SHA256SUMS before unpacking, then diffs the vendor dir.
+          curl -fsSL -o "$RUNNER_TEMP/fetch.sh" \
+            "https://raw.githubusercontent.com/BabelQueue/conformance/v${BQ_CONFORMANCE_VERSION}/fetch.sh"
+          echo "${BQ_FETCH_SH_SHA256}  $RUNNER_TEMP/fetch.sh" | sha256sum -c -
+          bash "$RUNNER_TEMP/fetch.sh" --check "$BQ_CONFORMANCE_VERSION" tests/conformance
+          test "$(tr -d '[:space:]' < tests/conformance/CONFORMANCE_VERSION)" = "$BQ_CONFORMANCE_VERSION"
+          echo "Vendored conformance is in sync with the v${BQ_CONFORMANCE_VERSION} release asset."
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,celery,django,otel]" opentelemetry-sdk jsonschema
+
+      - name: Run the conformance suite and write results.json
+        env:
+          BQ_CONFORMANCE_RESULTS: ${{ runner.temp }}/results.json
+        run: pytest -q tests/test_conformance.py
+
+      - name: Validate results.json (schema, bindings, sections)
+        run: python scripts/check_conformance_results.py "$RUNNER_TEMP/results.json" tests/conformance
 
   ci-green:
     name: CI green

@@ -14,6 +14,10 @@ jobs:
     # Recommended for PyPI Trusted Publishing — configure a "pypi" environment +
     # a trusted publisher on PyPI (repo BabelQueue/babelqueue-python, this workflow).
     environment: pypi
+    env:
+      # The pinned conformance release (ADR-0032). Keep identical to ci.yml.
+      BQ_CONFORMANCE_VERSION: 1.5.0
+      BQ_FETCH_SH_SHA256: 8bb6ba567b288fb0ac71a70fd17041b2503df119e01998d76fdad372570bf849
     permissions:
       id-token: write   # PyPI Trusted Publishing (OIDC) — no API token needed
       contents: write   # create the GitHub release
@@ -25,11 +29,25 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install & test
+      - name: Verify the vendored suite against the release asset
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/fetch.sh" \
+            "https://raw.githubusercontent.com/BabelQueue/conformance/v${BQ_CONFORMANCE_VERSION}/fetch.sh"
+          echo "${BQ_FETCH_SH_SHA256}  $RUNNER_TEMP/fetch.sh" | sha256sum -c -
+          bash "$RUNNER_TEMP/fetch.sh" --check "$BQ_CONFORMANCE_VERSION" tests/conformance
+          test "$(tr -d '[:space:]' < tests/conformance/CONFORMANCE_VERSION)" = "$BQ_CONFORMANCE_VERSION"
+
+      - name: Install & test (writes results.json)
+        env:
+          BQ_CONFORMANCE_RESULTS: ${{ runner.temp }}/results.json
         run: |
           python -m pip install --upgrade pip build
-          pip install -e ".[dev]"
+          pip install -e ".[dev,celery,django,otel]" opentelemetry-sdk jsonschema
           pytest
+          test -s "$BQ_CONFORMANCE_RESULTS"  # the conformance run must have produced results.json
+
+      - name: Validate results.json (schema, bindings, sections)
+        run: python scripts/check_conformance_results.py "$RUNNER_TEMP/results.json" tests/conformance
 
       - name: Build distributions
         run: python -m build
@@ -44,3 +62,5 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
+          files: ${{ runner.temp }}/results.json
+          fail_on_unmatched_files: true

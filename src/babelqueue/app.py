@@ -284,7 +284,7 @@ class BabelQueue:
             # §3.7/§4.7/§5.7/§6.7/§7.7): the raw body goes to the DLQ byte-identical, so there is
             # no envelope to read here.
             gated = received.route_urn.startswith(_UNSUPPORTED_SCHEMA_ROUTE_PREFIX)
-            envelope = {} if gated else EnvelopeCodec.decode(received.body)
+            envelope = {} if gated else EnvelopeCodec.decode_lenient(received.body)
             urn = str(envelope.get("job") or envelope.get("urn") or "")
             if received.route_urn and envelope:
                 # Transport-supplied routing override; body untouched. Only for a body that
@@ -587,7 +587,7 @@ def _without_forbidden_keys(body: str) -> str:
         return body
     # ``decode`` (not the raw parse) so the dropped keys — and a top-level ``urn`` alias, folded
     # into ``job`` — are gone before ``encode``, which rejects them (ADR-0031 (c)).
-    return EnvelopeCodec.encode(EnvelopeCodec.decode(body))
+    return EnvelopeCodec.encode(EnvelopeCodec.decode_lenient(body))
 
 
 def _handler_wants_envelope(fn: Handler) -> bool:

@@ -35,9 +35,11 @@ FORBIDDEN_KEYS: Tuple[Tuple[Optional[str], str], ...] = (
     ("meta", "ts"),
 )
 
-#: The closed ASCII whitespace set that makes a ``job`` "blank" (cross-SDK parity, GR-5): never a
-#: bare ``str.strip()``, which also strips Unicode spaces such as U+2003.
-_ASCII_WHITESPACE = " \t\n\v\f\r"
+#: The closed ASCII whitespace set of ADR-0032 §5 (space, \t, \n, \v, \f, \r) — the single source for
+#: every trim / blank check in the SDK (cross-SDK parity, GR-5): never a bare ``str.strip()``,
+#: which also strips Unicode spaces such as U+00A0, U+2003 and U+3000. The transport modules
+#: import it instead of keeping their own copy.
+ASCII_WHITESPACE = " \t\n\v\f\r"
 
 #: Logger every forbidden-key warning is reported through (one record per dropped key).
 logger = logging.getLogger("babelqueue.codec")
@@ -87,12 +89,39 @@ def has_forbidden_keys(envelope: Mapping[str, Any]) -> bool:
     return _has_forbidden_keys(envelope)
 
 
-def _is_blank(value: Any) -> bool:
-    """Missing, ``None``, empty or only ASCII whitespace; a falsy non-string (``0``, ``false``,
-    ``[]``, ``{}``) is blank too, as in ``job or urn``. A truthy non-string is not blank."""
-    if isinstance(value, str):
-        return value.strip(_ASCII_WHITESPACE) == ""
-    return not value
+def _is_valid_urn(value: Any) -> bool:
+    """A usable identity: a string that is not blank under the ASCII set (ADR-0032 §5/§6).
+
+    Any non-string — including the falsy ``0`` / ``False`` / ``[]`` / ``{}`` — is not a URN.
+    """
+    return isinstance(value, str) and value.strip(ASCII_WHITESPACE) != ""
+
+
+def _parse_object(raw: Any) -> Optional[Dict[str, Any]]:
+    """The parsed JSON object, or ``None`` when ``raw`` is malformed or not an object."""
+    try:
+        decoded = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+def _fold_identity(decoded: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop forbidden keys and fold the ``urn`` alias into ``job`` (ADR-0031 (c), ADR-0032 §6)."""
+    strip_forbidden_keys(decoded)
+    if "job" in decoded and not isinstance(decoded["job"], str):
+        logger.warning(
+            "Ignored the non-string envelope key /job (%s)%s (ADR-0032 §6).",
+            type(decoded["job"]).__name__,
+            "; falling back to urn" if _is_valid_urn(decoded.get("urn")) else "",
+        )
+    if "urn" in decoded:
+        alias = decoded.pop("urn")
+        if _is_valid_urn(decoded.get("job")):
+            _warn_dropped("/urn")
+        elif _is_valid_urn(alias):
+            decoded["job"] = alias
+    return decoded
 
 
 def _warn_dropped(pointer: str) -> None:
@@ -148,14 +177,14 @@ class EnvelopeCodec:
         (``id``, ``queue``, ``lang``, ``schema_version``, ``created_at``) or a forbidden ``meta``
         key (message-envelope.md §10) raises :class:`~babelqueue.exceptions.EnvelopeKeyError`.
         """
-        urn = (urn or "").strip()
+        urn = (urn or "").strip(ASCII_WHITESPACE)
         if not urn:
             raise BabelQueueError(
                 "A polyglot message must expose a stable, non-empty URN so consumers "
                 "can identify it without any class name."
             )
 
-        trace_id = (trace_id or "").strip() or str(uuid.uuid4())
+        trace_id = (trace_id or "").strip(ASCII_WHITESPACE) or str(uuid.uuid4())
 
         extra: Dict[str, Any] = {}
         if meta is not None:
@@ -233,32 +262,55 @@ class EnvelopeCodec:
         (message-envelope.md §10) are dropped and reported as warnings on :data:`logger`
         (policy K-15: warn, never reject), so re-encoding never re-emits them.
 
-        The ``urn`` alias is folded into ``job`` (ADR-0031 (c)): when ``job`` is missing, empty or
-        only ASCII whitespace, the ``urn`` value becomes ``job`` (silently); when both carry a
-        value, ``job`` wins and ``urn`` is dropped with a warning naming ``/urn``. The decoded
-        envelope never keeps a ``urn`` key.
+        The ``urn`` alias is folded into ``job`` (ADR-0031 (c), ADR-0032 §6): a ``job`` that is
+        not a string (``null``, number, boolean, object, array — falsy or not) is ignored with a
+        warning; a ``job`` that is missing, empty or only ASCII whitespace is ignored silently.
+        In both cases a valid string ``urn`` becomes ``job``. When ``job`` is valid, it wins and
+        ``urn`` is dropped with a warning naming ``/urn``. A ``urn`` that is not a valid string is
+        ignored (dropped). The decoded envelope never keeps a ``urn`` key.
+
+        A readable JSON object with neither a valid ``job`` nor a valid ``urn`` raises
+        :class:`~babelqueue.exceptions.BabelQueueError` (ADR-0032 §6). Malformed or non-object
+        input still yields ``{}`` (the poison-path convention). Runtime and transport paths that
+        must tolerate an identity-less document use :meth:`decode_lenient` instead.
         """
-        decoded = parse_envelope(raw)
-        strip_forbidden_keys(decoded)
-        if "urn" in decoded:
-            if _is_blank(decoded.get("job")):
-                decoded["job"] = decoded.pop("urn")
-            else:
-                del decoded["urn"]
-                _warn_dropped("/urn")
+        parsed = _parse_object(raw)
+        if parsed is None:
+            return {}
+        decoded = _fold_identity(parsed)
+        if not _is_valid_urn(decoded.get("job")):
+            raise BabelQueueError(
+                "The envelope has neither a valid string 'job' nor a valid string 'urn' "
+                "(ADR-0032 section 6)."
+            )
         return decoded
+
+    @staticmethod
+    def decode_lenient(raw: str) -> Dict[str, Any]:
+        """Like :meth:`decode`, but an envelope without any valid identity does not raise.
+
+        The forbidden-key drop, the ``urn`` fold and the non-string ``job`` warning are identical;
+        a document with neither a valid ``job`` nor a valid ``urn`` comes back without a usable
+        ``job`` (:meth:`urn` is ``""``, :meth:`accepts` is ``False``). For the runtime dispatch,
+        the transports' attempts reconciliation and ``redrive``, which must keep routing such a
+        body down the poison / pass-through path instead of failing the delivery. Malformed or
+        non-object input yields ``{}``.
+        """
+        parsed = _parse_object(raw)
+        return {} if parsed is None else _fold_identity(parsed)
 
     @staticmethod
     def urn(envelope: Mapping[str, Any]) -> str:
         """The message URN: canonical ``job``, with ``urn`` accepted as an alias.
 
-        A blank ``job`` (missing, empty or only ASCII whitespace) falls back to ``urn``.
+        A ``job`` that is not a valid string (missing, non-string, empty or only ASCII
+        whitespace) falls back to ``urn``; a ``urn`` that is not a valid string is ignored.
         """
         job = envelope.get("job")
-        if isinstance(job, str) and not _is_blank(job):
-            return job
+        if _is_valid_urn(job):
+            return str(job)
         alias = envelope.get("urn")
-        return alias if isinstance(alias, str) and not _is_blank(alias) else ""
+        return str(alias) if _is_valid_urn(alias) else ""
 
     @staticmethod
     def accepts(envelope: Mapping[str, Any]) -> bool:
@@ -283,7 +335,7 @@ class EnvelopeCodec:
             return False
 
         trace_id = envelope.get("trace_id")
-        if not isinstance(trace_id, str) or trace_id == "":
+        if not isinstance(trace_id, str) or trace_id.strip(ASCII_WHITESPACE) == "":
             return False
 
         return True

@@ -199,7 +199,7 @@ class PulsarConsumeTest(unittest.TestCase):
         return popped
 
     def _pop(self, raw: str, properties, redelivery_count: int = 0, **options) -> dict:
-        return EnvelopeCodec.decode(self._pop_message(raw, properties, redelivery_count, **options).body)
+        return EnvelopeCodec.decode_lenient(self._pop_message(raw, properties, redelivery_count, **options).body)
 
     def _body_with_urn(self, urn: str, attempts: int = 0) -> str:
         env = EnvelopeCodec.decode(body(attempts))
@@ -222,6 +222,20 @@ class PulsarConsumeTest(unittest.TestCase):
         self.assertEqual(calls[0][1], other)
         self.assertEqual(calls[0][2]["job"], other)
         self.assertEqual(calls[0][2]["data"], {"order_id": 1042})
+
+    def test_bq_job_property_is_trimmed_with_the_ascii_set_only(self):
+        # ADR-0032 section 5: ASCII whitespace is trimmed, U+00A0 / U+2003 / U+3000 are part of the value.
+        raw = self._body_with_urn("urn:babel:billing:invoiced")
+        for padded, expected in (
+            (f" \t{URN}\n\v\f\r ", URN),
+            (f"\u00a0{URN}\u00a0", f"\u00a0{URN}\u00a0"),
+            (f"\u2003{URN}\u3000", f"\u2003{URN}\u3000"),
+            (f" \u00a0{URN} ", f"\u00a0{URN}"),
+        ):
+            with self.subTest(bq_job=repr(padded)):
+                self.assertEqual(self._pop_message(raw, {"bq-job": padded}).route_urn, expected)
+        # a property of only ASCII whitespace names no route
+        self.assertEqual(self._pop_message(raw, {"bq-job": " \t\r\n"}).route_urn, "")
 
     def test_pop_routing_works_without_a_hook(self):
         popped = self._pop_message(self._body_with_urn("urn:babel:billing:invoiced"), {"bq-job": URN})
@@ -394,7 +408,7 @@ class PulsarConsumeTest(unittest.TestCase):
         env = EnvelopeCodec.decode(raw)
         del env["job"]
         popped = self._pop_message(EnvelopeCodec.encode(env), {"bq-job": URN})
-        env = EnvelopeCodec.decode(popped.body)
+        env = EnvelopeCodec.decode_lenient(popped.body)
         self.assertEqual(popped.route_urn, "")
         self.assertEqual(EnvelopeCodec.urn(env), "")
         self.assertFalse(EnvelopeCodec.accepts(env))
