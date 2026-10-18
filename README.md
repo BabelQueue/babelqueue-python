@@ -4,6 +4,8 @@
 [![PyPI](https://img.shields.io/pypi/v/babelqueue.svg)](https://pypi.org/project/babelqueue/)
 [![Python](https://img.shields.io/pypi/pyversions/babelqueue.svg)](https://pypi.org/project/babelqueue/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Live interop](https://img.shields.io/endpoint?url=https%3A%2F%2Fbabelqueue.com%2Fbadges%2Fnightly.json)](https://babelqueue.com/compatibility/)
+[![BabelQueue conformance](https://img.shields.io/badge/BabelQueue-conformance%20matrix-10B981.svg)](https://babelqueue.com/compatibility/)
 
 > **Polyglot Queues, Simplified.** Read and write the canonical BabelQueue message
 > envelope from Python — so your Python services (AI/ML, data processing, …)
