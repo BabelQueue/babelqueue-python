@@ -1,5 +1,81 @@
 {
   "schema_version": 1,
+  "conformance_version": "1.5.0",
+  "sections": {
+    "cases": {
+      "scope": "core"
+    },
+    "idempotency": {
+      "scope": "core"
+    },
+    "sqs": {
+      "scope": "sqs"
+    },
+    "asb": {
+      "scope": "asb"
+    },
+    "pulsar": {
+      "scope": "pulsar"
+    },
+    "kafka": {
+      "scope": "kafka"
+    },
+    "artemis": {
+      "scope": "artemis"
+    },
+    "redis": {
+      "scope": "redis"
+    },
+    "rabbitmq": {
+      "scope": "amqp"
+    },
+    "payload_schema": {
+      "scope": "core"
+    },
+    "roundtrip": {
+      "scope": "core"
+    },
+    "data_shape": {
+      "scope": "core"
+    },
+    "forbidden_keys": {
+      "scope": "core"
+    },
+    "extension_write": {
+      "scope": "core"
+    },
+    "encode_reject": {
+      "scope": "core"
+    },
+    "payload_schema_unicode": {
+      "scope": "core"
+    },
+    "trim": {
+      "scope": "core"
+    },
+    "job_type": {
+      "scope": "core"
+    },
+    "traceparent": {
+      "scope": "otel"
+    },
+    "delay": {
+      "scope": "sqs"
+    },
+    "backoff": {
+      "scope": "kafka"
+    },
+    "redis_layout": {
+      "scope": "redis"
+    }
+  },
+  "exceptions": [
+    {
+      "family": "php",
+      "binding": "asb",
+      "adr": "ADR-0021"
+    }
+  ],
   "description": "Cross-SDK conformance cases. Every BabelQueue SDK core must satisfy these against the canonical wire envelope. Per-message fields (meta.id, trace_id, meta.created_at) are intrinsically unique and are NOT asserted by value.",
   "cases": [
     {
@@ -956,6 +1032,830 @@
         "valid": true,
         "data": {
           "min2": "e\u0301"
+        }
+      }
+    ]
+  },
+  "trim": {
+    "description": "ADR-0032 \u00a75 (normative): the ASCII whitespace set is space, \\t, \\n, \\r, \\f, \\v; U+00A0, U+2003 and U+3000 are NOT whitespace and are part of the value. Scope: `core`. Every case has a `mode`. `make`: call the producer's `make` with `urn` (and `trace_id` when given); the URN and the trace_id are trimmed with the ASCII set, so `expect` is the resulting `job` / `trace_id`, or `\"reject\"` when the URN is empty after trimming. `decode`: decode `file`; `valid: true` means it succeeds with `expect.urn` as the resolved identity and a warning iff `expect_warning` (a blank string `job` falls back to `urn` silently, ADR-0032 \u00a76); `valid: false` means decode raises. `accepts`: `accepts(file)` MUST equal `expect_accepts` (a blank `trace_id` makes it false) while decode itself still succeeds when `expect_decode_ok` is true (an older producer's message without a usable trace_id is tolerated). `reemit`: decode, increment `attempts`, re-encode (retry/DLQ/redrive/relay) and assert `expect_preserved` (JSON Pointer -> value) byte for byte: re-emit never trims. Note on tension with urn-naming section 2: the `make` cases that use a Unicode-space or space-padded URN pin only the ASCII-trim blank rule (what `make` does with such an input); they do not endorse such strings as well-formed URNs, which urn-naming section 2 constrains separately.",
+    "cases": [
+      {
+        "name": "make-trims-ascii-space",
+        "mode": "make",
+        "urn": " urn:acme:a ",
+        "expect": {
+          "job": "urn:acme:a"
+        }
+      },
+      {
+        "name": "make-trims-ascii-tab",
+        "mode": "make",
+        "urn": "\turn:acme:a\t",
+        "expect": {
+          "job": "urn:acme:a"
+        }
+      },
+      {
+        "name": "make-trims-ascii-lf",
+        "mode": "make",
+        "urn": "\nurn:acme:a\n",
+        "expect": {
+          "job": "urn:acme:a"
+        }
+      },
+      {
+        "name": "make-trims-ascii-cr",
+        "mode": "make",
+        "urn": "\rurn:acme:a\r",
+        "expect": {
+          "job": "urn:acme:a"
+        }
+      },
+      {
+        "name": "make-trims-ascii-ff",
+        "mode": "make",
+        "urn": "\furn:acme:a\f",
+        "expect": {
+          "job": "urn:acme:a"
+        }
+      },
+      {
+        "name": "make-trims-ascii-vt",
+        "mode": "make",
+        "urn": "\u000burn:acme:a\u000b",
+        "expect": {
+          "job": "urn:acme:a"
+        }
+      },
+      {
+        "name": "make-trims-mixed-ascii-set",
+        "mode": "make",
+        "urn": " \t\n\r\f\u000burn:acme:a \u000b\f\r\n\t",
+        "expect": {
+          "job": "urn:acme:a"
+        }
+      },
+      {
+        "name": "make-trims-trace-id",
+        "mode": "make",
+        "urn": "urn:acme:a",
+        "trace_id": "\t 7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\n",
+        "expect": {
+          "job": "urn:acme:a",
+          "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b"
+        }
+      },
+      {
+        "name": "make-keeps-unicode-nbsp-padding",
+        "mode": "make",
+        "urn": "\u00a0urn:acme:a\u00a0",
+        "expect": {
+          "job": "\u00a0urn:acme:a\u00a0"
+        }
+      },
+      {
+        "name": "make-keeps-unicode-emsp-padding",
+        "mode": "make",
+        "urn": "\u2003urn:acme:a\u2003",
+        "expect": {
+          "job": "\u2003urn:acme:a\u2003"
+        }
+      },
+      {
+        "name": "make-keeps-unicode-ideographic-padding",
+        "mode": "make",
+        "urn": "\u3000urn:acme:a\u3000",
+        "expect": {
+          "job": "\u3000urn:acme:a\u3000"
+        }
+      },
+      {
+        "name": "make-ascii-trim-stops-at-unicode-space",
+        "mode": "make",
+        "urn": " \u00a0urn:acme:a\u3000 ",
+        "expect": {
+          "job": "\u00a0urn:acme:a\u3000"
+        }
+      },
+      {
+        "name": "make-unicode-space-only-urn-is-not-blank",
+        "mode": "make",
+        "urn": "\u2003",
+        "expect": {
+          "job": "\u2003"
+        }
+      },
+      {
+        "name": "make-rejects-urn-blank-after-trim",
+        "mode": "make",
+        "urn": " \t\n\r\f\u000b",
+        "expect": "reject"
+      },
+      {
+        "name": "decode-blank-job-space-falls-back-to-urn",
+        "mode": "decode",
+        "file": "fixtures/trim-blank-job-space.json",
+        "valid": true,
+        "expect": {
+          "urn": "urn:acme:b"
+        },
+        "expect_warning": false
+      },
+      {
+        "name": "decode-blank-job-tab-falls-back-to-urn",
+        "mode": "decode",
+        "file": "fixtures/trim-blank-job-tab.json",
+        "valid": true,
+        "expect": {
+          "urn": "urn:acme:b"
+        },
+        "expect_warning": false
+      },
+      {
+        "name": "decode-blank-job-lf-falls-back-to-urn",
+        "mode": "decode",
+        "file": "fixtures/trim-blank-job-lf.json",
+        "valid": true,
+        "expect": {
+          "urn": "urn:acme:b"
+        },
+        "expect_warning": false
+      },
+      {
+        "name": "decode-blank-job-cr-falls-back-to-urn",
+        "mode": "decode",
+        "file": "fixtures/trim-blank-job-cr.json",
+        "valid": true,
+        "expect": {
+          "urn": "urn:acme:b"
+        },
+        "expect_warning": false
+      },
+      {
+        "name": "decode-blank-job-ff-falls-back-to-urn",
+        "mode": "decode",
+        "file": "fixtures/trim-blank-job-ff.json",
+        "valid": true,
+        "expect": {
+          "urn": "urn:acme:b"
+        },
+        "expect_warning": false
+      },
+      {
+        "name": "decode-blank-job-vt-falls-back-to-urn",
+        "mode": "decode",
+        "file": "fixtures/trim-blank-job-vt.json",
+        "valid": true,
+        "expect": {
+          "urn": "urn:acme:b"
+        },
+        "expect_warning": false
+      },
+      {
+        "name": "decode-unicode-nbsp-job-is-not-blank",
+        "mode": "decode",
+        "file": "fixtures/trim-unicode-job-nbsp.json",
+        "valid": true,
+        "expect": {
+          "urn": "\u00a0"
+        },
+        "expect_warning": false
+      },
+      {
+        "name": "decode-unicode-emsp-job-is-not-blank",
+        "mode": "decode",
+        "file": "fixtures/trim-unicode-job-emsp.json",
+        "valid": true,
+        "expect": {
+          "urn": "\u2003"
+        },
+        "expect_warning": false
+      },
+      {
+        "name": "decode-unicode-ideographic-job-is-not-blank",
+        "mode": "decode",
+        "file": "fixtures/trim-unicode-job-ideographic.json",
+        "valid": true,
+        "expect": {
+          "urn": "\u3000"
+        },
+        "expect_warning": false
+      },
+      {
+        "name": "decode-unicode-space-urn-is-valid",
+        "mode": "decode",
+        "file": "fixtures/trim-urn-only-unicode-space.json",
+        "valid": true,
+        "expect": {
+          "urn": "\u2003"
+        },
+        "expect_warning": false
+      },
+      {
+        "name": "decode-ascii-blank-urn-is-invalid",
+        "mode": "decode",
+        "file": "fixtures/trim-urn-only-ascii-blank.json",
+        "valid": false,
+        "reason": "no job and the urn alias is blank under the ASCII set, so there is no valid identity"
+      },
+      {
+        "name": "decode-blank-job-and-blank-urn-is-invalid",
+        "mode": "decode",
+        "file": "fixtures/trim-job-and-urn-both-blank.json",
+        "valid": false,
+        "reason": "job and urn are both blank under the ASCII set, so there is no valid identity"
+      },
+      {
+        "name": "accepts-blank-trace-id-space-is-false",
+        "mode": "accepts",
+        "file": "fixtures/trim-blank-trace-id-space.json",
+        "expect_accepts": false,
+        "expect_decode_ok": true
+      },
+      {
+        "name": "accepts-blank-trace-id-tab-is-false",
+        "mode": "accepts",
+        "file": "fixtures/trim-blank-trace-id-tab.json",
+        "expect_accepts": false,
+        "expect_decode_ok": true
+      },
+      {
+        "name": "accepts-blank-trace-id-lf-is-false",
+        "mode": "accepts",
+        "file": "fixtures/trim-blank-trace-id-lf.json",
+        "expect_accepts": false,
+        "expect_decode_ok": true
+      },
+      {
+        "name": "accepts-blank-trace-id-cr-is-false",
+        "mode": "accepts",
+        "file": "fixtures/trim-blank-trace-id-cr.json",
+        "expect_accepts": false,
+        "expect_decode_ok": true
+      },
+      {
+        "name": "accepts-blank-trace-id-ff-is-false",
+        "mode": "accepts",
+        "file": "fixtures/trim-blank-trace-id-ff.json",
+        "expect_accepts": false,
+        "expect_decode_ok": true
+      },
+      {
+        "name": "accepts-blank-trace-id-vt-is-false",
+        "mode": "accepts",
+        "file": "fixtures/trim-blank-trace-id-vt.json",
+        "expect_accepts": false,
+        "expect_decode_ok": true
+      },
+      {
+        "name": "reemit-keeps-ascii-padded-job",
+        "mode": "reemit",
+        "file": "fixtures/trim-reemit-job-ascii-padded.json",
+        "expect_attempts": 1,
+        "expect_preserved": {
+          "/job": " urn:acme:a\t"
+        }
+      },
+      {
+        "name": "reemit-keeps-unicode-padded-job",
+        "mode": "reemit",
+        "file": "fixtures/trim-reemit-job-unicode-padded.json",
+        "expect_attempts": 1,
+        "expect_preserved": {
+          "/job": "\u00a0urn:acme:a\u3000"
+        }
+      },
+      {
+        "name": "reemit-keeps-ascii-padded-trace-id",
+        "mode": "reemit",
+        "file": "fixtures/trim-reemit-trace-id-padded.json",
+        "expect_attempts": 1,
+        "expect_preserved": {
+          "/trace_id": " 7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\t"
+        }
+      }
+    ]
+  },
+  "job_type": {
+    "description": "ADR-0032 \u00a76 (normative): on decode a `job` that is not a string (null, number, boolean, object, array) is ignored and the decoder MUST emit a warning; a blank-string `job` keeps the ADR-0031 rule and falls back to `urn` WITHOUT a warning; a `urn` alias that is not a string is ignored; a valid `urn` is a non-blank string under the ASCII set; with neither a valid `job` nor a valid `urn` decode raises. Scope: `core`. For each case decode `file`: `valid: true` means it succeeds with `expect.urn` as the resolved identity and a warning iff `expect_warning`; `valid: false` means decode raises (whether a warning is also emitted before the error is not asserted).",
+    "cases": [
+      {
+        "name": "null-job-ignored-falls-back-to-urn",
+        "file": "fixtures/job-type-null-urn-fallback.json",
+        "valid": true,
+        "expect": {
+          "urn": "urn:acme:b"
+        },
+        "expect_warning": true
+      },
+      {
+        "name": "number-job-ignored-falls-back-to-urn",
+        "file": "fixtures/job-type-number-urn-fallback.json",
+        "valid": true,
+        "expect": {
+          "urn": "urn:acme:b"
+        },
+        "expect_warning": true
+      },
+      {
+        "name": "bool-job-ignored-falls-back-to-urn",
+        "file": "fixtures/job-type-bool-urn-fallback.json",
+        "valid": true,
+        "expect": {
+          "urn": "urn:acme:b"
+        },
+        "expect_warning": true
+      },
+      {
+        "name": "object-job-ignored-falls-back-to-urn",
+        "file": "fixtures/job-type-object-urn-fallback.json",
+        "valid": true,
+        "expect": {
+          "urn": "urn:acme:b"
+        },
+        "expect_warning": true
+      },
+      {
+        "name": "array-job-ignored-falls-back-to-urn",
+        "file": "fixtures/job-type-array-urn-fallback.json",
+        "valid": true,
+        "expect": {
+          "urn": "urn:acme:b"
+        },
+        "expect_warning": true
+      },
+      {
+        "name": "empty-string-job-falls-back-without-warning",
+        "file": "fixtures/job-type-empty-string-urn-fallback.json",
+        "valid": true,
+        "expect": {
+          "urn": "urn:acme:b"
+        },
+        "expect_warning": false
+      },
+      {
+        "name": "blank-ascii-string-job-falls-back-without-warning",
+        "file": "fixtures/blank-ascii-job-urn-fallback.json",
+        "valid": true,
+        "expect": {
+          "urn": "urn:acme:b"
+        },
+        "expect_warning": false
+      },
+      {
+        "name": "null-job-without-urn-is-invalid",
+        "file": "fixtures/job-type-null-no-urn.json",
+        "valid": false,
+        "reason": "job is not a string and there is no urn alias, so there is no valid identity"
+      },
+      {
+        "name": "number-job-with-blank-urn-is-invalid",
+        "file": "fixtures/job-type-number-blank-urn.json",
+        "valid": false,
+        "reason": "job is not a string and the urn alias is blank, so there is no valid identity"
+      },
+      {
+        "name": "number-job-with-number-urn-is-invalid",
+        "file": "fixtures/job-type-number-nonstring-urn.json",
+        "valid": false,
+        "reason": "neither job nor urn is a string, so there is no valid identity"
+      },
+      {
+        "name": "array-urn-is-ignored",
+        "file": "fixtures/job-type-missing-job-array-urn.json",
+        "valid": false,
+        "reason": "a urn alias that is not a string is ignored, and there is no job"
+      }
+    ]
+  },
+  "delay": {
+    "description": "Amazon SQS delays (broker-bindings.md \u00a73.4). Scope: `sqs`. For each case, ask the SQS transport to publish with `delay_seconds` on a `queue_type` queue. `expect.delay_seconds_attribute` is the `DelaySeconds` the SendMessage call carries; `expect: \"reject\"` means the publish MUST raise BabelQueueException (the SDK's native error type) and never silently drop or truncate the delay. A delay of 0 or a negative delay is not pinned by the contract and is not tested. The `release_visibility` block pins the `ChangeMessageVisibility` timeout of a release (\u00a73.5): `0` redelivers now, `N` backs off N seconds. Only the SQS contract is encoded here; the Redis (\u00a71) and Kafka (\u00a76.4) delay mechanics are different mechanisms and are not pinned by this section (Kafka tiers are the `backoff` section; Redis defines no available-at formula).",
+    "cases": [
+      {
+        "name": "standard-1s",
+        "queue_type": "standard",
+        "delay_seconds": 1,
+        "expect": {
+          "delay_seconds_attribute": 1
+        }
+      },
+      {
+        "name": "standard-60s",
+        "queue_type": "standard",
+        "delay_seconds": 60,
+        "expect": {
+          "delay_seconds_attribute": 60
+        }
+      },
+      {
+        "name": "standard-900s-is-the-cap",
+        "queue_type": "standard",
+        "delay_seconds": 900,
+        "expect": {
+          "delay_seconds_attribute": 900
+        }
+      },
+      {
+        "name": "standard-901s-rejected",
+        "queue_type": "standard",
+        "delay_seconds": 901,
+        "expect": "reject"
+      },
+      {
+        "name": "standard-3600s-rejected",
+        "queue_type": "standard",
+        "delay_seconds": 3600,
+        "expect": "reject"
+      },
+      {
+        "name": "fifo-per-message-delay-rejected",
+        "queue_type": "fifo",
+        "delay_seconds": 30,
+        "expect": "reject"
+      }
+    ],
+    "release_visibility": {
+      "description": "SQS release (broker-bindings.md \u00a73.5): ChangeMessageVisibility(ReceiptHandle, VisibilityTimeout). `delay_seconds` is the requested release delay; `expect.visibility_timeout` is the VisibilityTimeout sent. 43200 s (12 h) is the SQS maximum; behaviour above it is not pinned.",
+      "cases": [
+        {
+          "name": "release-now",
+          "delay_seconds": 0,
+          "expect": {
+            "visibility_timeout": 0
+          }
+        },
+        {
+          "name": "release-30s",
+          "delay_seconds": 30,
+          "expect": {
+            "visibility_timeout": 30
+          }
+        },
+        {
+          "name": "release-12h",
+          "delay_seconds": 43200,
+          "expect": {
+            "visibility_timeout": 43200
+          }
+        }
+      ]
+    }
+  },
+  "backoff": {
+    "description": "Kafka retry-topic tiers (broker-bindings.md \u00a76.4/\u00a76.5). Scope: `kafka`. `retry_tiers_ms` are the configured `<topic>.retry.<n>` delay tiers in ascending order (the contract's example is 5s, 30s, 5m, 30m); the contract does not fix how `<n>` is numbered, so the expected tier is given by its delay (`tier_ms`), not by a topic name. For each case in `cases`, request `delay_ms` for a message on `work_topic`: the SDK MUST publish to the smallest tier >= the requested delay and set the listed headers (values are UTF-8 decimal strings per \u00a76.3; any header not listed is unspecified); a delay above the largest tier, or any delay with no tiers configured, MUST raise BabelQueueException (`expect: \"reject\"`). The `retry_republish` block pins the release/retry republish (\u00a76.5): `bq-attempts + 1`, `bq-original-topic`, `bq-delay` (= `release_delay_ms`; present on every record routed via a retry topic, section 6.3), body `attempts` kept in sync, and the same tier rule for `release_delay_ms`. Only what the contract defines is pinned: the backoff policy that produces `release_delay_ms` (worker configuration) is not.",
+    "cases": [
+      {
+        "name": "below-first-tier",
+        "work_topic": "orders",
+        "retry_tiers_ms": [
+          5000,
+          30000,
+          300000,
+          1800000
+        ],
+        "delay_ms": 1000,
+        "expect": {
+          "tier_ms": 5000,
+          "headers": {
+            "bq-delay": "1000",
+            "bq-original-topic": "orders"
+          }
+        }
+      },
+      {
+        "name": "exactly-first-tier",
+        "work_topic": "orders",
+        "retry_tiers_ms": [
+          5000,
+          30000,
+          300000,
+          1800000
+        ],
+        "delay_ms": 5000,
+        "expect": {
+          "tier_ms": 5000,
+          "headers": {
+            "bq-delay": "5000",
+            "bq-original-topic": "orders"
+          }
+        }
+      },
+      {
+        "name": "just-above-first-tier",
+        "work_topic": "orders",
+        "retry_tiers_ms": [
+          5000,
+          30000,
+          300000,
+          1800000
+        ],
+        "delay_ms": 5001,
+        "expect": {
+          "tier_ms": 30000,
+          "headers": {
+            "bq-delay": "5001",
+            "bq-original-topic": "orders"
+          }
+        }
+      },
+      {
+        "name": "exactly-third-tier",
+        "work_topic": "orders",
+        "retry_tiers_ms": [
+          5000,
+          30000,
+          300000,
+          1800000
+        ],
+        "delay_ms": 300000,
+        "expect": {
+          "tier_ms": 300000,
+          "headers": {
+            "bq-delay": "300000",
+            "bq-original-topic": "orders"
+          }
+        }
+      },
+      {
+        "name": "exactly-largest-tier",
+        "work_topic": "orders",
+        "retry_tiers_ms": [
+          5000,
+          30000,
+          300000,
+          1800000
+        ],
+        "delay_ms": 1800000,
+        "expect": {
+          "tier_ms": 1800000,
+          "headers": {
+            "bq-delay": "1800000",
+            "bq-original-topic": "orders"
+          }
+        }
+      },
+      {
+        "name": "above-largest-tier-rejected",
+        "work_topic": "orders",
+        "retry_tiers_ms": [
+          5000,
+          30000,
+          300000,
+          1800000
+        ],
+        "delay_ms": 1800001,
+        "expect": "reject"
+      },
+      {
+        "name": "no-tiers-configured-rejected",
+        "work_topic": "orders",
+        "retry_tiers_ms": [],
+        "delay_ms": 1000,
+        "expect": "reject"
+      }
+    ],
+    "retry_republish": {
+      "description": "Kafka release/retry republish (broker-bindings.md \u00a76.5). Start from a message at `attempts` on `work_topic` and release it with `release_delay_ms`. `expect.headers` and `expect.body_attempts` describe the republished record (including `bq-delay` = `release_delay_ms`, section 6.3); with no retry tiers configured a release MUST raise BabelQueueException.",
+      "cases": [
+        {
+          "name": "first-retry",
+          "work_topic": "orders",
+          "retry_tiers_ms": [
+            5000,
+            30000,
+            300000,
+            1800000
+          ],
+          "attempts": 0,
+          "release_delay_ms": 5000,
+          "expect": {
+            "tier_ms": 5000,
+            "body_attempts": 1,
+            "headers": {
+              "bq-delay": "5000",
+              "bq-attempts": "1",
+              "bq-original-topic": "orders"
+            }
+          }
+        },
+        {
+          "name": "third-retry-picks-larger-tier",
+          "work_topic": "orders",
+          "retry_tiers_ms": [
+            5000,
+            30000,
+            300000,
+            1800000
+          ],
+          "attempts": 2,
+          "release_delay_ms": 30000,
+          "expect": {
+            "tier_ms": 30000,
+            "body_attempts": 3,
+            "headers": {
+              "bq-delay": "30000",
+              "bq-attempts": "3",
+              "bq-original-topic": "orders"
+            }
+          }
+        },
+        {
+          "name": "no-tiers-configured-rejected",
+          "work_topic": "orders",
+          "retry_tiers_ms": [],
+          "attempts": 0,
+          "release_delay_ms": 5000,
+          "expect": "reject"
+        }
+      ]
+    }
+  },
+  "traceparent": {
+    "description": "W3C `traceparent` out-of-band propagation (ADR-0028, ADR-0025). Scope: `otel` (ADR-0032 section 2): `otel` is not a broker but the optional W3C `traceparent` extract/inject code of ADR-0028 (in the core of Node and .NET; a separate module for Go, Python, Java and PHP), so only a package that carries it lists `otel` in `bindings` and runs this section. `mode: extract` cases give the delivered header value (`traceparent`, or null when the transport delivered none) and the envelope's `trace_id`; the consumer-side extraction MUST yield `expect`: `source: traceparent` with the header's 32-hex `trace_id_hex`, 16-hex `parent_span_id` and 2-hex `flags`, or `source: trace_id` (the v0.1 fallback, ADR-0025) with `trace_id_hex` = the envelope `trace_id` without hyphens. A malformed header is ignored (it never raises) and behaves exactly like no header. Only the structure `00-<32hex>-<16hex>-<2hex>` is pinned; the finer W3C validity rules (all-zero ids, version ff, upper case) are not part of this section. Pinning the producer side (that the header rides in the transport's own metadata channel beside the envelope, never inside it) needs a real transport and is left to the R1 OTel plan, as are the finer W3C rules.",
+    "cases": [
+      {
+        "name": "valid-sampled",
+        "mode": "extract",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "expect": {
+          "source": "traceparent",
+          "trace_id_hex": "4bf92f3577b34da6a3ce929d0e0e4736",
+          "parent_span_id": "00f067aa0ba902b7",
+          "flags": "01"
+        }
+      },
+      {
+        "name": "valid-not-sampled",
+        "mode": "extract",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "expect": {
+          "source": "traceparent",
+          "trace_id_hex": "4bf92f3577b34da6a3ce929d0e0e4736",
+          "parent_span_id": "00f067aa0ba902b7",
+          "flags": "00"
+        }
+      },
+      {
+        "name": "header-wins-over-envelope-trace-id",
+        "mode": "extract",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "expect": {
+          "source": "traceparent",
+          "trace_id_hex": "4bf92f3577b34da6a3ce929d0e0e4736",
+          "parent_span_id": "00f067aa0ba902b7",
+          "flags": "01"
+        },
+        "description": "The header's trace id is used even though the envelope trace_id differs; the envelope trace_id itself is untouched (GR-4)."
+      },
+      {
+        "name": "no-header-falls-back-to-trace-id",
+        "mode": "extract",
+        "traceparent": null,
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "expect": {
+          "source": "trace_id",
+          "trace_id_hex": "7b3f9c2ae41d4f889b2a1c0d5e6f7a8b"
+        }
+      },
+      {
+        "name": "empty-header-ignored",
+        "mode": "extract",
+        "traceparent": "",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "expect": {
+          "source": "trace_id",
+          "trace_id_hex": "7b3f9c2ae41d4f889b2a1c0d5e6f7a8b"
+        }
+      },
+      {
+        "name": "garbage-ignored",
+        "mode": "extract",
+        "traceparent": "not-a-traceparent",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "expect": {
+          "source": "trace_id",
+          "trace_id_hex": "7b3f9c2ae41d4f889b2a1c0d5e6f7a8b"
+        }
+      },
+      {
+        "name": "too-few-fields-ignored",
+        "mode": "extract",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "expect": {
+          "source": "trace_id",
+          "trace_id_hex": "7b3f9c2ae41d4f889b2a1c0d5e6f7a8b"
+        }
+      },
+      {
+        "name": "too-many-fields-ignored",
+        "mode": "extract",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "expect": {
+          "source": "trace_id",
+          "trace_id_hex": "7b3f9c2ae41d4f889b2a1c0d5e6f7a8b"
+        }
+      },
+      {
+        "name": "short-trace-id-ignored",
+        "mode": "extract",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e47-00f067aa0ba902b7-01",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "expect": {
+          "source": "trace_id",
+          "trace_id_hex": "7b3f9c2ae41d4f889b2a1c0d5e6f7a8b"
+        }
+      },
+      {
+        "name": "long-trace-id-ignored",
+        "mode": "extract",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736ab-00f067aa0ba902b7-01",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "expect": {
+          "source": "trace_id",
+          "trace_id_hex": "7b3f9c2ae41d4f889b2a1c0d5e6f7a8b"
+        }
+      },
+      {
+        "name": "short-parent-id-ignored",
+        "mode": "extract",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902-01",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "expect": {
+          "source": "trace_id",
+          "trace_id_hex": "7b3f9c2ae41d4f889b2a1c0d5e6f7a8b"
+        }
+      },
+      {
+        "name": "non-hex-trace-id-ignored",
+        "mode": "extract",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e473g-00f067aa0ba902b7-01",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "expect": {
+          "source": "trace_id",
+          "trace_id_hex": "7b3f9c2ae41d4f889b2a1c0d5e6f7a8b"
+        }
+      },
+      {
+        "name": "non-hex-parent-id-ignored",
+        "mode": "extract",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902bz-01",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "expect": {
+          "source": "trace_id",
+          "trace_id_hex": "7b3f9c2ae41d4f889b2a1c0d5e6f7a8b"
+        }
+      },
+      {
+        "name": "short-flags-ignored",
+        "mode": "extract",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-1",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "expect": {
+          "source": "trace_id",
+          "trace_id_hex": "7b3f9c2ae41d4f889b2a1c0d5e6f7a8b"
+        }
+      }
+    ]
+  },
+  "redis_layout": {
+    "description": "Redis key names in the Laravel-compatible layout (broker-bindings.md \u00a71.1). Scope: `redis`. For each case, with the transport in its Laravel-compatible layout and `key_prefix` the Laravel default, the keys used for the logical `queue` MUST equal `expect`: `ready` (list), `delayed` (sorted set, scored by available-at), `reserved` (sorted set, scored by the retry-after deadline), `notify` (blocking-pop wake-up). Only the names are pinned. The contract defines no available-at formula and no delayed/reserved sweep procedure beyond 'whatever the installed Laravel/Redis version uses', so neither is tested; a deviation from the section 1.1 layout (for example a transport that ships only a `<queue>:processing` reliable-queue layout) is an SDK bug to be fixed in that SDK's phase, not a reason to skip: no ADR authorises a skip here. The delayed/reserved sweep and the available-at formula are out of scope for this section and are covered by the R1 Redis plan.",
+    "cases": [
+      {
+        "name": "simple-queue",
+        "queue": "orders",
+        "key_prefix": "queues:",
+        "expect": {
+          "ready": "queues:orders",
+          "delayed": "queues:orders:delayed",
+          "reserved": "queues:orders:reserved",
+          "notify": "queues:orders:notify"
+        }
+      },
+      {
+        "name": "dotted-queue",
+        "queue": "emails.high",
+        "key_prefix": "queues:",
+        "expect": {
+          "ready": "queues:emails.high",
+          "delayed": "queues:emails.high:delayed",
+          "reserved": "queues:emails.high:reserved",
+          "notify": "queues:emails.high:notify"
+        }
+      },
+      {
+        "name": "mixed-case-queue",
+        "queue": "Billing_Retry-1",
+        "key_prefix": "queues:",
+        "expect": {
+          "ready": "queues:Billing_Retry-1",
+          "delayed": "queues:Billing_Retry-1:delayed",
+          "reserved": "queues:Billing_Retry-1:reserved",
+          "notify": "queues:Billing_Retry-1:notify"
         }
       }
     ]

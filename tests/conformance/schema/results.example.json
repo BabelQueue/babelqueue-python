@@ -1,0 +1,60 @@
+{
+  "sdk": "example-sdk/redis",
+  "version": "1.9.0",
+  "conformance_version": "1.5.0",
+  "generated_at": "2026-10-18T09:30:00Z",
+  "bindings": [
+    "redis",
+    "otel"
+  ],
+  "sections": {
+    "cases": {
+      "order-created": {
+        "status": "pass"
+      },
+      "urn-alias": {
+        "status": "pass"
+      }
+    },
+    "trim": {
+      "make-trims-ascii-space": {
+        "status": "pass"
+      },
+      "make-keeps-unicode-nbsp-padding": {
+        "status": "pass"
+      },
+      "reemit-keeps-ascii-padded-job": {
+        "status": "pass"
+      }
+    },
+    "job_type": {
+      "null-job-ignored-falls-back-to-urn": {
+        "status": "pass"
+      },
+      "null-job-without-urn-is-invalid": {
+        "status": "pass"
+      }
+    },
+    "traceparent": {
+      "valid-sampled": {
+        "status": "pass"
+      },
+      "garbage-ignored": {
+        "status": "pass"
+      }
+    },
+    "redis": {
+      "payload_identity": {
+        "status": "pass"
+      }
+    },
+    "redis_layout": {
+      "simple-queue": {
+        "status": "pass"
+      },
+      "dotted-queue": {
+        "status": "pass"
+      }
+    }
+  }
+}

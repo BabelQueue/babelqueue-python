@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://babelqueue.com/conformance/schema/results.schema.json",
+  "title": "BabelQueue conformance results",
+  "description": "The machine-readable result of running one SDK package against the cross-SDK conformance suite (ADR-0032 section 2). Sections are keyed by their name in manifest.json; each section maps a case id to {status, reason?}. Case ids: a section's `cases` array gives one case per element, identified by its `name`, else by `<section>#<0-based index>`. A sub-key object that has its own `cases` array yields `<sub-key>/<name>`, or `<sub-key>/<0-based index>` for an unnamed element. Any other object sub-key is a single case keyed by the sub-key. `description` and `schema` are never cases. The manifest's top-level `cases` array is the section named `cases`. Where a section has no `cases` array, a case is identified by its `name`, else by its map key, else by `<section>#<0-based index>`. A `skip` is only legal for an individual case of an in-scope section and MUST carry a `reason` that cites the authorising ADR (`ADR-NNNN`). A section whose scope is a binding the package does not carry is simply absent. A binding that an SDK family deliberately does not support (an ADR-backed entry in the manifest `exceptions` list, for example PHP x asb, ADR-0021) is not listed in `bindings` and its section is absent from results; it is not a skip. A real results file lists every case of every in-scope section; `results.example.json` is abbreviated.",
+  "type": "object",
+  "required": [
+    "sdk",
+    "version",
+    "conformance_version",
+    "generated_at",
+    "bindings",
+    "sections"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "sdk": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Package identity, for example `babelqueue-go/redis`."
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Version of the package under test."
+    },
+    "conformance_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+      "description": "The suite version the run was made against (the value of CONFORMANCE_VERSION)."
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?([Zz]|[+-][0-9]{2}:[0-9]{2})$",
+      "description": "RFC 3339 timestamp of the run."
+    },
+    "bindings": {
+      "type": "array",
+      "uniqueItems": true,
+      "description": "Every transport/binding the package carries, derived from its modules (ADR-0032 section 2). The list MUST be complete: leaving a carried binding out does not narrow the scope, the package is simply not Compatible. `otel` is listed when the package carries the W3C traceparent extract/inject code of ADR-0028 (in the core for Node and .NET, in a separate module elsewhere); it is not a broker. It is empty for a core-only package. An in-scope section for a listed binding must be present; a section for an unlisted binding must be absent.",
+      "items": {
+        "enum": [
+          "redis",
+          "amqp",
+          "sqs",
+          "asb",
+          "pulsar",
+          "kafka",
+          "artemis",
+          "otel"
+        ]
+      }
+    },
+    "sections": {
+      "type": "object",
+      "description": "Section name -> case id -> result.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": {
+          "$ref": "#/$defs/caseResult"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "caseResult": {
+      "type": "object",
+      "required": [
+        "status"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "enum": [
+            "pass",
+            "fail",
+            "skip"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Why the case failed or was skipped. Required, and it MUST contain an ADR reference (`ADR-NNNN`), when status is `skip`."
+        }
+      },
+      "if": {
+        "properties": {
+          "status": {
+            "const": "skip"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "required": [
+          "reason"
+        ],
+        "properties": {
+          "reason": {
+            "pattern": "ADR-[0-9]{4}"
+          }
+        }
+      }
+    }
+  }
+}
