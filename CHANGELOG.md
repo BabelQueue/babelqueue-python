@@ -9,6 +9,28 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.21.0] - 2026-10-19
+
+Implements ADR-0032 (conformance packaging, results format, ASCII trim and the non-string `job` rule).
+The envelope stays at `schema_version: 1`.
+
+### Changed
+- **`EnvelopeCodec.decode` raises `BabelQueueError` for a JSON object with neither a valid string `job` nor
+  a valid string `urn`** (ADR-0032 section 6). Malformed or non-object input still yields `{}`. The runtime
+  dispatch, the transports' attempts reconciliation and `redrive` use the new `decode_lenient`, so such a
+  body still takes the poison / pass-through path.
+- A non-string `job` (`None`, number, boolean, object, array, falsy or not) is ignored with a warning and a
+  valid string `urn` takes over.
+- Trim and blank checks in `make` (`urn`, `trace_id`) and `accepts` (`trace_id`) use the closed ASCII set
+  (space, `\t`, `\n`, `\v`, `\f`, `\r`); `str.strip()` Unicode whitespace is no longer trimmed
+  (ADR-0032 section 5). The set is exported as `codec.ASCII_WHITESPACE` and the transports import it.
+
+### Added
+- `EnvelopeCodec.decode_lenient`.
+- Conformance runner covers the v1.5.0 sections and writes `results.json` (ADR-0032 section 2).
+  `conformance-known-gaps.json` and `scripts/check_conformance_results.py` gate it in CI and release: the
+  SQS `delay` and Kafka `backoff` tier cases run and record honest `fail`s until they are implemented.
+
 ## [1.20.0] - 2026-10-17
 
 Conformance suite 1.4.0, [ADR-0031](https://babelqueue.com). The envelope is unchanged
