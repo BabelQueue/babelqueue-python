@@ -322,6 +322,19 @@ class AsbPublishTest(unittest.TestCase):
         self.assertEqual(sent.content_type, "application/json")
         self.assertEqual(EnvelopeCodec.urn(EnvelopeCodec.decode(str(sent))), URN)
 
+    def test_publish_encodes_ms_created_at_as_amqp_long(self):
+        from azure.servicebus._pyamqp import _encode
+
+        sender = FakeSender()
+        AsbTransport(client=FakeClient(sender=sender)).publish("orders", body())
+
+        props = sender.sent[0].application_properties
+        out = bytearray()
+        # a bare int > int32 raises "Value supplied for int invalid" here
+        _encode.encode_value(out, _encode.encode_application_properties(props))
+        self.assertIn(b"bq-created-at\x81", bytes(out))
+        self.assertIn(b"bq-schema-version\x54\x01", bytes(out))
+
 
 if __name__ == "__main__":
     unittest.main()

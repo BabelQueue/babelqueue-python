@@ -9,6 +9,15 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.21.1] - 2026-10-20
+
+### Fixed
+- **Azure Service Bus: `publish` no longer fails with `Value supplied for int invalid`.** The pure-Python AMQP
+  stack in `azure-servicebus` encodes a bare Python int as AMQP int32, so the millisecond `bq-created-at`
+  application property (broker-bindings.md §4.3) overflowed at send time. Out-of-int32 integer properties
+  are now sent as AMQP `long`, matching the Go, Java, .NET and Node transports. The native projection and
+  the envelope body are unchanged.
+
 ## [1.21.0] - 2026-10-19
 
 Implements ADR-0032 (conformance packaging, results format, ASCII trim and the non-string `job` rule).

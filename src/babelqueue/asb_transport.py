@@ -44,6 +44,36 @@ _BLANK_ASCII_PATTERN = re.compile("[" + re.escape(ASCII_WHITESPACE) + "]*")
 UNSUPPORTED_SCHEMA_ROUTE_PREFIX = "babelqueue:unsupported-schema-version:"
 
 
+_INT32_MIN = -(2**31)
+_INT32_MAX = 2**31 - 1
+
+
+def _amqp_typed(props: Dict[str, Any]) -> Dict[str, Any]:
+    """Pin out-of-int32 ints to AMQP ``long`` (§4.3: ``bq-created-at`` is Unix ms).
+
+    The pure-Python AMQP stack in ``azure-servicebus`` encodes every bare Python int as an
+    AMQP int32, so a millisecond epoch overflows at send time. A value outside the int32 range
+    is wrapped in the stack's explicit type descriptor; everything else is left as-is.
+    """
+    try:
+        from azure.servicebus._pyamqp.types import TYPE, VALUE, AMQPTypes
+
+        long_type: Any = AMQPTypes.long
+    except ImportError:  # pragma: no cover - older SDK layouts
+        TYPE, VALUE, long_type = "TYPE", "VALUE", "LONG"
+    out: Dict[str, Any] = {}
+    for key, value in props.items():
+        if (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and not _INT32_MIN <= value <= _INT32_MAX
+        ):
+            out[key] = {TYPE: long_type, VALUE: value}
+        else:
+            out[key] = value
+    return out
+
+
 class AsbTransport(Transport):
     def __init__(
         self,
@@ -196,7 +226,10 @@ class AsbTransport(Transport):
     def publish(self, queue: str, body: str) -> None:
         from azure.servicebus import ServiceBusMessage
 
-        message = ServiceBusMessage(body, **self._projection(body))
+        kwargs = self._projection(body)
+        if kwargs.get("application_properties"):
+            kwargs["application_properties"] = _amqp_typed(kwargs["application_properties"])
+        message = ServiceBusMessage(body, **kwargs)
         self._sender(queue).send_messages(message)
 
     def pop(self, queue: str, timeout: float = 1.0) -> Optional[ReceivedMessage]:
