@@ -9,7 +9,7 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
-Implements ADR-0033 (Redis) and ADR-0034 (Kafka tiers, back-off, poison). The envelope stays at
+Implements ADR-0033 (Redis) and ADR-0034 (Kafka tiers, backoff, poison). The envelope stays at
 `schema_version: 1`; the vendored conformance suite moves to v1.6.0 and
 `conformance-known-gaps.json` is now empty.
 
@@ -60,7 +60,7 @@ Implements ADR-0033 (Redis) and ADR-0034 (Kafka tiers, back-off, poison). The en
   the `babelqueue.kafka_retry.RetryReinjector` consumer that moves parked records from
   `<topic>.retry.<n>` back to the work topic (broker-bindings section 6.4). Opt-in: without tiers a
   retry / `publish_delayed` raises `BabelQueueError`.
-- Worker-side retry back-off: `BabelQueue(retry_backoff=, retry_backoff_multiplier=,
+- Worker-side retry backoff: `BabelQueue(retry_backoff=, retry_backoff_multiplier=,
   retry_backoff_max=, retry_jitter=)` (ADR-0034 section 9); the defaults keep an immediate release.
 - Conformance runner covers the v1.6.0 sections (`redis_layout`, `redis_delay`, `retry_backoff`,
   `kafka_poison`, ...). CI runs the Redis cases against a real `redis:7` with `BQ_REQUIRE_REDIS=1`.
@@ -71,8 +71,8 @@ Implements ADR-0033 (Redis) and ADR-0034 (Kafka tiers, back-off, poison). The en
   tiers a retry now raises instead of republishing onto the work topic.
 
 ### Documentation
-- README: Redis layouts, the A3 limit (no out-of-band headers in the Laravel-compatible layout),
-  Kafka retry tiers, `LogAppendTime` on the tier topics, retry back-off, SQS `delay_seconds`.
+- README: Redis layouts, the limit that the Laravel-compatible layout carries no out-of-band headers (ADR-0033 §5),
+  Kafka retry tiers, `LogAppendTime` on the tier topics, retry backoff, SQS `delay_seconds`.
 
 ## [1.21.1] - 2026-10-20
 
