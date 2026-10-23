@@ -1,329 +1,161 @@
-"""Tests for the Redis transport.
+"""Tests for the Redis transport (ADR-0033, broker-bindings.md section 1).
 
-The unit tests inject a tiny in-memory Redis double, so they run without the
-``redis`` package and without a broker. The double emulates exactly the commands
-the transport uses (``rpush``/``lpop``/``blmove``/``lrem``/``zadd``/``zrem``/
-``blpop``) plus the three Laravel Lua scripts the Laravel-compatible mode runs,
-so the reserved-set / reliable-queue semantics are exercised end-to-end.
+The transport is Lua-script based, so a hand-written double cannot prove it: the scripts must run.
+:mod:`redis_backend` supplies a **real Redis** when one is reachable (CI: ``redis:7``), else an
+in-process fakeredis + lupa server (a real Lua interpreter with an emulated command set) - clearly
+a stand-in, never a replacement for the real run. With ``BQ_REQUIRE_REDIS`` set only a real Redis is
+accepted. Without either the broker tests skip; the pure-function and constructor tests always run.
 
-A separate integration test round-trips against a real Redis and is skipped unless
-the ``redis`` package and a reachable broker are present (CI runs it).
+Every score and migration decision derives from the transport's injectable ``clock``, so the tests
+drive time with a fake clock and stay deterministic on a real broker too.
 """
 
 from __future__ import annotations
 
 import json
-import os
+import logging
+import re
+import threading
+import time
 import unittest
-import uuid
+from pathlib import Path
 
-from babelqueue import BabelQueue, EnvelopeCodec
+from babelqueue import BabelQueue, BabelQueueError, EnvelopeCodec
 from babelqueue.redis_transport import (
+    _DEAD_LETTER,
+    _POP,
+    _SETTLE,
     RedisTransport,
     _frame_value,
     _pop_result,
-    _qint,
+    _qretry_after,
+    _released_body,
     _unframe,
 )
-from babelqueue.transport import HeaderPublisher, ReceivedMessage
+from babelqueue.routing import UnknownUrnStrategy
+from babelqueue.transport import (
+    NON_NUMERIC_ATTEMPTS_ROUTE,
+    DeadLetterWriter,
+    HeaderPublisher,
+    ReceivedMessage,
+    Redeliverer,
+)
+
+import redis_backend
+
+URN = "urn:babel:orders:created"
+TOKEN = re.compile(r"^[0-9a-f]{32}$")
+SOURCE = Path(__file__).resolve().parent.parent / "src" / "babelqueue" / "redis_transport.py"
 
 
-class FakeRedis:
-    """In-memory stand-in for the subset of Redis the transport uses.
+class Clock:
+    """A settable clock (epoch seconds)."""
 
-    Lists are Python lists; sorted sets are ``{member: score}`` dicts. ``eval``
-    recognises the three Laravel Lua scripts (push / pop / migrate / release) by
-    keyword and emulates their effect — including the ``cjson`` re-encode of the
-    reserved member, which is what makes Python's and Laravel's reserved members
-    byte-identical in production.
-    """
+    def __init__(self, now: float = 1_700_000_000.4) -> None:
+        self.now = now
 
-    def __init__(self) -> None:
-        self.lists: dict[str, list[str]] = {}
-        self.zsets: dict[str, dict[str, float]] = {}
+    def __call__(self) -> float:
+        return self.now
 
-    # -- plain commands (Python-owned mode) ---------------------------------
-
-    def rpush(self, key, value):  # noqa: ANN001
-        self.lists.setdefault(key, []).append(value)
-        return len(self.lists[key])
-
-    def lpop(self, key):  # noqa: ANN001
-        lst = self.lists.get(key)
-        return lst.pop(0) if lst else None
-
-    def llen(self, key):  # noqa: ANN001
-        return len(self.lists.get(key, []))
-
-    def lrange(self, key, start, stop):  # noqa: ANN001
-        lst = self.lists.get(key, [])
-        end = len(lst) if stop == -1 else stop + 1
-        return lst[start:end]
-
-    def blmove(self, src, dst, timeout, src_dir, dst_dir):  # noqa: ANN001, ARG002
-        lst = self.lists.get(src)
-        if not lst:
-            return None
-        value = lst.pop(0)
-        self.lists.setdefault(dst, []).append(value)
-        return value
-
-    def lrem(self, key, count, value):  # noqa: ANN001, ARG002
-        lst = self.lists.get(key, [])
-        if value in lst:
-            lst.remove(value)
-            return 1
-        return 0
-
-    def blpop(self, keys, timeout):  # noqa: ANN001, ARG002
-        for key in keys:
-            lst = self.lists.get(key)
-            if lst:
-                return (key, lst.pop(0))
-        return None
-
-    def zadd(self, key, mapping):  # noqa: ANN001
-        self.zsets.setdefault(key, {}).update(mapping)
-
-    def zrem(self, key, member):  # noqa: ANN001
-        z = self.zsets.get(key, {})
-        return 1 if z.pop(member, None) is not None else 0
-
-    def zcard(self, key):  # noqa: ANN001
-        return len(self.zsets.get(key, {}))
-
-    def delete(self, *keys):  # noqa: ANN001
-        for key in keys:
-            self.lists.pop(key, None)
-            self.zsets.pop(key, None)
-
-    def close(self):
-        pass
-
-    # -- Lua scripts (Laravel-compatible mode) ------------------------------
-
-    def eval(self, script, numkeys, *args):  # noqa: ANN001
-        keys = list(args[:numkeys])
-        argv = list(args[numkeys:])
-        if "rpush" in script and "lpop" not in script and "zrange" not in script:
-            return self._push(keys, argv)
-        if "'lpop'" in script and "zadd" in script:
-            return self._pop(keys, argv)
-        if "zrangebyscore" in script:
-            return self._migrate(keys, argv)
-        if "'zrem'" in script and "zadd" in script:
-            return self._release(keys, argv)
-        raise AssertionError("unrecognised Lua script")
-
-    def _push(self, keys, argv):  # noqa: ANN001
-        ready, notify = keys
-        self.rpush(ready, argv[0])
-        self.rpush(notify, "1")
-
-    def _pop(self, keys, argv):  # noqa: ANN001
-        ready, reserved_key, notify = keys
-        job = self.lpop(ready)
-        if job is None:
-            return [None, None]
-        decoded = json.loads(job)
-        decoded["attempts"] = decoded.get("attempts", 0) + 1
-        reserved = json.dumps(decoded, separators=(",", ":"))
-        self.zadd(reserved_key, {reserved: float(argv[0])})
-        self.lpop(notify)
-        return [job, reserved]
-
-    def _migrate(self, keys, argv):  # noqa: ANN001
-        src, dst, notify = keys
-        now = float(argv[0])
-        z = self.zsets.get(src, {})
-        due = [m for m, score in z.items() if score <= now]
-        for member in due:
-            z.pop(member, None)
-            self.rpush(dst, member)
-            self.rpush(notify, "1")
-        return due
-
-    def _release(self, keys, argv):  # noqa: ANN001
-        delayed, reserved_key = keys
-        member, score = argv[0], float(argv[1])
-        self.zrem(reserved_key, member)
-        self.zadd(delayed, {member: score})
-        return True
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
 
 
-class RedisOwnedModeTest(unittest.TestCase):
-    """The default Python-owned reliable-queue mode (BLMOVE + processing list)."""
-
-    def _tr(self):
-        fake = FakeRedis()
-        return RedisTransport("redis://", client=fake), fake
-
-    def test_publish_uses_raw_queue_key(self):
-        tr, fake = self._tr()
-        tr.publish("orders", "body-1")
-        self.assertEqual(fake.lists["orders"], ["body-1"])
-
-    def test_pop_moves_to_processing_and_ack_removes(self):
-        tr, fake = self._tr()
-        tr.publish("orders", "body-1")
-        msg = tr.pop("orders", timeout=0)
-        self.assertEqual(msg.body, "body-1")
-        self.assertEqual(fake.lists["orders:processing"], ["body-1"])
-        self.assertEqual(fake.lists["orders"], [])
-        tr.ack(msg)
-        self.assertEqual(fake.lists["orders:processing"], [])
-
-    def test_pop_empty_returns_none(self):
-        tr, _ = self._tr()
-        self.assertIsNone(tr.pop("orders", timeout=0))
+def make_body(queue: str, data=None, attempts: int = 0, **extra) -> str:
+    env = EnvelopeCodec.make(URN, data if data is not None else {"x": 1}, queue=queue)
+    env["attempts"] = attempts
+    env.update(extra)
+    return EnvelopeCodec.encode(env)
 
 
-class RedisLaravelCompatTest(unittest.TestCase):
-    """Laravel reserved-set parity: shared queue, reserve / ack / release / migrate."""
+class _NoRedisTest(unittest.TestCase):
+    """Constructor / validation tests that never touch the broker."""
 
-    def _tr(self, **kw):
-        fake = FakeRedis()
-        return RedisTransport("redis://", client=fake, laravel_compat=True, **kw), fake
-
-    def test_publish_uses_laravel_keys_and_notify(self):
-        tr, fake = self._tr()
-        env = EnvelopeCodec.make("urn:babel:orders:created", {"x": 1}, queue="orders")
-        tr.publish("orders", EnvelopeCodec.encode(env))
-        # Laravel prefixes logical names with "queues:" and pushes a notify token.
-        self.assertEqual(fake.llen("queues:orders"), 1)
-        self.assertEqual(fake.llen("queues:orders:notify"), 1)
-
-    def test_pop_reserves_into_sorted_set_and_increments_attempts(self):
-        tr, fake = self._tr()
-        env = EnvelopeCodec.make("urn:babel:orders:created", {"x": 1}, queue="orders")
-        tr.publish("orders", EnvelopeCodec.encode(env))
-
-        msg = tr.pop("orders", timeout=0)
-        self.assertIsNotNone(msg)
-        # ready list drained, reserved set holds exactly the in-flight job
-        self.assertEqual(fake.llen("queues:orders"), 0)
-        self.assertEqual(fake.zcard("queues:orders:reserved"), 1)
-        # attempts incremented on reserve, exactly like Laravel's pop Lua
-        self.assertEqual(EnvelopeCodec.decode(msg.body)["attempts"], 1)
-        # the ack handle IS the reserved member (so ZREM matches byte-for-byte)
-        self.assertIn(msg.handle, fake.zsets["queues:orders:reserved"])
-
-    def test_ack_removes_from_reserved_set(self):
-        tr, fake = self._tr()
-        env = EnvelopeCodec.make("urn:babel:orders:created", {"x": 1}, queue="orders")
-        tr.publish("orders", EnvelopeCodec.encode(env))
-        msg = tr.pop("orders", timeout=0)
-        tr.ack(msg)
-        self.assertEqual(fake.zcard("queues:orders:reserved"), 0)
-
-    def test_ack_noop_on_empty_handle(self):
-        tr, fake = self._tr()
-        tr.ack(ReceivedMessage(body="", queue="orders", handle=None))
-        self.assertEqual(fake.zsets, {})
-
-    def test_crashed_worker_reservation_is_re_reserved_on_next_pop(self):
-        """A reserved job whose retry-after has lapsed migrates back and is re-served
-        — the reliable-queue guarantee that prevents message loss on worker crash."""
-        tr, fake = self._tr(retry_after=-1)  # reserve already expired the instant it lands
-        env = EnvelopeCodec.make("urn:babel:orders:created", {"x": 1}, queue="orders")
-        tr.publish("orders", EnvelopeCodec.encode(env))
-
-        first = tr.pop("orders", timeout=0)  # reserves (expired-at-now deadline)
-        self.assertIsNotNone(first)
-        # worker "crashes" without ack; next pop migrates the lapsed reservation back
-        second = tr.pop("orders", timeout=0)
-        self.assertIsNotNone(second)
-        # attempts climbed again on the second reservation
-        self.assertEqual(EnvelopeCodec.decode(second.body)["attempts"], 2)
-
-    def test_release_returns_job_to_delayed_set(self):
-        tr, fake = self._tr()
-        env = EnvelopeCodec.make("urn:babel:orders:created", {"x": 1}, queue="orders")
-        tr.publish("orders", EnvelopeCodec.encode(env))
-        msg = tr.pop("orders", timeout=0)
-        tr.release(msg, delay=0)
-        # left the reserved set, parked on the delayed set for retry
-        self.assertEqual(fake.zcard("queues:orders:reserved"), 0)
-        self.assertEqual(fake.zcard("queues:orders:delayed"), 1)
-
-    def test_release_noop_in_owned_mode(self):
-        tr, fake = self._tr()
-        # owned-mode transport: release is a no-op (handle present but not compat)
-        owned = RedisTransport("redis://", client=fake)
-        owned.release(ReceivedMessage(body="b", queue="orders", handle="b"))
-        self.assertEqual(fake.zsets, {})
-
-    def test_pop_empty_returns_none(self):
-        tr, _ = self._tr()
-        self.assertIsNone(tr.pop("orders", timeout=0))
-
-    def test_pop_block_window_drains_to_none(self):
-        """Empty ready list with a stale notify token: the block path consumes the
-        token (blpop wakeup), re-checks, finds nothing and returns None — the
-        timeout-drain case a consume loop relies on to make progress."""
-        tr, fake = self._tr(block_for=1)
-        fake.rpush("queues:orders:notify", "1")  # token but no actual job
-        self.assertIsNone(tr.pop("orders", timeout=1))
-        # the stale token was consumed by the blpop wakeup
-        self.assertEqual(fake.llen("queues:orders:notify"), 0)
-
-    def test_pop_retrieves_when_job_already_ready(self):
-        """A job already on the ready list is reserved on the first eval (no block)."""
-        tr, fake = self._tr()
-        env = EnvelopeCodec.make("urn:babel:orders:created", {"x": 1}, queue="orders")
-        fake.rpush("queues:orders", EnvelopeCodec.encode(env))
-        fake.rpush("queues:orders:notify", "1")
-        msg = tr.pop("orders", timeout=1)
-        self.assertIsNotNone(msg)
-        self.assertEqual(EnvelopeCodec.decode(msg.body)["attempts"], 1)
+    def test_defaults(self):
+        tr = RedisTransport("redis://", client=object())
+        self.assertEqual(tr._retry_after, 90)
+        self.assertEqual(tr._batch, -1)
+        self.assertFalse(tr._laravel_compat)
 
     def test_url_enables_compat_and_overrides(self):
-        fake = FakeRedis()
-        tr = RedisTransport("redis://h:6379/0?laravel=1&prefix=q:&retry_after=90", client=fake)
+        tr = RedisTransport("redis://h/0?laravel=1&prefix=p:&retry_after=30", client=object())
         self.assertTrue(tr._laravel_compat)
-        self.assertEqual(tr._key_prefix, "q:")
-        self.assertEqual(tr._retry_after, 90)
+        self.assertEqual(tr._ready("orders"), "p:orders")
+        self.assertEqual(tr._retry_after, 30)
+
+    def test_retry_after_null_disables_recovery(self):
+        for value in ("null", "none", "NONE"):
+            tr = RedisTransport(f"redis://h/0?retry_after={value}", client=object())
+            self.assertIsNone(tr._retry_after)
+        self.assertIsNone(RedisTransport("redis://", client=object(), retry_after=None)._retry_after)
+
+    def test_invalid_retry_after_is_rejected(self):
+        for bad in (-1, 1.5, True, "90"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                RedisTransport("redis://", client=object(), retry_after=bad)  # type: ignore[arg-type]
+        for url in ("redis://h/0?retry_after=abc", "redis://h/0?retry_after=-5"):
+            with self.assertRaises(ValueError, msg=url):
+                RedisTransport(url, client=object())
+
+    def test_invalid_migration_batch_size_is_rejected(self):
+        for bad in (0, -2, 1.5, True):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                RedisTransport("redis://", client=object(), migration_batch_size=bad)  # type: ignore[arg-type]
+        for ok in (-1, 1, 500):
+            RedisTransport("redis://", client=object(), migration_batch_size=ok)
+
+    def test_capabilities(self):
+        tr = RedisTransport("redis://", client=object())
+        self.assertIsInstance(tr, Redeliverer)
+        self.assertIsInstance(tr, DeadLetterWriter)
+        self.assertIsInstance(tr, HeaderPublisher)
+
+    def test_qretry_after(self):
+        self.assertEqual(_qretry_after({}), 90)
+        self.assertEqual(_qretry_after({"retry_after": ["12"]}), 12)
+        self.assertIsNone(_qretry_after({"retry_after": ["null"]}))
 
     def test_pop_result_handles_short_and_false_replies(self):
-        # empty / too-short reply, and Lua `false` (None) job or reserved member
+        self.assertEqual(_pop_result(None), (None, None))
         self.assertEqual(_pop_result([]), (None, None))
         self.assertEqual(_pop_result([None, None]), (None, None))
-        self.assertEqual(_pop_result(["job", "reserved"]), ("job", "reserved"))
+        self.assertEqual(_pop_result([False, False]), (None, None))
+        self.assertEqual(_pop_result(["a", "b"]), ("a", "b"))
 
-    def test_qint_falls_back_on_missing_and_non_numeric(self):
-        self.assertEqual(_qint({}, "retry_after", 60), 60)  # absent -> default
-        self.assertEqual(_qint({"retry_after": ["nope"]}, "retry_after", 60), 60)  # non-int
-        self.assertEqual(_qint({"retry_after": ["90"]}, "retry_after", 60), 90)  # parsed
+    def test_released_body_advances_attempts_and_keeps_everything_else(self):
+        body = (
+            '{"job":"u","trace_id":"t","data":{},"meta":{"schema_version":1,"x":[]},'
+            '"attempts":2,"x-extra":{"k":"é"},"big":123456789012345678901234567890}'
+        )
+        out = json.loads(_released_body(body))
+        self.assertEqual(out["attempts"], 3)
+        self.assertEqual(out["data"], {})
+        self.assertEqual(out["meta"]["x"], [])
+        self.assertEqual(out["x-extra"], {"k": "é"})
+        self.assertEqual(out["big"], 123456789012345678901234567890)
+        self.assertIn("é", _released_body(body))  # unicode is not escaped
 
-    def test_round_trip_through_app(self):
-        fake = FakeRedis()
-        tr = RedisTransport("redis://", client=fake, laravel_compat=True)
-        app = BabelQueue(transport=tr, queue="orders")
-        seen: dict = {}
+    def test_released_body_is_unchanged_when_it_cannot_be_advanced(self):
+        for body in (
+            "not json",
+            "[1,2]",
+            '{"job":"u"}',
+            '{"job":"u","attempts":"2"}',
+            '{"job":"u","attempts":true}',
+            '{"job":"u","attempts":null}',
+        ):
+            self.assertEqual(_released_body(body), body)
 
-        @app.handler("urn:babel:orders:created")
-        def _on(data, meta):  # noqa: ANN001
-            seen.update({"data": data, "meta": meta})
-
-        msg_id = app.publish("urn:babel:orders:created", {"order_id": 7})
-        processed = app.consume("orders", max_messages=1, timeout=0)
-        self.assertEqual(processed, 1)
-        self.assertEqual(seen["data"]["order_id"], 7)
-        self.assertEqual(seen["meta"]["id"], msg_id)
-        # acked: reserved set empty
-        self.assertEqual(fake.zcard("queues:orders:reserved"), 0)
+    def test_reservation_token_is_a_csprng_hex_token(self):
+        source = SOURCE.read_text(encoding="utf-8")
+        self.assertIn("secrets.token_hex(_TOKEN_BYTES)", source)
+        self.assertIn("_TOKEN_BYTES = 16", source)
+        for forbidden in ("import random", "uuid"):
+            self.assertNotIn(forbidden, source)
 
 
-class RedisHeaderFrameTest(unittest.TestCase):
+class RedisFrameFunctionsTest(unittest.TestCase):
     """ADR-0028: the transport-owned ``__bq_frame`` carrier + bare-value back-compat."""
-
-    def _tr(self):
-        fake = FakeRedis()
-        return RedisTransport("redis://", client=fake), fake
-
-    def test_transport_is_a_header_publisher(self):
-        tr, _ = self._tr()
-        self.assertIsInstance(tr, HeaderPublisher)
 
     def test_frame_round_trip_recovers_headers_and_verbatim_body(self):
         body = '{"job":"u","trace_id":"t","data":{},"meta":{"schema_version":1},"attempts":0}'
@@ -340,7 +172,6 @@ class RedisHeaderFrameTest(unittest.TestCase):
         self.assertEqual(_frame_value(body, {"": "x", "drop": ""}), body)  # all blank -> bare
 
     def test_unframe_bare_values_back_compat(self):
-        # a bare envelope, a non-JSON value, and JSON without the sentinel all unframe to (value, {})
         for value in (
             '{"job":"u","trace_id":"t","data":{},"meta":{"schema_version":1}}',
             "not-json",
@@ -351,154 +182,687 @@ class RedisHeaderFrameTest(unittest.TestCase):
             self.assertEqual(body, value)
             self.assertEqual(headers, {})
 
-    def test_publish_with_headers_stores_frame_and_pop_unframes(self):
-        tr, fake = self._tr()
-        body = EnvelopeCodec.encode(
-            EnvelopeCodec.make("urn:babel:orders:created", {"x": 1}, queue="orders")
+
+class PopScriptWithoutRedisTest(unittest.TestCase):
+    """The reserve script's ``cjson.encode`` guard, proven without a Redis server.
+
+    fakeredis + lupa can MASK this bug: its cjson serialises ``inf`` as ``Infinity`` without error,
+    whereas real Redis' lua-cjson raises ``Cannot serialise number: must not be NaN or Inf`` (also
+    for over-deep nesting). On an unguarded script real Redis therefore aborts the EVAL after the
+    ``lpop``: the job is gone from ``:ready`` and was never reserved. These tests run the script in a
+    plain Lua interpreter against a ``cjson`` stub that fails the way real Redis does; the broker
+    tests in ``LaravelLayoutTest`` add the same bodies against a real Redis (CI: ``redis:7``).
+    """
+
+    #: Stand-in for lua-cjson: decode maps a marker to a table, encode refuses inf/NaN anywhere.
+    STUB = """
+        local function bad(v, depth)
+            if type(v) == 'number' then return v ~= v or v == math.huge or v == -math.huge end
+            if type(v) == 'table' then
+                for _, x in pairs(v) do if bad(x) then return true end end
+            end
+            return false
+        end
+        cjson = {
+            decode = function(s)
+                if s == 'INF_ATTEMPTS' then return {attempts = math.huge} end
+                if s == 'INF_DATA' then return {attempts = 0, data = {n = math.huge}} end
+                if s == 'NAN_DATA' then return {attempts = 0, data = {n = 0/0}} end
+                if s == 'OK' then return {attempts = 0} end
+                error('Expected value but found invalid token')
+            end,
+            encode = function(t)
+                if bad(t) then error('Cannot serialise number: must not be NaN or Inf') end
+                return 'ENCODED:' .. tostring(t.attempts)
+            end,
+        }
+    """
+
+    def _lua(self):
+        try:
+            from lupa import LuaRuntime
+        except ImportError:  # pragma: no cover - lupa ships with the test extras
+            self.skipTest("lupa is not installed")
+        return LuaRuntime(unpack_returned_tuples=True)
+
+    def _run(self, script: str, job: str):
+        lua = self._lua()
+        lua.execute(self.STUB)
+        lua.execute(
+            "KEYS = {'ready', 'reserved', 'notify'}; ARGV = {'100'}; calls = {}\n"
+            "redis = {call = function(cmd, key, ...)\n"
+            "  table.insert(calls, {cmd, key, ...})\n"
+            "  if cmd == 'lpop' and key == 'ready' then return POPPED end\n"
+            "  return false\n"
+            "end}"
         )
-        tr.publish_with_headers("orders", body, {"traceparent": "00-deadbeef"})
-        # the stored list value is a frame (the ack handle), the body is unframed on pop
-        stored = fake.lists["orders"][0]
-        self.assertIn('"__bq_frame"', stored)
-        msg = tr.pop("orders", timeout=0)
-        self.assertEqual(msg.body, body)  # consumer sees the bare wire envelope
-        self.assertEqual(msg.headers.get("traceparent"), "00-deadbeef")
-        # the ack handle is the stored frame, so LREM still matches
-        self.assertEqual(msg.handle, stored)
-        tr.ack(msg)
-        self.assertEqual(fake.lists["orders:processing"], [])
+        lua.globals().POPPED = job
+        result = lua.eval("function() " + script + " end")()
+        zadds = [c for c in lua.eval("calls").values() if c[1] == "zadd"]
+        return result[1], result[2], zadds
 
-    def test_plain_publish_then_pop_has_no_headers(self):
-        tr, _ = self._tr()
-        body = '{"job":"u","trace_id":"t","data":{},"meta":{"schema_version":1}}'
-        tr.publish("orders", body)
-        msg = tr.pop("orders", timeout=0)
-        self.assertEqual(msg.body, body)
-        self.assertEqual(msg.headers, {})  # bare value consumes with no headers
+    def test_an_encode_that_fails_reserves_the_raw_job_instead_of_aborting(self):
+        for job in ("INF_ATTEMPTS", "INF_DATA", "NAN_DATA"):
+            with self.subTest(job=job):
+                popped, reserved, zadds = self._run(_POP, job)
+                self.assertEqual((popped, reserved), (job, job))
+                self.assertEqual(len(zadds), 1)
+                self.assertEqual(zadds[0][4], job)  # ZADD reserved <score> <member>: member is the raw job
 
-    def test_publish_with_headers_no_headers_stays_bare(self):
-        tr, fake = self._tr()
-        body = '{"job":"u","trace_id":"t","data":{},"meta":{"schema_version":1}}'
-        tr.publish_with_headers("orders", body, {})
-        self.assertEqual(fake.lists["orders"], [body])  # byte-identical bare value, no frame
+    def test_a_clean_body_still_reserves_the_re_encoded_attempts_plus_one(self):
+        popped, reserved, _ = self._run(_POP, "OK")
+        self.assertEqual((popped, reserved), ("OK", "ENCODED:1"))
 
-    def test_laravel_compat_degrades_to_bare_publish(self):
-        fake = FakeRedis()
-        tr = RedisTransport("redis://", client=fake, laravel_compat=True)
-        env = EnvelopeCodec.make("urn:babel:orders:created", {"x": 1}, queue="orders")
-        body = EnvelopeCodec.encode(env)
-        tr.publish_with_headers("orders", body, {"traceparent": "00-x"})
-        # stored bare on the Laravel ready list (no frame — the reservation Lua decodes the job)
-        self.assertEqual(fake.lists["queues:orders"], [body])
-        for value in fake.lists["queues:orders"]:
-            self.assertNotIn("__bq_frame", value)
+    def test_the_stub_models_the_bug_an_unguarded_encode_raises(self):
+        unguarded = _POP.replace(
+            "local eok, encoded = pcall(cjson.encode, decoded)\n        if eok then\n"
+            "            reserved = encoded\n        else\n            reserved = job\n        end",
+            "reserved = cjson.encode(decoded)",
+        )
+        self.assertNotEqual(unguarded, _POP)
+        from lupa import LuaError
+
+        with self.assertRaises(LuaError):
+            self._run(unguarded, "INF_DATA")
+
+    def test_the_script_source_guards_the_encode_with_pcall(self):
+        self.assertIn("pcall(cjson.encode", _POP)
+        self.assertNotIn("= cjson.encode(", _POP)
 
 
-# ---------------------------------------------------------------------------
-# Integration: skipped unless a real Redis is reachable (CI runs it).
-# ---------------------------------------------------------------------------
+class _BrokerTest(unittest.TestCase):
+    """Base for the tests that need Redis (real, else emulated, else skipped)."""
 
-try:
-    import redis as _redis
-except ImportError:  # pragma: no cover
-    _redis = None
+    laravel = False
+    retry_after = 90
 
-REDIS_URL = os.environ.get("BABELQUEUE_TEST_REDIS", "redis://localhost:6379/0")
-
-
-def _redis_available() -> bool:
-    if _redis is None:
-        return False
-    try:
-        _redis.Redis.from_url(REDIS_URL, decode_responses=True).ping()
-        return True
-    except Exception:  # pragma: no cover - connection failure
-        return False
-
-
-@unittest.skipUnless(_redis_available(), f"no reachable Redis at {REDIS_URL}")
-class RedisTransportIntegrationTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.queue = f"bqtest:{uuid.uuid4().hex}"
-        self.client = _redis.Redis.from_url(REDIS_URL, decode_responses=True)
+        client, kind = redis_backend.connect()
+        if client is None:
+            if redis_backend.require_real_redis():
+                self.fail("BQ_REQUIRE_REDIS is set but no Redis is reachable")
+            self.skipTest("no Redis (real or emulated) available")
+        self.client = client
+        self.kind = kind
+        self.queue = redis_backend.unique_queue()
+        self.addCleanup(redis_backend.purge, client, self.queue)
+        self.clock = Clock()
+        self.tr = self.transport()
 
-    def tearDown(self) -> None:
-        self.client.delete(self.queue, f"{self.queue}:processing", f"{self.queue}.dlq")
-        self.client.delete(
-            f"queues:{self.queue}", f"queues:{self.queue}:reserved",
-            f"queues:{self.queue}:delayed", f"queues:{self.queue}:notify",
+    def transport(self, **overrides) -> RedisTransport:
+        params = dict(
+            client=self.client,
+            laravel_compat=self.laravel,
+            retry_after=self.retry_after,
+            clock=self.clock,
         )
+        params.update(overrides)
+        return RedisTransport("redis://", **params)  # type: ignore[arg-type]
 
-    def test_publish_consume_round_trip_and_ack(self) -> None:
-        app = BabelQueue(REDIS_URL, queue=self.queue)
+    # key helpers -------------------------------------------------------------
+    @property
+    def ready(self) -> str:
+        return f"queues:{self.queue}"
+
+    @property
+    def reserved(self) -> str:
+        return f"{self.ready}:reserved"
+
+    @property
+    def delayed(self) -> str:
+        return f"{self.ready}:delayed"
+
+    @property
+    def notify(self) -> str:
+        return f"{self.ready}:notify"
+
+    @property
+    def processing(self) -> str:
+        return f"{self.queue}:processing"
+
+    @property
+    def deadlines(self) -> str:
+        return f"{self.queue}:processing:deadlines"
+
+    def app(self, tr=None, **kwargs) -> BabelQueue:
+        return BabelQueue(transport=tr or self.tr, queue=self.queue, **kwargs)
+
+    @property
+    def now(self) -> int:
+        return int(self.clock.now)
+
+
+class LaravelLayoutTest(_BrokerTest):
+    laravel = True
+
+    def test_publish_uses_laravel_keys_and_notify(self):
+        body = make_body(self.queue)
+        self.tr.publish(self.queue, body)
+        self.assertEqual(self.client.lrange(self.ready, 0, -1), [body])
+        self.assertEqual(self.client.llen(self.notify), 1)
+
+    def test_pop_hands_the_raw_job_to_the_handler_and_reserves_attempts_plus_one(self):
+        body = make_body(self.queue)
+        self.tr.publish(self.queue, body)
+        msg = self.tr.pop(self.queue, timeout=0)
+        self.assertEqual(msg.body, body)  # raw: attempts is still 0 for the handler
+        self.assertEqual(msg.route_urn, "")
+        members = self.client.zrange(self.reserved, 0, -1, withscores=True)
+        self.assertEqual(len(members), 1)
+        member, score = members[0]
+        self.assertEqual(json.loads(member)["attempts"], 1)
+        self.assertEqual(int(score), self.now + 90)
+        self.assertEqual(msg.handle, member)
+        self.assertEqual(self.client.llen(self.notify), 0)
+
+    def test_ack_removes_the_reservation(self):
+        self.tr.publish(self.queue, make_body(self.queue))
+        msg = self.tr.pop(self.queue, timeout=0)
+        self.tr.ack(msg)
+        self.assertEqual(self.client.zcard(self.reserved), 0)
+
+    def test_pop_empty_returns_none(self):
+        self.assertIsNone(self.tr.pop(self.queue, timeout=0))
+
+    def test_blocking_pop_drains_to_none_within_the_window(self):
+        started = time.monotonic()
+        self.assertIsNone(self.tr.pop(self.queue, timeout=0.4))
+        self.assertLess(time.monotonic() - started, 2.0)
+
+    def test_failed_attempt_is_counted_exactly_once(self):
+        # Regression for the double count: the handler saw the raw job, a failure releases
+        # raw attempts + 1 (not reserved attempts + 1 again).
+        self.tr.publish(self.queue, make_body(self.queue))
+        app = self.app(max_attempts=10)
+        app.register(URN, lambda data, meta: (_ for _ in ()).throw(RuntimeError("boom")))
+        app.dispatch(self.tr.pop(self.queue, timeout=0))
+        delayed = self.client.zrange(self.delayed, 0, -1)
+        self.assertEqual([json.loads(b)["attempts"] for b in delayed], [1])
+        self.assertEqual(self.client.zcard(self.reserved), 0)
+        self.clock.advance(1)
+        again = self.tr.pop(self.queue, timeout=0)
+        self.assertEqual(json.loads(again.body)["attempts"], 1)
+        app.dispatch(again)
+        self.assertEqual([json.loads(b)["attempts"] for b in self.client.zrange(self.delayed, 0, -1)], [2])
+
+    def test_failure_with_retry_backoff_lands_in_delayed_at_floor_now_plus_ceil_backoff(self):
+        self.tr.publish(self.queue, make_body(self.queue))
+        app = self.app(max_attempts=10, retry_backoff=2.5)
+        app.register(URN, lambda data, meta: (_ for _ in ()).throw(RuntimeError("boom")))
+        app.dispatch(self.tr.pop(self.queue, timeout=0))
+        ((_, score),) = self.client.zrange(self.delayed, 0, -1, withscores=True)
+        self.assertEqual(int(score), self.now + 3)  # floor(now) + ceil(2.5)
+        # Not visible before the score, visible at it.
+        self.assertIsNone(self.tr.pop(self.queue, timeout=0))
+        self.clock.advance(2)
+        self.assertIsNone(self.tr.pop(self.queue, timeout=0))
+        self.clock.advance(1)
+        self.assertIsNotNone(self.tr.pop(self.queue, timeout=0))
+
+    def test_release_preserves_unknown_keys_and_empty_containers(self):
+        raw = (
+            '{"job":"%s","trace_id":"t","data":{},"meta":{"schema_version":1,"id":"i"},'
+            '"attempts":0,"x-extra":{"keep":[]},"note":"é"}' % URN
+        )
+        self.tr.publish(self.queue, raw)
+        msg = self.tr.pop(self.queue, timeout=0)
+        self.tr.release(msg, 0)
+        ((released,),) = [(b,) for b in self.client.zrange(self.delayed, 0, -1)]
+        out = json.loads(released)
+        self.assertEqual(out["attempts"], 1)
+        self.assertEqual(out["data"], {})
+        self.assertEqual(out["x-extra"], {"keep": []})
+        self.assertEqual(out["note"], "é")
+        self.assertEqual(self.client.zcard(self.reserved), 0)
+
+    def test_release_negative_delay_clamps_to_zero(self):
+        self.tr.publish(self.queue, make_body(self.queue))
+        msg = self.tr.pop(self.queue, timeout=0)
+        self.tr.release(msg, -5)
+        ((_, score),) = self.client.zrange(self.delayed, 0, -1, withscores=True)
+        self.assertEqual(int(score), self.now)
+
+    def test_crashed_worker_reservation_is_recovered_and_the_next_consumer_sees_attempts_plus_one(self):
+        self.tr.publish(self.queue, make_body(self.queue))
+        crashed = self.tr.pop(self.queue, timeout=0)  # never settled: the worker died
+        self.assertEqual(json.loads(crashed.body)["attempts"], 0)
+        self.assertIsNone(self.tr.pop(self.queue, timeout=0))  # still reserved
+        self.clock.advance(91)
+        second = self.transport().pop(self.queue, timeout=0)
+        self.assertIsNotNone(second)
+        self.assertEqual(json.loads(second.body)["attempts"], 1)  # the lost attempt counted once
+
+    def test_retry_after_none_never_recovers_and_reserves_with_plus_inf(self):
+        tr = self.transport(retry_after=None)
+        tr.publish(self.queue, make_body(self.queue))
+        tr.pop(self.queue, timeout=0)
+        ((_, score),) = self.client.zrange(self.reserved, 0, -1, withscores=True)
+        self.assertEqual(score, float("inf"))
+        self.clock.advance(10_000_000)
+        self.assertIsNone(tr.pop(self.queue, timeout=0))
+        self.assertEqual(self.client.zcard(self.reserved), 1)
+
+    def test_poison_bodies_reserve_raw_and_dead_letter_byte_identical_without_residue(self):
+        poison = ["not json at all", '{"job":"%s","attempts":"x"}' % URN, "[1,2,3]", '{"job":"%s"}' % URN]
+        for raw in poison[:2]:
+            self.tr.publish(self.queue, raw)
+        app = self.app(dead_letter=True)
+        app.register(URN, lambda data, meta: None)
+        for raw in poison[:2]:
+            msg = self.tr.pop(self.queue, timeout=0)
+            self.assertEqual(msg.body, raw)
+            self.assertEqual(msg.route_urn, NON_NUMERIC_ATTEMPTS_ROUTE)
+            self.assertEqual(msg.handle, raw)  # reserved member == the job
+            app.dispatch(msg)
+        dlq = self.client.lrange(f"queues:{self.queue}.dlq", 0, -1)
+        self.assertEqual(dlq, poison[:2])  # byte-identical, no dead_letter block
+        for key in (self.ready, self.reserved, self.delayed):
+            self.assertEqual(self.client.exists(key), 0, key)
+
+    def test_poison_is_dead_lettered_with_the_default_configuration(self):
+        # §1.1 / ADR-0033: the DLQ write is unconditional, so ``dead_letter_enabled`` (default
+        # False) must not turn poison into a silent drop.
+        poison = ["garbage", '{"job":"%s","attempts":"3"}' % URN]
+        for raw in poison:
+            self.tr.publish(self.queue, raw)
+        app = self.app()
+        self.assertFalse(app.dead_letter_enabled)
+        for _ in poison:
+            app.dispatch(self.tr.pop(self.queue, timeout=0))
+        self.assertEqual(self.client.lrange(f"{self.ready}.dlq", 0, -1), poison)  # byte-identical
+        self.assertEqual(self.client.llen(f"{self.ready}.dlq:notify"), len(poison))
+        for key in (self.ready, self.reserved, self.delayed):
+            self.assertEqual(self.client.exists(key), 0, key)
+
+    def test_poison_dead_letter_failure_leaves_it_reserved_not_dropped(self):
+        self.tr.publish(self.queue, "garbage")
+        app = self.app()
+        msg = self.tr.pop(self.queue, timeout=0)
+        original = self.tr.dead_letter
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("dlq write refused")
+
+        self.tr.dead_letter = boom
+        try:
+            with self.assertLogs("babelqueue.app", level="ERROR"):
+                app.dispatch(msg)
+        finally:
+            self.tr.dead_letter = original
+        self.assertEqual(self.client.exists(f"{self.ready}.dlq"), 0)
+        self.assertEqual(self.client.zcard(self.reserved) + self.client.llen(self.ready), 1)
+
+    def test_bodies_real_redis_cannot_re_encode_are_reserved_raw_not_lost(self):
+        # ``1e400`` decodes to inf; lua-cjson then refuses to encode it. The emulator accepts it
+        # (``Infinity``), so this proof only means something on a real Redis; the same script is
+        # also proven against a failing cjson stub in PopScriptWithoutRedisTest.
+        if self.kind != "real":
+            self.skipTest("the emulator's cjson masks this failure; needs a real Redis")
+        poison = [
+            '{"attempts":0,"data":{"n":1e400}}',
+            '{"attempts":1e400}',
+            '{"attempts":0,"data":{"x":NaN}}',
+        ]
+        for raw in poison:
+            self.tr.publish(self.queue, raw)
+        app = self.app(dead_letter=True)
+        app.register(URN, lambda data, meta: None)
+        for raw in poison:
+            msg = self.tr.pop(self.queue, timeout=0)
+            self.assertIsNotNone(msg, raw)
+            self.assertEqual(msg.body, raw)
+            self.assertEqual(msg.route_urn, NON_NUMERIC_ATTEMPTS_ROUTE)
+            self.assertEqual(msg.handle, raw)
+            app.dispatch(msg)
+        self.assertEqual(self.client.lrange(f"{self.ready}.dlq", 0, -1), poison)
+        for key in (self.ready, self.reserved, self.delayed):
+            self.assertEqual(self.client.exists(key), 0, key)
+
+    def test_poison_is_dead_lettered_even_with_the_delete_unknown_urn_strategy(self):
+        poison = ["not-json", '{"job":"%s","attempts":"3"}' % URN]
+        for raw in poison:
+            self.tr.publish(self.queue, raw)
+        app = self.app(dead_letter=True, on_unknown_urn=UnknownUrnStrategy.DELETE)
+        app.register(URN, lambda data, meta: None)
+        for _ in poison:
+            app.dispatch(self.tr.pop(self.queue, timeout=0))
+        self.assertEqual(self.client.lrange(f"{self.ready}.dlq", 0, -1), poison)
+        self.assertEqual(self.client.zcard(self.reserved), 0)
+
+    def test_a_genuine_unknown_urn_is_still_deleted_with_the_delete_strategy(self):
+        self.tr.publish(self.queue, make_body(self.queue))
+        app = self.app(dead_letter=True, on_unknown_urn=UnknownUrnStrategy.DELETE)
+        app.dispatch(self.tr.pop(self.queue, timeout=0))  # no handler for URN
+        self.assertEqual(self.client.exists(f"{self.ready}.dlq"), 0)
+        self.assertEqual(self.client.zcard(self.reserved), 0)
+
+    def test_dead_letter_moves_the_reservation_to_the_dlq_in_one_script(self):
+        self.tr.publish(self.queue, make_body(self.queue))
+        msg = self.tr.pop(self.queue, timeout=0)
+        self.tr.dead_letter(msg, f"{self.queue}.dlq", "record")
+        self.assertEqual(self.client.lrange(f"{self.ready}.dlq", 0, -1), ["record"])
+        self.assertEqual(self.client.llen(f"{self.ready}.dlq:notify"), 1)
+        self.assertEqual(self.client.zcard(self.reserved), 0)
+
+    def test_dead_letter_of_a_stale_reservation_writes_nothing(self):
+        self.tr.publish(self.queue, make_body(self.queue))
+        slow = self.tr.pop(self.queue, timeout=0)
+        self.clock.advance(91)
+        taken = self.transport().pop(self.queue, timeout=0)  # migrated back, re-reserved by another worker
+        self.assertIsNotNone(taken)
+        with self.assertLogs("babelqueue.redis", level="WARNING") as logs:
+            self.tr.dead_letter(slow, f"{self.queue}.dlq", "record")
+        self.assertIn("expired", logs.output[0])
+        self.assertEqual(self.client.exists(f"{self.ready}.dlq"), 0)
+        self.assertEqual(self.client.zcard(self.reserved), 1)  # the new owner's reservation is intact
+
+    def test_dead_letter_script_is_gated_on_the_member(self):
+        keys = (self.reserved, f"{self.ready}.dlq", f"{self.ready}.dlq:notify")
+        self.assertEqual(self.client.eval(_DEAD_LETTER, 3, *keys, "ghost", "body"), 0)
+        self.assertEqual(self.client.exists(keys[1]), 0)
+        self.client.zadd(self.reserved, {"member": 1})
+        self.assertEqual(self.client.eval(_DEAD_LETTER, 3, *keys, "member", "body"), 1)
+        self.assertEqual(self.client.lrange(keys[1], 0, -1), ["body"])
+        self.assertEqual(self.client.zcard(self.reserved), 0)
+        self.addCleanup(self.client.delete, *keys)
+
+    def test_dead_letter_without_a_handle_is_a_plain_publish(self):
+        orphan = ReceivedMessage(body="x", queue=self.queue, handle=None)
+        self.tr.dead_letter(orphan, f"{self.queue}.dlq", "record")
+        self.assertEqual(self.client.lrange(f"{self.ready}.dlq", 0, -1), ["record"])
+
+    def test_publish_delayed_scores_floor_now_plus_ceil_delay(self):
+        self.tr.publish_delayed(self.queue, make_body(self.queue), 1.2)
+        ((_, score),) = self.client.zrange(self.delayed, 0, -1, withscores=True)
+        self.assertEqual(int(score), self.now + 2)
+        self.assertEqual(self.client.llen(self.ready), 0)
+        self.assertEqual(self.client.llen(self.notify), 0)  # no notify token on a delayed add
+        self.assertIsNone(self.tr.pop(self.queue, timeout=0))
+        self.clock.advance(2)
+        self.assertIsNotNone(self.tr.pop(self.queue, timeout=0))
+
+    def test_publish_delayed_negative_delay_is_zero(self):
+        self.tr.publish_delayed(self.queue, make_body(self.queue), -3)
+        ((_, score),) = self.client.zrange(self.delayed, 0, -1, withscores=True)
+        self.assertEqual(int(score), self.now)
+
+    def test_delayed_message_arrives_after_about_two_seconds(self):
+        real = RedisTransport("redis://", client=self.client, laravel_compat=True)
+        real.publish_delayed(self.queue, make_body(self.queue), 2)
+        started = time.monotonic()
+        msg = real.pop(self.queue, timeout=5)
+        elapsed = time.monotonic() - started
+        self.assertIsNotNone(msg)
+        self.assertGreaterEqual(elapsed, 1.0)
+        self.assertLessEqual(elapsed, 3.5)
+
+    def test_migration_batch_size_bounds_one_migration(self):
+        tr = self.transport(migration_batch_size=1)
+        for i in range(3):
+            tr.publish_delayed(self.queue, make_body(self.queue, {"i": i}), 0)
+        self.assertEqual(self.client.zcard(self.delayed), 3)
+        self.assertIsNotNone(tr.pop(self.queue, timeout=0))
+        self.assertEqual(self.client.zcard(self.delayed), 2)  # one moved per pop
+
+    def test_laravel_compat_headers_degrade_to_a_bare_publish(self):
+        body = make_body(self.queue)
+        self.tr.publish_with_headers(self.queue, body, {"traceparent": "00-x"})
+        self.assertEqual(self.client.lrange(self.ready, 0, -1), [body])
+
+    def test_round_trip_through_app(self):
+        app = self.app()
         seen = {}
 
-        @app.handler("urn:babel:orders:created")
-        def handle(data, meta):  # noqa: ANN001
-            seen.update(data)
+        @app.handler(URN)
+        def _on(data, meta):  # noqa: ANN001
+            seen.update(data=data, meta=meta)
 
-        app.publish("urn:babel:orders:created", {"order_id": 42})
-        processed = app.consume(max_messages=1, timeout=2)
+        msg_id = app.publish(URN, {"order_id": 7})
+        self.assertEqual(app.consume(self.queue, max_messages=1, timeout=0), 1)
+        self.assertEqual(seen["data"]["order_id"], 7)
+        self.assertEqual(seen["meta"]["id"], msg_id)
+        self.assertEqual(self.client.zcard(self.reserved), 0)
 
-        self.assertEqual(processed, 1)
-        self.assertEqual(seen, {"order_id": 42})
-        self.assertEqual(self.client.llen(self.queue), 0)
-        self.assertEqual(self.client.llen(f"{self.queue}:processing"), 0)
+    def test_retries_run_out_into_the_dead_letter_queue(self):
+        app = self.app(max_attempts=2, dead_letter=True)
+        app.register(URN, lambda data, meta: (_ for _ in ()).throw(RuntimeError("boom")))
+        self.tr.publish(self.queue, make_body(self.queue))
+        app.dispatch(self.tr.pop(self.queue, timeout=0))
+        self.clock.advance(1)
+        app.dispatch(self.tr.pop(self.queue, timeout=0))
+        (record,) = self.client.lrange(f"{self.ready}.dlq", 0, -1)
+        self.assertEqual(json.loads(record)["attempts"], 2)
+        self.assertEqual(self.client.zcard(self.reserved), 0)
+        self.assertEqual(self.client.zcard(self.delayed), 0)
 
-    def test_failure_dead_letters_to_redis(self) -> None:
-        app = BabelQueue(REDIS_URL, queue=self.queue, max_attempts=1, dead_letter=True)
 
-        @app.handler("urn:babel:orders:created")
-        def handle(data, meta):  # noqa: ANN001
+class LegacyLayoutTest(_BrokerTest):
+    laravel = False
+
+    def test_publish_uses_the_raw_queue_key(self):
+        body = make_body(self.queue)
+        self.tr.publish(self.queue, body)
+        self.assertEqual(self.client.lrange(self.queue, 0, -1), [body])
+
+    def test_publish_delayed_is_a_laravel_layout_feature(self):
+        with self.assertRaises(BabelQueueError):
+            self.tr.publish_delayed(self.queue, make_body(self.queue), 5)
+        self.assertEqual(self.client.exists(self.queue), 0)
+
+    def test_pop_reserves_with_a_token_deadline_and_ack_clears_everything(self):
+        body = make_body(self.queue)
+        self.tr.publish(self.queue, body)
+        msg = self.tr.pop(self.queue, timeout=0)
+        self.assertEqual(msg.body, body)
+        self.assertEqual(self.client.lrange(self.processing, 0, -1), [body])
+        ((member, score),) = self.client.zrange(self.deadlines, 0, -1, withscores=True)
+        token, _, raw = member.partition(":")
+        self.assertRegex(token, TOKEN)
+        self.assertEqual(raw, body)
+        self.assertEqual(int(score), self.now + 90)
+        self.tr.ack(msg)
+        self.assertEqual(self.client.llen(self.processing), 0)
+        self.assertEqual(self.client.zcard(self.deadlines), 0)
+
+    def test_pop_empty_returns_none(self):
+        self.assertIsNone(self.tr.pop(self.queue, timeout=0))
+
+    def test_blocking_pop_picks_up_a_message_published_while_waiting(self):
+        body = make_body(self.queue)
+        timer = threading.Timer(0.3, lambda: self.client.rpush(self.queue, body))
+        timer.start()
+        self.addCleanup(timer.cancel)
+        msg = self.tr.pop(self.queue, timeout=3)
+        self.assertIsNotNone(msg)
+        self.assertEqual(msg.body, body)
+
+    def test_each_reservation_gets_its_own_token(self):
+        body = make_body(self.queue)
+        self.tr.publish(self.queue, body)
+        self.tr.publish(self.queue, body)
+        a = self.tr.pop(self.queue, timeout=0)
+        b = self.tr.pop(self.queue, timeout=0)
+        self.assertNotEqual(a.handle.token, b.handle.token)
+        self.assertRegex(a.handle.token, TOKEN)
+        self.assertRegex(b.handle.token, TOKEN)
+
+    def test_kill_9_worker_is_swept_back_to_the_end_with_attempts_untouched(self):
+        a, b, c = (make_body(self.queue, {"n": n}) for n in "abc")
+        for body in (a, b, c):
+            self.tr.publish(self.queue, body)
+        lost = self.tr.pop(self.queue, timeout=0)  # the worker is killed here: no ack, no release
+        self.assertEqual(lost.body, a)
+        self.clock.advance(91)  # past the retry-after deadline
+        survivor = self.transport()
+        order = []
+        for _ in range(3):
+            msg = survivor.pop(self.queue, timeout=0)
+            order.append(msg.body)
+            survivor.ack(msg)
+        self.assertEqual(order, [b, c, a])  # swept to the END
+        self.assertEqual(json.loads(order[-1])["attempts"], 0)
+        self.assertEqual(self.client.llen(self.processing), 0)
+        self.assertEqual(self.client.zcard(self.deadlines), 0)
+
+    def test_within_the_deadline_nothing_is_swept(self):
+        self.tr.publish(self.queue, make_body(self.queue))
+        self.tr.pop(self.queue, timeout=0)
+        self.clock.advance(89)
+        self.assertIsNone(self.transport().pop(self.queue, timeout=0))
+        self.assertEqual(self.client.llen(self.processing), 1)
+
+    def test_late_ack_touches_nothing_and_warns(self):
+        body = make_body(self.queue)
+        self.tr.publish(self.queue, body)
+        slow = self.tr.pop(self.queue, timeout=0)
+        self.clock.advance(91)
+        other = self.transport()
+        taken = other.pop(self.queue, timeout=0)  # swept and re-reserved under a new token
+        self.assertEqual(taken.body, body)
+        with self.assertLogs("babelqueue.redis", level="WARNING") as logs:
+            self.tr.ack(slow)  # the slow worker's own reservation is gone
+        self.assertIn("expired", logs.output[0])
+        self.assertEqual(self.client.lrange(self.processing, 0, -1), [body])  # the new owner's
+        self.assertEqual(self.client.zcard(self.deadlines), 1)
+        other.ack(taken)
+        self.assertEqual(self.client.llen(self.processing), 0)
+
+    def test_identical_copies_are_settled_one_reservation_at_a_time(self):
+        body = make_body(self.queue)
+        self.tr.publish(self.queue, body)
+        self.tr.publish(self.queue, body)
+        first = self.tr.pop(self.queue, timeout=0)
+        second = self.tr.pop(self.queue, timeout=0)
+        self.assertEqual(self.client.llen(self.processing), 2)
+        self.tr.ack(first)
+        self.assertEqual(self.client.llen(self.processing), 1)
+        self.assertEqual(self.client.zcard(self.deadlines), 1)
+        ((member, _),) = self.client.zrange(self.deadlines, 0, -1, withscores=True)
+        self.assertTrue(member.startswith(second.handle.token))
+        self.tr.ack(second)
+        self.assertEqual(self.client.llen(self.processing), 0)
+        self.assertEqual(self.client.zcard(self.deadlines), 0)
+
+    def test_retry_after_none_reserves_with_plus_inf_and_never_sweeps(self):
+        tr = self.transport(retry_after=None)
+        tr.publish(self.queue, make_body(self.queue))
+        tr.pop(self.queue, timeout=0)
+        ((_, score),) = self.client.zrange(self.deadlines, 0, -1, withscores=True)
+        self.assertEqual(score, float("inf"))
+        self.clock.advance(10_000_000)
+        self.assertIsNone(tr.pop(self.queue, timeout=0))
+        self.assertEqual(self.client.llen(self.processing), 1)
+
+    def test_release_ignores_the_delay_and_requeues_at_the_end(self):
+        first, second = make_body(self.queue, {"n": 1}), make_body(self.queue, {"n": 2})
+        self.tr.publish(self.queue, first)
+        self.tr.publish(self.queue, second)
+        msg = self.tr.pop(self.queue, timeout=0)
+        self.tr.release(msg, 30)  # no delayed set in the legacy layout: delay is ignored
+        self.assertEqual(self.client.llen(self.processing), 0)
+        self.assertEqual(self.client.zcard(self.deadlines), 0)
+        stored = self.client.lrange(self.queue, 0, -1)
+        self.assertEqual(stored[0], second)
+        self.assertEqual(json.loads(stored[1])["attempts"], 1)
+
+    def test_release_reframes_the_headers(self):
+        body = make_body(self.queue)
+        self.tr.publish_with_headers(self.queue, body, {"traceparent": "00-abc"})
+        msg = self.tr.pop(self.queue, timeout=0)
+        self.assertEqual(msg.headers, {"traceparent": "00-abc"})
+        self.tr.release(msg, 0)
+        again = self.tr.pop(self.queue, timeout=0)
+        self.assertEqual(again.headers, {"traceparent": "00-abc"})
+        self.assertEqual(json.loads(again.body)["attempts"], 1)
+
+    def test_dead_letter_writes_and_settles_as_one_step(self):
+        body = make_body(self.queue)
+        self.tr.publish(self.queue, body)
+        msg = self.tr.pop(self.queue, timeout=0)
+        self.tr.dead_letter(msg, f"{self.queue}.dlq", "record")
+        self.assertEqual(self.client.lrange(f"{self.queue}.dlq", 0, -1), ["record"])
+        self.assertEqual(self.client.llen(self.processing), 0)
+        self.assertEqual(self.client.zcard(self.deadlines), 0)
+
+    def test_dead_letter_of_a_stale_reservation_writes_nothing(self):
+        self.tr.publish(self.queue, make_body(self.queue))
+        slow = self.tr.pop(self.queue, timeout=0)
+        self.clock.advance(91)
+        self.transport().pop(self.queue, timeout=0)  # sweeps and re-reserves
+        with self.assertLogs("babelqueue.redis", level="WARNING"):
+            self.tr.dead_letter(slow, f"{self.queue}.dlq", "record")
+        self.assertEqual(self.client.exists(f"{self.queue}.dlq"), 0)
+
+    def test_settle_script_takes_token_and_raw_and_builds_the_member_itself(self):
+        body = make_body(self.queue)
+        self.tr.publish(self.queue, body)
+        msg = self.tr.pop(self.queue, timeout=0)
+        token, raw = msg.handle.token, msg.handle.raw
+        keys = (self.processing, self.deadlines)
+        self.assertEqual(self.client.eval(_SETTLE, 2, *keys, "0" * 32, raw), 0)  # foreign token
+        self.assertEqual(self.client.llen(self.processing), 1)
+        self.assertEqual(self.client.eval(_SETTLE, 2, *keys, token, raw), 1)  # ARGV = token, raw
+        self.assertEqual(self.client.llen(self.processing), 0)
+        self.assertEqual(self.client.zcard(self.deadlines), 0)
+
+    def test_settle_script_pushes_the_body_to_the_target(self):
+        self.tr.publish(self.queue, make_body(self.queue))
+        msg = self.tr.pop(self.queue, timeout=0)
+        target = f"{self.queue}.dlq"
+        self.addCleanup(self.client.delete, target)
+        keys = (self.processing, self.deadlines, target)
+        self.assertEqual(self.client.eval(_SETTLE, 3, *keys, msg.handle.token, msg.handle.raw, "record"), 1)
+        self.assertEqual(self.client.lrange(target, 0, -1), ["record"])
+
+    def test_the_processing_key_name_is_unchanged(self):
+        self.tr.publish(self.queue, make_body(self.queue))
+        self.tr.pop(self.queue, timeout=0)
+        self.assertEqual(self.client.exists(f"{self.queue}:processing"), 1)
+
+    def test_legacy_is_the_default_layout(self):
+        self.assertFalse(RedisTransport("redis://", client=self.client)._laravel_compat)
+
+    def test_round_trip_through_app_and_retry_to_the_dead_letter_queue(self):
+        app = self.app(max_attempts=2, dead_letter=True)
+        calls = []
+
+        def boom(data, meta):  # noqa: ANN001
+            calls.append(1)
             raise RuntimeError("boom")
 
-        app.publish("urn:babel:orders:created", {"order_id": 1})
-        app.consume(max_messages=2, timeout=2)
+        app.register(URN, boom)
+        app.publish(URN, {"x": 1})
+        self.assertEqual(app.consume(self.queue, max_messages=2, timeout=0), 2)
+        self.assertEqual(len(calls), 2)
+        (record,) = self.client.lrange(f"{self.queue}.dlq", 0, -1)
+        self.assertEqual(json.loads(record)["attempts"], 2)
+        self.assertEqual(self.client.llen(self.processing), 0)
+        self.assertEqual(self.client.zcard(self.deadlines), 0)
 
-        self.assertEqual(self.client.llen(f"{self.queue}:processing"), 0)
-        dlq = self.client.lrange(f"{self.queue}.dlq", 0, -1)
-        self.assertEqual(len(dlq), 1)
-        env = EnvelopeCodec.decode(dlq[0])
-        self.assertEqual(env["dead_letter"]["reason"], "failed")
+    def test_publish_with_headers_stores_a_frame_and_pop_unframes(self):
+        body = make_body(self.queue)
+        self.tr.publish_with_headers(self.queue, body, {"traceparent": "00-deadbeef"})
+        (stored,) = self.client.lrange(self.queue, 0, -1)
+        self.assertIn('"__bq_frame"', stored)
+        msg = self.tr.pop(self.queue, timeout=0)
+        self.assertEqual(msg.body, body)
+        self.assertEqual(msg.headers.get("traceparent"), "00-deadbeef")
+        self.assertEqual(msg.handle.raw, stored)  # the ack handle keeps the stored frame
+        self.tr.ack(msg)
+        self.assertEqual(self.client.llen(self.processing), 0)
 
-    def test_traceparent_header_round_trips_on_real_redis(self) -> None:
-        """ADR-0028: a published traceparent arrives on the consumed message's headers, and the
-        body (the frozen wire envelope) is unchanged. A bare publish consumes with no headers."""
-        tr = RedisTransport(REDIS_URL)
-        body = EnvelopeCodec.encode(
-            EnvelopeCodec.make("urn:babel:orders:created", {"order_id": 7}, queue=self.queue)
-        )
-        tr.publish_with_headers(self.queue, body, {"traceparent": "00-feedface"})
-        msg = tr.pop(self.queue, timeout=2)
-        self.assertIsNotNone(msg)
-        self.assertEqual(msg.body, body)  # body unchanged
-        self.assertEqual(msg.headers.get("traceparent"), "00-feedface")
-        tr.ack(msg)
+    def test_plain_publish_then_pop_has_no_headers(self):
+        self.tr.publish(self.queue, make_body(self.queue))
+        self.assertEqual(self.tr.pop(self.queue, timeout=0).headers, {})
 
-        # a bare publish consumes with no headers (back-compat)
-        tr.publish(self.queue, body)
-        bare = tr.pop(self.queue, timeout=2)
-        self.assertIsNotNone(bare)
-        self.assertEqual(bare.body, body)
-        self.assertEqual(bare.headers, {})
-        tr.ack(bare)
+    def test_publish_with_no_headers_stays_bare(self):
+        body = make_body(self.queue)
+        self.tr.publish_with_headers(self.queue, body, {})
+        self.assertEqual(self.client.lrange(self.queue, 0, -1), [body])
 
-    def test_laravel_compat_reserved_set_round_trip(self) -> None:
-        """Against a real Redis: a Laravel-compatible worker reserves into the
-        ``queues:<name>:reserved`` sorted set and acks via ZREM."""
-        tr = RedisTransport(REDIS_URL, laravel_compat=True)
-        app = BabelQueue(transport=tr, queue=self.queue)
-        seen = {}
-        app.register("urn:babel:orders:created", lambda data, meta: seen.update(data))
-
-        app.publish("urn:babel:orders:created", {"order_id": 99})
-        processed = app.consume(self.queue, max_messages=1, timeout=2)
-
-        self.assertEqual(processed, 1)
-        self.assertEqual(seen, {"order_id": 99})
-        self.assertEqual(self.client.zcard(f"queues:{self.queue}:reserved"), 0)
-        self.assertEqual(self.client.llen(f"queues:{self.queue}"), 0)
+    def test_warning_logger_name(self):
+        self.assertEqual(logging.getLogger("babelqueue.redis").name, "babelqueue.redis")
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     unittest.main()

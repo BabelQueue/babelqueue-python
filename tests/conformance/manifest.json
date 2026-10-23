@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "conformance_version": "1.5.0",
+  "conformance_version": "1.6.0",
   "sections": {
     "cases": {
       "scope": "core"
@@ -65,8 +65,17 @@
     "backoff": {
       "scope": "kafka"
     },
+    "retry_backoff": {
+      "scope": "core"
+    },
     "redis_layout": {
       "scope": "redis"
+    },
+    "redis_delay": {
+      "scope": "redis"
+    },
+    "kafka_poison": {
+      "scope": "kafka"
     }
   },
   "exceptions": [
@@ -1429,7 +1438,7 @@
     ]
   },
   "delay": {
-    "description": "Amazon SQS delays (broker-bindings.md \u00a73.4). Scope: `sqs`. For each case, ask the SQS transport to publish with `delay_seconds` on a `queue_type` queue. `expect.delay_seconds_attribute` is the `DelaySeconds` the SendMessage call carries; `expect: \"reject\"` means the publish MUST raise BabelQueueException (the SDK's native error type) and never silently drop or truncate the delay. A delay of 0 or a negative delay is not pinned by the contract and is not tested. The `release_visibility` block pins the `ChangeMessageVisibility` timeout of a release (\u00a73.5): `0` redelivers now, `N` backs off N seconds. Only the SQS contract is encoded here; the Redis (\u00a71) and Kafka (\u00a76.4) delay mechanics are different mechanisms and are not pinned by this section (Kafka tiers are the `backoff` section; Redis defines no available-at formula).",
+    "description": "Amazon SQS delays (broker-bindings.md \u00a73.4). Scope: `sqs`. For each case, ask the SQS transport to publish with `delay_seconds` on a `queue_type` queue. `expect.delay_seconds_attribute` is the `DelaySeconds` the SendMessage call carries; `expect: \"reject\"` means the publish MUST raise BabelQueueException (the SDK's native error type) and never silently drop or truncate the delay. A delay of 0 or a negative delay is not pinned by the contract and is not tested. The `release_visibility` block pins the `ChangeMessageVisibility` timeout of a release (\u00a73.5): `0` redelivers now, `N` backs off N seconds. Only the SQS contract is encoded here; the Redis (\u00a71.6) and Kafka (\u00a76.4) delay mechanics are different mechanisms and are not pinned by this section (Kafka tiers are the `backoff` section; the Redis available-at formula is the separate `redis_delay` section, scope `redis`, added in 1.6.0).",
     "cases": [
       {
         "name": "standard-1s",
@@ -1502,7 +1511,7 @@
     }
   },
   "backoff": {
-    "description": "Kafka retry-topic tiers (broker-bindings.md \u00a76.4/\u00a76.5). Scope: `kafka`. `retry_tiers_ms` are the configured `<topic>.retry.<n>` delay tiers in ascending order (the contract's example is 5s, 30s, 5m, 30m); the contract does not fix how `<n>` is numbered, so the expected tier is given by its delay (`tier_ms`), not by a topic name. For each case in `cases`, request `delay_ms` for a message on `work_topic`: the SDK MUST publish to the smallest tier >= the requested delay and set the listed headers (values are UTF-8 decimal strings per \u00a76.3; any header not listed is unspecified); a delay above the largest tier, or any delay with no tiers configured, MUST raise BabelQueueException (`expect: \"reject\"`). The `retry_republish` block pins the release/retry republish (\u00a76.5): `bq-attempts + 1`, `bq-original-topic`, `bq-delay` (= `release_delay_ms`; present on every record routed via a retry topic, section 6.3), body `attempts` kept in sync, and the same tier rule for `release_delay_ms`. Only what the contract defines is pinned: the backoff policy that produces `release_delay_ms` (worker configuration) is not.",
+    "description": "Kafka retry-topic tiers (broker-bindings.md \u00a76.4/\u00a76.5). Scope: `kafka`. `retry_tiers_ms` are the configured `<topic>.retry.<n>` delay tiers in ascending order (the contract's example is 5s, 30s, 5m, 30m); `<n>` is the 1-based tier index (`<topic>.retry.1` is the first configured tier; \u00a76.4), never a delay value, so in the cases below the expected tier is given by its delay (`tier_ms`) and the `topic_names` / `retry_attempt_tier` blocks pin the topic names. Two separate rules, which MUST NOT be merged (\u00a76.4 vs \u00a76.5). (1) The REQUESTED-DELAY rule (\u00a76.4), pinned by `cases`: for each case request `delay_ms` for a message on `work_topic`; the SDK MUST publish to the smallest tier >= the requested delay and set the listed headers, `bq-delay` being the REQUESTED delay (values are UTF-8 decimal strings per \u00a76.3; any header not listed is unspecified); a delay above the largest tier, or any delay with no tiers configured, MUST raise BabelQueueException (`expect: \"reject\"`). (2) The RETRY/RELEASE rule (\u00a76.5), pinned by `retry_republish` and `retry_attempt_tier`: a record that already has `attempts` (`attempts_before`) attempts goes to tier `n = min(attempts_before, N-1) + 1` of the `N` configured tiers and stays on the last tier once they run out; the republished record carries `bq-attempts = attempts_before + 1`, `bq-delay = tier_ms` (the tier's own delay, not a worker-computed one), `bq-original-topic = work_topic`, and the body `attempts` kept in sync (`body_attempts`); with no tiers configured the retry MUST raise BabelQueueException. Kafka does not apply the `retry_backoff` parameters on this path (ADR-0034 \u00a79; their formula is the separate `retry_backoff` section, scope `core`). Conformance 1.6.0 adds the blocks `topic_names`, `retry_attempt_tier` and `default_tiers`, each with its own `cases` array (ADR-0034), and rewrites `retry_republish` to the \u00a76.5 attempt-to-tier rule. `topic_names`: the retry topic of tier `n` MUST be `<work_topic>.retry.<n>` (`expect_topic`). `retry_attempt_tier`: the \u00a76.5 retry rule, also pinning the consumed record's `key` byte for byte when the case lists one. `default_tiers`: the named constant `DEFAULT_RETRY_TIERS_MS` (or the language's equivalent) MUST equal `expect` (RECOMMENDED list, \u00a76.4).",
     "cases": [
       {
         "name": "below-first-tier",
@@ -1615,10 +1624,11 @@
       }
     ],
     "retry_republish": {
-      "description": "Kafka release/retry republish (broker-bindings.md \u00a76.5). Start from a message at `attempts` on `work_topic` and release it with `release_delay_ms`. `expect.headers` and `expect.body_attempts` describe the republished record (including `bq-delay` = `release_delay_ms`, section 6.3); with no retry tiers configured a release MUST raise BabelQueueException.",
+      "description": "Kafka release/retry republish (broker-bindings.md \u00a76.5). Start from a message at `attempts` on `work_topic` with `retry_tiers_ms` configured and release/retry it. The target is NOT chosen from a requested delay: it is tier `n = min(attempts, N-1) + 1` (the same rule as `retry_attempt_tier`; this block exercises the release/retry entry point of the SDK, that block the republish helper). `expect` pins `n`, `topic` (`<work_topic>.retry.<n>`), `tier_ms`, `body_attempts` (= `attempts + 1`) and `headers` (`bq-attempts = attempts + 1`, `bq-delay = tier_ms`, `bq-original-topic = work_topic`; UTF-8 decimal strings, \u00a76.3). With no retry tiers configured the call MUST raise BabelQueueException (`expect: \"reject\"`).",
       "cases": [
         {
           "name": "first-retry",
+          "source": "broker-bindings.md \u00a76.5 (retry tier rule: n = min(attempts_before, N-1) + 1; retry republish headers)",
           "work_topic": "orders",
           "retry_tiers_ms": [
             5000,
@@ -1627,19 +1637,44 @@
             1800000
           ],
           "attempts": 0,
-          "release_delay_ms": 5000,
           "expect": {
+            "n": 1,
+            "topic": "orders.retry.1",
             "tier_ms": 5000,
             "body_attempts": 1,
             "headers": {
-              "bq-delay": "5000",
               "bq-attempts": "1",
+              "bq-delay": "5000",
               "bq-original-topic": "orders"
             }
           }
         },
         {
-          "name": "third-retry-picks-larger-tier",
+          "name": "second-retry-second-tier",
+          "source": "broker-bindings.md \u00a76.5 (retry tier rule: n = min(attempts_before, N-1) + 1; retry republish headers)",
+          "work_topic": "orders",
+          "retry_tiers_ms": [
+            5000,
+            30000,
+            300000,
+            1800000
+          ],
+          "attempts": 1,
+          "expect": {
+            "n": 2,
+            "topic": "orders.retry.2",
+            "tier_ms": 30000,
+            "body_attempts": 2,
+            "headers": {
+              "bq-attempts": "2",
+              "bq-delay": "30000",
+              "bq-original-topic": "orders"
+            }
+          }
+        },
+        {
+          "name": "third-retry-third-tier",
+          "source": "broker-bindings.md \u00a76.5 (retry tier rule: n = min(attempts_before, N-1) + 1; retry republish headers)",
           "work_topic": "orders",
           "retry_tiers_ms": [
             5000,
@@ -1648,27 +1683,556 @@
             1800000
           ],
           "attempts": 2,
-          "release_delay_ms": 30000,
           "expect": {
-            "tier_ms": 30000,
+            "n": 3,
+            "topic": "orders.retry.3",
+            "tier_ms": 300000,
             "body_attempts": 3,
             "headers": {
-              "bq-delay": "30000",
               "bq-attempts": "3",
+              "bq-delay": "300000",
+              "bq-original-topic": "orders"
+            }
+          }
+        },
+        {
+          "name": "fifth-retry-stays-on-last-tier",
+          "source": "broker-bindings.md \u00a76.5 (retry tier rule: n = min(attempts_before, N-1) + 1; retry republish headers)",
+          "work_topic": "orders",
+          "retry_tiers_ms": [
+            5000,
+            30000,
+            300000,
+            1800000
+          ],
+          "attempts": 4,
+          "expect": {
+            "n": 4,
+            "topic": "orders.retry.4",
+            "tier_ms": 1800000,
+            "body_attempts": 5,
+            "headers": {
+              "bq-attempts": "5",
+              "bq-delay": "1800000",
               "bq-original-topic": "orders"
             }
           }
         },
         {
           "name": "no-tiers-configured-rejected",
+          "source": "broker-bindings.md \u00a76.5 (retry tier rule: n = min(attempts_before, N-1) + 1; retry republish headers); no tiers: BabelQueueException",
           "work_topic": "orders",
           "retry_tiers_ms": [],
           "attempts": 0,
-          "release_delay_ms": 5000,
           "expect": "reject"
         }
       ]
+    },
+    "topic_names": {
+      "description": "Retry topic naming (broker-bindings.md \u00a76.4): the retry topic of tier `n` (1-based) of `work_topic` MUST be `expect_topic` = `<work_topic>.retry.<n>`.",
+      "cases": [
+        {
+          "name": "first-tier",
+          "source": "broker-bindings.md \u00a76.4 (retry topics `<topic>.retry.<n>`, n is the tier index from 1)",
+          "work_topic": "orders",
+          "n": 1,
+          "expect_topic": "orders.retry.1"
+        },
+        {
+          "name": "second-tier",
+          "source": "broker-bindings.md \u00a76.4 (retry topics `<topic>.retry.<n>`, n is the tier index from 1)",
+          "work_topic": "orders",
+          "n": 2,
+          "expect_topic": "orders.retry.2"
+        },
+        {
+          "name": "fourth-tier",
+          "source": "broker-bindings.md \u00a76.4 (retry topics `<topic>.retry.<n>`, n is the tier index from 1)",
+          "work_topic": "orders",
+          "n": 4,
+          "expect_topic": "orders.retry.4"
+        },
+        {
+          "name": "dotted-topic",
+          "source": "broker-bindings.md \u00a76.4 (retry topics `<topic>.retry.<n>`, n is the tier index from 1)",
+          "work_topic": "orders.v2",
+          "n": 2,
+          "expect_topic": "orders.v2.retry.2"
+        },
+        {
+          "name": "tier-index-is-not-a-delay",
+          "source": "broker-bindings.md \u00a76.4 (retry topics `<topic>.retry.<n>`, n is the tier index from 1)",
+          "work_topic": "orders",
+          "n": 3,
+          "expect_topic": "orders.retry.3"
+        }
+      ]
+    },
+    "retry_attempt_tier": {
+      "description": "Retry attempt-to-tier mapping and republish headers (broker-bindings.md \u00a76.5). Retrying a record that already has `attempts_before` attempts MUST go to tier `n = min(attempts_before, N-1) + 1` of the `N` configured `retry_tiers_ms` and stay on the last tier once they run out; `expect` pins `topic`, `tier_ms`, the headers (`bq-attempts = attempts_before + 1`, `bq-delay = tier_ms`, `bq-original-topic = work_topic`; UTF-8 decimal strings), the body `attempts` (`body_attempts`) and, when the case lists a `key`, the record key byte for byte.",
+      "cases": [
+        {
+          "name": "attempts-0-first-tier",
+          "source": "broker-bindings.md \u00a76.5 (retry tier rule: n = min(attempts_before, N-1) + 1; retry republish headers)",
+          "work_topic": "orders",
+          "retry_tiers_ms": [
+            5000,
+            30000,
+            300000,
+            1800000
+          ],
+          "attempts_before": 0,
+          "expect": {
+            "n": 1,
+            "topic": "orders.retry.1",
+            "tier_ms": 5000,
+            "body_attempts": 1,
+            "headers": {
+              "bq-attempts": "1",
+              "bq-delay": "5000",
+              "bq-original-topic": "orders"
+            }
+          }
+        },
+        {
+          "name": "attempts-1-second-tier",
+          "source": "broker-bindings.md \u00a76.5 (retry tier rule: n = min(attempts_before, N-1) + 1; retry republish headers)",
+          "work_topic": "orders",
+          "retry_tiers_ms": [
+            5000,
+            30000,
+            300000,
+            1800000
+          ],
+          "attempts_before": 1,
+          "expect": {
+            "n": 2,
+            "topic": "orders.retry.2",
+            "tier_ms": 30000,
+            "body_attempts": 2,
+            "headers": {
+              "bq-attempts": "2",
+              "bq-delay": "30000",
+              "bq-original-topic": "orders"
+            }
+          }
+        },
+        {
+          "name": "attempts-2-third-tier",
+          "source": "broker-bindings.md \u00a76.5 (retry tier rule: n = min(attempts_before, N-1) + 1; retry republish headers)",
+          "work_topic": "orders",
+          "retry_tiers_ms": [
+            5000,
+            30000,
+            300000,
+            1800000
+          ],
+          "attempts_before": 2,
+          "expect": {
+            "n": 3,
+            "topic": "orders.retry.3",
+            "tier_ms": 300000,
+            "body_attempts": 3,
+            "headers": {
+              "bq-attempts": "3",
+              "bq-delay": "300000",
+              "bq-original-topic": "orders"
+            }
+          }
+        },
+        {
+          "name": "attempts-3-last-tier",
+          "source": "broker-bindings.md \u00a76.5 (retry tier rule: n = min(attempts_before, N-1) + 1; retry republish headers)",
+          "work_topic": "orders",
+          "retry_tiers_ms": [
+            5000,
+            30000,
+            300000,
+            1800000
+          ],
+          "attempts_before": 3,
+          "expect": {
+            "n": 4,
+            "topic": "orders.retry.4",
+            "tier_ms": 1800000,
+            "body_attempts": 4,
+            "headers": {
+              "bq-attempts": "4",
+              "bq-delay": "1800000",
+              "bq-original-topic": "orders"
+            }
+          }
+        },
+        {
+          "name": "attempts-4-stays-on-last-tier",
+          "source": "broker-bindings.md \u00a76.5 (retry tier rule: n = min(attempts_before, N-1) + 1; retry republish headers)",
+          "work_topic": "orders",
+          "retry_tiers_ms": [
+            5000,
+            30000,
+            300000,
+            1800000
+          ],
+          "attempts_before": 4,
+          "expect": {
+            "n": 4,
+            "topic": "orders.retry.4",
+            "tier_ms": 1800000,
+            "body_attempts": 5,
+            "headers": {
+              "bq-attempts": "5",
+              "bq-delay": "1800000",
+              "bq-original-topic": "orders"
+            }
+          }
+        },
+        {
+          "name": "attempts-10-stays-on-last-tier",
+          "source": "broker-bindings.md \u00a76.5 (retry tier rule: n = min(attempts_before, N-1) + 1; retry republish headers)",
+          "work_topic": "orders",
+          "retry_tiers_ms": [
+            5000,
+            30000,
+            300000,
+            1800000
+          ],
+          "attempts_before": 10,
+          "expect": {
+            "n": 4,
+            "topic": "orders.retry.4",
+            "tier_ms": 1800000,
+            "body_attempts": 11,
+            "headers": {
+              "bq-attempts": "11",
+              "bq-delay": "1800000",
+              "bq-original-topic": "orders"
+            }
+          }
+        },
+        {
+          "name": "single-tier-always-first",
+          "source": "broker-bindings.md \u00a76.5 (retry tier rule: n = min(attempts_before, N-1) + 1; retry republish headers)",
+          "work_topic": "orders",
+          "retry_tiers_ms": [
+            10000
+          ],
+          "attempts_before": 0,
+          "expect": {
+            "n": 1,
+            "topic": "orders.retry.1",
+            "tier_ms": 10000,
+            "body_attempts": 1,
+            "headers": {
+              "bq-attempts": "1",
+              "bq-delay": "10000",
+              "bq-original-topic": "orders"
+            }
+          }
+        },
+        {
+          "name": "single-tier-stays",
+          "source": "broker-bindings.md \u00a76.5 (retry tier rule: n = min(attempts_before, N-1) + 1; retry republish headers)",
+          "work_topic": "orders",
+          "retry_tiers_ms": [
+            10000
+          ],
+          "attempts_before": 5,
+          "expect": {
+            "n": 1,
+            "topic": "orders.retry.1",
+            "tier_ms": 10000,
+            "body_attempts": 6,
+            "headers": {
+              "bq-attempts": "6",
+              "bq-delay": "10000",
+              "bq-original-topic": "orders"
+            }
+          }
+        },
+        {
+          "name": "two-tiers-custom",
+          "source": "broker-bindings.md \u00a76.5 (retry tier rule: n = min(attempts_before, N-1) + 1; retry republish headers)",
+          "work_topic": "orders",
+          "retry_tiers_ms": [
+            1000,
+            60000
+          ],
+          "attempts_before": 1,
+          "expect": {
+            "n": 2,
+            "topic": "orders.retry.2",
+            "tier_ms": 60000,
+            "body_attempts": 2,
+            "headers": {
+              "bq-attempts": "2",
+              "bq-delay": "60000",
+              "bq-original-topic": "orders"
+            }
+          }
+        },
+        {
+          "name": "dotted-work-topic",
+          "source": "broker-bindings.md \u00a76.5 (retry tier rule: n = min(attempts_before, N-1) + 1; retry republish headers)",
+          "work_topic": "orders.v2",
+          "retry_tiers_ms": [
+            5000,
+            30000,
+            300000,
+            1800000
+          ],
+          "attempts_before": 2,
+          "expect": {
+            "n": 3,
+            "topic": "orders.v2.retry.3",
+            "tier_ms": 300000,
+            "body_attempts": 3,
+            "headers": {
+              "bq-attempts": "3",
+              "bq-delay": "300000",
+              "bq-original-topic": "orders.v2"
+            }
+          }
+        },
+        {
+          "name": "key-forwarded-byte-for-byte",
+          "source": "broker-bindings.md \u00a76.5 (retry tier rule: n = min(attempts_before, N-1) + 1; retry republish headers)",
+          "work_topic": "orders",
+          "retry_tiers_ms": [
+            5000,
+            30000,
+            300000,
+            1800000
+          ],
+          "attempts_before": 1,
+          "key": "customer-0042",
+          "expect": {
+            "n": 2,
+            "topic": "orders.retry.2",
+            "tier_ms": 30000,
+            "body_attempts": 2,
+            "headers": {
+              "bq-attempts": "2",
+              "bq-delay": "30000",
+              "bq-original-topic": "orders"
+            },
+            "key": "customer-0042"
+          }
+        }
+      ]
+    },
+    "default_tiers": {
+      "description": "The RECOMMENDED default retry tier list (broker-bindings.md \u00a76.4), exposed as the constant `DEFAULT_RETRY_TIERS_MS` (or the language's idiomatic equivalent); its value MUST equal `expect`.",
+      "cases": [
+        {
+          "name": "recommended-tier-list",
+          "source": "broker-bindings.md \u00a76.4 (RECOMMENDED tier list, exposed as DEFAULT_RETRY_TIERS_MS)",
+          "constant": "DEFAULT_RETRY_TIERS_MS",
+          "expect": [
+            5000,
+            30000,
+            300000,
+            1800000
+          ]
+        }
+      ]
     }
+  },
+  "retry_backoff": {
+    "description": "Worker-side retry backoff formula (ADR-0034 \u00a79; broker-bindings.md \u00a76.5 states Kafka itself does not apply it). Scope: `core`: tested on the SDK's backoff helper without a broker, whatever the transport (SQS, Redis, AMQP or Kafka worker path). `d(n) = min(retry_backoff_max, retry_backoff * retry_backoff_multiplier^(n-1))` seconds, `n = attempts + 1` (1-based), `retry_backoff_max = 0` meaning no cap. With `retry_jitter: none` the delay MUST equal `expect_delay_seconds` exactly (the defaults are `retry_backoff 0`, `multiplier 1`, `max 0`, so an unconfigured helper yields 0); with `retry_jitter: full` the delay is `uniform(0, d(n))`, so a runner only asserts `expect_delay_range_seconds.min <= delay <= .max` (the deterministic `d(n)`), over a few draws.",
+    "cases": [
+      {
+        "name": "defaults-are-zero",
+        "source": "ADR-0034 \u00a79 (retry backoff formula d(n)); broker-bindings.md \u00a76.5 states Kafka itself does not apply it",
+        "retry_backoff": 0,
+        "retry_backoff_multiplier": 1,
+        "retry_backoff_max": 0,
+        "retry_jitter": "none",
+        "n": 1,
+        "expect_delay_seconds": 0
+      },
+      {
+        "name": "defaults-are-zero-at-attempt-5",
+        "source": "ADR-0034 \u00a79 (retry backoff formula d(n)); broker-bindings.md \u00a76.5 states Kafka itself does not apply it",
+        "retry_backoff": 0,
+        "retry_backoff_multiplier": 1,
+        "retry_backoff_max": 0,
+        "retry_jitter": "none",
+        "n": 5,
+        "expect_delay_seconds": 0
+      },
+      {
+        "name": "constant-base-multiplier-1",
+        "source": "ADR-0034 \u00a79 (retry backoff formula d(n)); broker-bindings.md \u00a76.5 states Kafka itself does not apply it",
+        "retry_backoff": 5,
+        "retry_backoff_multiplier": 1,
+        "retry_backoff_max": 0,
+        "retry_jitter": "none",
+        "n": 1,
+        "expect_delay_seconds": 5
+      },
+      {
+        "name": "constant-base-multiplier-1-attempt-4",
+        "source": "ADR-0034 \u00a79 (retry backoff formula d(n)); broker-bindings.md \u00a76.5 states Kafka itself does not apply it",
+        "retry_backoff": 5,
+        "retry_backoff_multiplier": 1,
+        "retry_backoff_max": 0,
+        "retry_jitter": "none",
+        "n": 4,
+        "expect_delay_seconds": 5
+      },
+      {
+        "name": "exponential-attempt-1",
+        "source": "ADR-0034 \u00a79 (retry backoff formula d(n)); broker-bindings.md \u00a76.5 states Kafka itself does not apply it",
+        "retry_backoff": 1,
+        "retry_backoff_multiplier": 2,
+        "retry_backoff_max": 0,
+        "retry_jitter": "none",
+        "n": 1,
+        "expect_delay_seconds": 1
+      },
+      {
+        "name": "exponential-attempt-2",
+        "source": "ADR-0034 \u00a79 (retry backoff formula d(n)); broker-bindings.md \u00a76.5 states Kafka itself does not apply it",
+        "retry_backoff": 1,
+        "retry_backoff_multiplier": 2,
+        "retry_backoff_max": 0,
+        "retry_jitter": "none",
+        "n": 2,
+        "expect_delay_seconds": 2
+      },
+      {
+        "name": "exponential-attempt-3",
+        "source": "ADR-0034 \u00a79 (retry backoff formula d(n)); broker-bindings.md \u00a76.5 states Kafka itself does not apply it",
+        "retry_backoff": 1,
+        "retry_backoff_multiplier": 2,
+        "retry_backoff_max": 0,
+        "retry_jitter": "none",
+        "n": 3,
+        "expect_delay_seconds": 4
+      },
+      {
+        "name": "exponential-attempt-6",
+        "source": "ADR-0034 \u00a79 (retry backoff formula d(n)); broker-bindings.md \u00a76.5 states Kafka itself does not apply it",
+        "retry_backoff": 1,
+        "retry_backoff_multiplier": 2,
+        "retry_backoff_max": 0,
+        "retry_jitter": "none",
+        "n": 6,
+        "expect_delay_seconds": 32
+      },
+      {
+        "name": "cap-not-reached",
+        "source": "ADR-0034 \u00a79 (retry backoff formula d(n)); broker-bindings.md \u00a76.5 states Kafka itself does not apply it",
+        "retry_backoff": 1,
+        "retry_backoff_multiplier": 2,
+        "retry_backoff_max": 10,
+        "retry_jitter": "none",
+        "n": 4,
+        "expect_delay_seconds": 8
+      },
+      {
+        "name": "cap-reached",
+        "source": "ADR-0034 \u00a79 (retry backoff formula d(n)); broker-bindings.md \u00a76.5 states Kafka itself does not apply it",
+        "retry_backoff": 1,
+        "retry_backoff_multiplier": 2,
+        "retry_backoff_max": 10,
+        "retry_jitter": "none",
+        "n": 5,
+        "expect_delay_seconds": 10
+      },
+      {
+        "name": "cap-far-exceeded",
+        "source": "ADR-0034 \u00a79 (retry backoff formula d(n)); broker-bindings.md \u00a76.5 states Kafka itself does not apply it",
+        "retry_backoff": 1,
+        "retry_backoff_multiplier": 2,
+        "retry_backoff_max": 10,
+        "retry_jitter": "none",
+        "n": 20,
+        "expect_delay_seconds": 10
+      },
+      {
+        "name": "fractional-base-and-multiplier",
+        "source": "ADR-0034 \u00a79 (retry backoff formula d(n)); broker-bindings.md \u00a76.5 states Kafka itself does not apply it",
+        "retry_backoff": 0.5,
+        "retry_backoff_multiplier": 3,
+        "retry_backoff_max": 0,
+        "retry_jitter": "none",
+        "n": 3,
+        "expect_delay_seconds": 4.5
+      },
+      {
+        "name": "large-growth-no-cap",
+        "source": "ADR-0034 \u00a79 (retry backoff formula d(n)); broker-bindings.md \u00a76.5 states Kafka itself does not apply it",
+        "retry_backoff": 2,
+        "retry_backoff_multiplier": 10,
+        "retry_backoff_max": 0,
+        "retry_jitter": "none",
+        "n": 4,
+        "expect_delay_seconds": 2000
+      },
+      {
+        "name": "zero-base-stays-zero",
+        "source": "ADR-0034 \u00a79 (retry backoff formula d(n)); broker-bindings.md \u00a76.5 states Kafka itself does not apply it",
+        "retry_backoff": 0,
+        "retry_backoff_multiplier": 2,
+        "retry_backoff_max": 0,
+        "retry_jitter": "none",
+        "n": 5,
+        "expect_delay_seconds": 0
+      },
+      {
+        "name": "full-jitter-attempt-1-bound",
+        "source": "ADR-0034 \u00a79 (retry backoff formula d(n)); broker-bindings.md \u00a76.5 states Kafka itself does not apply it",
+        "retry_backoff": 1,
+        "retry_backoff_multiplier": 2,
+        "retry_backoff_max": 0,
+        "retry_jitter": "full",
+        "n": 1,
+        "expect_delay_range_seconds": {
+          "min": 0,
+          "max": 1
+        }
+      },
+      {
+        "name": "full-jitter-attempt-3-bound",
+        "source": "ADR-0034 \u00a79 (retry backoff formula d(n)); broker-bindings.md \u00a76.5 states Kafka itself does not apply it",
+        "retry_backoff": 1,
+        "retry_backoff_multiplier": 2,
+        "retry_backoff_max": 0,
+        "retry_jitter": "full",
+        "n": 3,
+        "expect_delay_range_seconds": {
+          "min": 0,
+          "max": 4
+        }
+      },
+      {
+        "name": "full-jitter-capped-bound",
+        "source": "ADR-0034 \u00a79 (retry backoff formula d(n)); broker-bindings.md \u00a76.5 states Kafka itself does not apply it",
+        "retry_backoff": 1,
+        "retry_backoff_multiplier": 2,
+        "retry_backoff_max": 10,
+        "retry_jitter": "full",
+        "n": 6,
+        "expect_delay_range_seconds": {
+          "min": 0,
+          "max": 10
+        }
+      },
+      {
+        "name": "full-jitter-zero-bound",
+        "source": "ADR-0034 \u00a79 (retry backoff formula d(n)); broker-bindings.md \u00a76.5 states Kafka itself does not apply it",
+        "retry_backoff": 0,
+        "retry_backoff_multiplier": 1,
+        "retry_backoff_max": 0,
+        "retry_jitter": "full",
+        "n": 3,
+        "expect_delay_range_seconds": {
+          "min": 0,
+          "max": 0
+        }
+      }
+    ]
   },
   "traceparent": {
     "description": "W3C `traceparent` out-of-band propagation (ADR-0028, ADR-0025). Scope: `otel` (ADR-0032 section 2): `otel` is not a broker but the optional W3C `traceparent` extract/inject code of ADR-0028 (in the core of Node and .NET; a separate module for Go, Python, Java and PHP), so only a package that carries it lists `otel` in `bindings` and runs this section. `mode: extract` cases give the delivered header value (`traceparent`, or null when the transport delivered none) and the envelope's `trace_id`; the consumer-side extraction MUST yield `expect`: `source: traceparent` with the header's 32-hex `trace_id_hex`, 16-hex `parent_span_id` and 2-hex `flags`, or `source: trace_id` (the v0.1 fallback, ADR-0025) with `trace_id_hex` = the envelope `trace_id` without hyphens. A malformed header is ignored (it never raises) and behaves exactly like no header. Only the structure `00-<32hex>-<16hex>-<2hex>` is pinned; the finer W3C validity rules (all-zero ids, version ff, upper case) are not part of this section. Pinning the producer side (that the header rides in the transport's own metadata channel beside the envelope, never inside it) needs a real transport and is left to the R1 OTel plan, as are the finer W3C rules.",
@@ -1823,7 +2387,7 @@
     ]
   },
   "redis_layout": {
-    "description": "Redis key names in the Laravel-compatible layout (broker-bindings.md \u00a71.1). Scope: `redis`. For each case, with the transport in its Laravel-compatible layout and `key_prefix` the Laravel default, the keys used for the logical `queue` MUST equal `expect`: `ready` (list), `delayed` (sorted set, scored by available-at), `reserved` (sorted set, scored by the retry-after deadline), `notify` (blocking-pop wake-up). Only the names are pinned. The contract defines no available-at formula and no delayed/reserved sweep procedure beyond 'whatever the installed Laravel/Redis version uses', so neither is tested; a deviation from the section 1.1 layout (for example a transport that ships only a `<queue>:processing` reliable-queue layout) is an SDK bug to be fixed in that SDK's phase, not a reason to skip: no ADR authorises a skip here. The delayed/reserved sweep and the available-at formula are out of scope for this section and are covered by the R1 Redis plan.",
+    "description": "Redis key names in the Laravel-compatible layout (broker-bindings.md \u00a71.1). Scope: `redis`. For each case, with the transport in its Laravel-compatible layout and `key_prefix` the Laravel default, the keys used for the logical `queue` MUST equal `expect`: `ready` (list), `delayed` (sorted set, scored by available-at), `reserved` (sorted set, scored by the retry-after deadline), `notify` (blocking-pop wake-up). The names in `cases` are pinned without a broker (no Redis needed). Conformance 1.6.0 adds the behavioural blocks below (ADR-0033, ADR-0034; broker-bindings.md \u00a71.1, \u00a71.6, \u00a71.7); a deviation from the section 1.1 layout (for example a transport that ships only a `<queue>:processing` reliable-queue layout) is an SDK bug to be fixed in that SDK's phase, not a reason to skip: no ADR authorises a skip here. Behavioural blocks (live Redis): `delayed_score`, `migrate`, `reserve`, `pcall_poison`, `release` (zset layout, \u00a71.1/\u00a71.6/\u00a71.7) and `processing_sweep`, `processing_token`, `late_ack`, `identical_copies`, `retry_after_null`, `lrem_count`, `malformed_member`, `orphan`, `legacy_release_gate`, `legacy_dlq_gate` (legacy `:processing` layout, \u00a71.7). RUNNER CONTRACT: the cases in `cases` need no Redis; every behavioural block needs a live Redis (the CI service container is `redis:7`). When the environment variable `BQ_REQUIRE_REDIS` is set, a runner that cannot reach Redis MUST FAIL (not skip); when it is unset the runner skips the behavioural blocks and logs that it did. Each SDK's Redis transport CI sets `BQ_REQUIRE_REDIS` together with a `redis:7` service container. CASE DSL: a behavioural case has `layout` (`zset` or `legacy`), `queue`, `retry_after` (seconds; JSON null = disabled), optional `migration_batch_size`, an initial `state`, and ordered `steps`. Each step is `{op, now, ..., as?, expect?}`, `now` being the clock the SDK must use (fractional epoch seconds; the runner pins the clock or passes it in). Ops: `push_delayed` (`delay`, `body`: the SDK's delayed push), `migrate` (the \u00a71.6 migrate, as run before a reserve), `reserve` (stores the reservation under `as`), `release` (`reservation`, `delay`), `ack` (`reservation`), `sweep` (the legacy \u00a71.7 sweep alone), `dead_letter` (`reservation`; the SDK's legacy-layout DLQ write, behind the same gate as release; `release` in the legacy layout is used with `delay: 0`). A `reservation` is an `as` name or an explicit `{token, raw}`. A reserve step may expect `outcome` (`delivered`, `empty` or `poison`), `handler_body` (the raw member exactly as the handler receives it) and `reported_attempts`. `state` and `expect` describe keys: zset layout `ready` (list of members, oldest first), `delayed` / `reserved` (lists of `{member, score}`, or `{member_json, score}` / `{body_json, score}` compared as parsed JSON because the reserve Lua re-encodes with cjson and the release body is SDK-encoded), `notify` (token count); `ready_generate` / `delayed_generate` `{count, member: \"item-%03d\", score}` expand to that many members; legacy layout `ready`, `processing` (list), `deadlines` (entries `{token, raw, score}` meaning member `<token>:<raw>`, or `{member, score}` for a verbatim member). A `token` of `\"<any>\"` matches any 32 lowercase hex characters (a new reservation's member is token + \":\" + raw; `tokens_distinct: true` also requires pairwise distinct tokens). A score of the string `\"+inf\"` is positive infinity. `expect` may also hold the counts `ready_count` (LLEN of the ready list `<queue>`) and `dlq_count` (LLEN of `<queue>.dlq`), used where the SDK-built body is not pinned (`legacy_release_gate`, `legacy_dlq_gate`). A key absent from `expect` is not asserted, and the DLQ key's content and the notify handling after a poison pop are deliberately not pinned. Members are compared byte for byte unless suffixed `_json`. Delayed-score formula: the same function as the `redis_delay` section (that section pins it over more inputs). Notes: the release body `attempts` is the raw body's `attempts` + 1 (equal to the count in the `:reserved` member), unknown keys and types and the `{}` / `[]` distinction are preserved (ADR-0031), the cjson-re-encoded `:reserved` member is exempt from byte-identity; the chunk size 100 of the migrate is observable only as completeness (the 250-item case), the SDK-visible `migration_batch_size` knob is tested with a small value.",
     "cases": [
       {
         "name": "simple-queue",
@@ -1857,6 +2421,2715 @@
           "reserved": "queues:Billing_Retry-1:reserved",
           "notify": "queues:Billing_Retry-1:notify"
         }
+      }
+    ],
+    "delayed_score": {
+      "description": "Delayed score (broker-bindings.md \u00a71.6): score = `floor(now) + ceil(delay)`, integer epoch seconds, fractional `now` and `delay` allowed (the example `now = 1000.7`, `delay = 1.5` gives `1002`). The same formula is pinned over more inputs by the `redis_delay` section (that one needs no Redis; this block checks it against a live server).",
+      "cases": [
+        {
+          "name": "fractional-now-fractional-delay",
+          "source": "broker-bindings.md \u00a71.6 (Delay score = floor(now) + ceil(delay))",
+          "layout": "zset",
+          "queue": "orders",
+          "state": {
+            "notify": 0
+          },
+          "steps": [
+            {
+              "op": "push_delayed",
+              "now": 1000.7,
+              "delay": 1.5,
+              "body": "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0}",
+              "expect": {
+                "delayed": [
+                  {
+                    "member": "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0}",
+                    "score": 1002
+                  }
+                ],
+                "notify": 0,
+                "ready": []
+              }
+            }
+          ]
+        },
+        {
+          "name": "integer-now-integer-delay",
+          "source": "broker-bindings.md \u00a71.6 (Delay score = floor(now) + ceil(delay))",
+          "layout": "zset",
+          "queue": "orders",
+          "state": {
+            "notify": 0
+          },
+          "steps": [
+            {
+              "op": "push_delayed",
+              "now": 1000.0,
+              "delay": 5,
+              "body": "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0}",
+              "expect": {
+                "delayed": [
+                  {
+                    "member": "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0}",
+                    "score": 1005
+                  }
+                ],
+                "notify": 0,
+                "ready": []
+              }
+            }
+          ]
+        },
+        {
+          "name": "sub-second-delay-rounds-up",
+          "source": "broker-bindings.md \u00a71.6 (Delay score = floor(now) + ceil(delay))",
+          "layout": "zset",
+          "queue": "orders",
+          "state": {
+            "notify": 0
+          },
+          "steps": [
+            {
+              "op": "push_delayed",
+              "now": 1000.2,
+              "delay": 0.1,
+              "body": "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0}",
+              "expect": {
+                "delayed": [
+                  {
+                    "member": "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0}",
+                    "score": 1001
+                  }
+                ],
+                "notify": 0,
+                "ready": []
+              }
+            }
+          ]
+        },
+        {
+          "name": "fractional-now-integer-delay-floors-now",
+          "source": "broker-bindings.md \u00a71.6 (Delay score = floor(now) + ceil(delay))",
+          "layout": "zset",
+          "queue": "orders",
+          "state": {
+            "notify": 0
+          },
+          "steps": [
+            {
+              "op": "push_delayed",
+              "now": 1000.9,
+              "delay": 2,
+              "body": "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0}",
+              "expect": {
+                "delayed": [
+                  {
+                    "member": "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0}",
+                    "score": 1002
+                  }
+                ],
+                "notify": 0,
+                "ready": []
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "migrate": {
+      "description": "Migrate (\u00a71.6, \u00a71.7): due `:delayed` items (`score <= floor(now)`) then expired `:reserved` items move to `<q>` byte for byte, one notify token per moved item; unexpired items stay; `retry_after: null` skips the `:reserved` recovery; reserve migrates before it pops.",
+      "cases": [
+        {
+          "name": "due-delayed-moves-rest-stays",
+          "source": "broker-bindings.md \u00a71.6 (Migrate: :delayed then :reserved, chunks of 100, one notify token per item)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "ready": [
+              "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0,\"n\":\"x\"}"
+            ],
+            "delayed": [
+              {
+                "member": "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0,\"n\":\"a\"}",
+                "score": 1000
+              },
+              {
+                "member": "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0,\"n\":\"b\"}",
+                "score": 1001
+              },
+              {
+                "member": "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0,\"n\":\"c\"}",
+                "score": 1002
+              }
+            ],
+            "notify": 0
+          },
+          "steps": [
+            {
+              "op": "migrate",
+              "now": 1001.9,
+              "expect": {
+                "ready": [
+                  "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0,\"n\":\"x\"}",
+                  "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0,\"n\":\"a\"}",
+                  "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0,\"n\":\"b\"}"
+                ],
+                "delayed": [
+                  {
+                    "member": "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0,\"n\":\"c\"}",
+                    "score": 1002
+                  }
+                ],
+                "notify": 2
+              }
+            }
+          ]
+        },
+        {
+          "name": "score-equal-to-floor-now-is-due",
+          "source": "broker-bindings.md \u00a71.6 (Migrate: :delayed then :reserved, chunks of 100, one notify token per item)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "delayed": [
+              {
+                "member": "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0,\"n\":\"a\"}",
+                "score": 1000
+              }
+            ],
+            "notify": 0
+          },
+          "steps": [
+            {
+              "op": "migrate",
+              "now": 1000.999,
+              "expect": {
+                "ready": [
+                  "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0,\"n\":\"a\"}"
+                ],
+                "delayed": [],
+                "notify": 1
+              }
+            }
+          ]
+        },
+        {
+          "name": "not-yet-due-stays",
+          "source": "broker-bindings.md \u00a71.6 (Migrate: :delayed then :reserved, chunks of 100, one notify token per item)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "delayed": [
+              {
+                "member": "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0,\"n\":\"a\"}",
+                "score": 1001
+              }
+            ],
+            "notify": 0
+          },
+          "steps": [
+            {
+              "op": "migrate",
+              "now": 1000.99,
+              "expect": {
+                "ready": [],
+                "delayed": [
+                  {
+                    "member": "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0,\"n\":\"a\"}",
+                    "score": 1001
+                  }
+                ],
+                "notify": 0
+              }
+            }
+          ]
+        },
+        {
+          "name": "delayed-first-then-reserved",
+          "source": "broker-bindings.md \u00a71.6 (Migrate: :delayed then :reserved, chunks of 100, one notify token per item)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "delayed": [
+              {
+                "member": "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0,\"n\":\"a\"}",
+                "score": 1000
+              }
+            ],
+            "reserved": [
+              {
+                "member": "{\"job\":\"urn:bq:orders:created\",\"attempts\":1,\"data\":{\"z\":1,\"a\":[ ]}}",
+                "score": 1000
+              }
+            ],
+            "notify": 0
+          },
+          "steps": [
+            {
+              "op": "migrate",
+              "now": 1000,
+              "expect": {
+                "ready": [
+                  "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0,\"n\":\"a\"}",
+                  "{\"job\":\"urn:bq:orders:created\",\"attempts\":1,\"data\":{\"z\":1,\"a\":[ ]}}"
+                ],
+                "delayed": [],
+                "reserved": [],
+                "notify": 2
+              }
+            }
+          ]
+        },
+        {
+          "name": "recovered-reserved-member-moves-byte-for-byte",
+          "source": "broker-bindings.md \u00a71.7 (retry_after, zset-layout recovery)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "reserved": [
+              {
+                "member": "{\"job\":\"urn:bq:orders:created\",\"attempts\":1,\"data\":{\"z\":1,\"a\":[ ]}}",
+                "score": 900
+              }
+            ],
+            "notify": 0
+          },
+          "steps": [
+            {
+              "op": "migrate",
+              "now": 1000,
+              "expect": {
+                "ready": [
+                  "{\"job\":\"urn:bq:orders:created\",\"attempts\":1,\"data\":{\"z\":1,\"a\":[ ]}}"
+                ],
+                "reserved": [],
+                "notify": 1
+              }
+            }
+          ]
+        },
+        {
+          "name": "unexpired-reserved-stays",
+          "source": "broker-bindings.md \u00a71.7 (retry_after, zset-layout recovery)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "reserved": [
+              {
+                "member": "{\"job\":\"urn:bq:orders:created\",\"attempts\":1,\"data\":{\"z\":1,\"a\":[ ]}}",
+                "score": 1090
+              }
+            ],
+            "notify": 0
+          },
+          "steps": [
+            {
+              "op": "migrate",
+              "now": 1000,
+              "expect": {
+                "ready": [],
+                "reserved": [
+                  {
+                    "member": "{\"job\":\"urn:bq:orders:created\",\"attempts\":1,\"data\":{\"z\":1,\"a\":[ ]}}",
+                    "score": 1090
+                  }
+                ],
+                "notify": 0
+              }
+            }
+          ]
+        },
+        {
+          "name": "bulk-250-moves-all-with-one-notify-each",
+          "source": "broker-bindings.md \u00a71.6 (Migrate: :delayed then :reserved, chunks of 100, one notify token per item)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "delayed_generate": {
+              "count": 250,
+              "member": "item-%03d",
+              "score": 1000
+            },
+            "notify": 0
+          },
+          "steps": [
+            {
+              "op": "migrate",
+              "now": 1000,
+              "expect": {
+                "ready_generate": {
+                  "count": 250,
+                  "member": "item-%03d"
+                },
+                "delayed": [],
+                "notify": 250
+              }
+            }
+          ]
+        },
+        {
+          "name": "migration-batch-size-limits-one-migrate",
+          "source": "broker-bindings.md \u00a71.6 (Migrate: :delayed then :reserved, chunks of 100, one notify token per item)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "migration_batch_size": 2,
+          "state": {
+            "delayed": [
+              {
+                "member": "m1",
+                "score": 1000
+              },
+              {
+                "member": "m2",
+                "score": 1000
+              },
+              {
+                "member": "m3",
+                "score": 1000
+              },
+              {
+                "member": "m4",
+                "score": 1000
+              },
+              {
+                "member": "m5",
+                "score": 1000
+              }
+            ],
+            "notify": 0
+          },
+          "steps": [
+            {
+              "op": "migrate",
+              "now": 1000,
+              "expect": {
+                "ready": [
+                  "m1",
+                  "m2"
+                ],
+                "delayed": [
+                  {
+                    "member": "m3",
+                    "score": 1000
+                  },
+                  {
+                    "member": "m4",
+                    "score": 1000
+                  },
+                  {
+                    "member": "m5",
+                    "score": 1000
+                  }
+                ],
+                "notify": 2
+              }
+            }
+          ]
+        },
+        {
+          "name": "retry-after-null-skips-reserved-migrate",
+          "source": "broker-bindings.md \u00a71.7 (retry_after, zset-layout recovery)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": null,
+          "state": {
+            "delayed": [
+              {
+                "member": "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0,\"n\":\"a\"}",
+                "score": 1000
+              }
+            ],
+            "reserved": [
+              {
+                "member": "{\"job\":\"urn:bq:orders:created\",\"attempts\":1,\"data\":{\"z\":1,\"a\":[ ]}}",
+                "score": 1000
+              }
+            ],
+            "notify": 0
+          },
+          "steps": [
+            {
+              "op": "migrate",
+              "now": 1000,
+              "expect": {
+                "ready": [
+                  "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0,\"n\":\"a\"}"
+                ],
+                "delayed": [],
+                "reserved": [
+                  {
+                    "member": "{\"job\":\"urn:bq:orders:created\",\"attempts\":1,\"data\":{\"z\":1,\"a\":[ ]}}",
+                    "score": 1000
+                  }
+                ],
+                "notify": 1
+              }
+            }
+          ]
+        },
+        {
+          "name": "reserve-migrates-delayed-before-popping",
+          "source": "broker-bindings.md \u00a71.6 (Migrate: :delayed then :reserved, chunks of 100, one notify token per item)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "delayed": [
+              {
+                "member": "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0,\"n\":\"a\"}",
+                "score": 1000
+              }
+            ],
+            "notify": 0
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000.5,
+              "expect": {
+                "outcome": "delivered",
+                "handler_body": "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0,\"n\":\"a\"}",
+                "ready": [],
+                "delayed": [],
+                "notify": 0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "reserve": {
+      "description": "Reserve (\u00a71.1 reserve Lua): the raw member reaches the handler byte for byte, the `:reserved` member carries `attempts + 1`, deadline = `floor(now) + retry_after`, one `:notify` token is consumed.",
+      "cases": [
+        {
+          "name": "attempts-0-to-1-raw-to-handler",
+          "source": "broker-bindings.md \u00a71.1 (reserve Lua: deadline is whole epoch seconds, floor(now) + retry_after, matching Laravel's availableAt()); ADR-0033 \u00a72",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "ready": [
+              "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0}"
+            ],
+            "notify": 1
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000.4,
+              "expect": {
+                "outcome": "delivered",
+                "handler_body": "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0}",
+                "reported_attempts": 1,
+                "reserved": [
+                  {
+                    "member_json": {
+                      "job": "urn:bq:orders:created",
+                      "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+                      "data": {
+                        "order_id": 1042
+                      },
+                      "meta": {
+                        "id": "f1e2d3c4-b5a6-4789-90ab-cdef01234567",
+                        "queue": "orders",
+                        "lang": "php",
+                        "schema_version": 1,
+                        "created_at": 1749132727000
+                      },
+                      "attempts": 1
+                    },
+                    "score": 1090
+                  }
+                ],
+                "ready": [],
+                "notify": 0
+              }
+            }
+          ]
+        },
+        {
+          "name": "attempts-2-to-3-unknown-keys-in-reserved-member",
+          "source": "broker-bindings.md \u00a71.1 (reserve Lua, ack, release - zset layout)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "ready": [
+              "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":2,\"x_ext\":{\"k\":[1,2]},\"x_flag\":true}"
+            ],
+            "notify": 1
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000,
+              "expect": {
+                "outcome": "delivered",
+                "handler_body": "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":2,\"x_ext\":{\"k\":[1,2]},\"x_flag\":true}",
+                "reported_attempts": 3,
+                "reserved": [
+                  {
+                    "member_json": {
+                      "job": "urn:bq:orders:created",
+                      "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+                      "data": {
+                        "order_id": 1042
+                      },
+                      "meta": {
+                        "id": "f1e2d3c4-b5a6-4789-90ab-cdef01234567",
+                        "queue": "orders",
+                        "lang": "php",
+                        "schema_version": 1,
+                        "created_at": 1749132727000
+                      },
+                      "attempts": 3,
+                      "x_ext": {
+                        "k": [
+                          1,
+                          2
+                        ]
+                      },
+                      "x_flag": true
+                    },
+                    "score": 1090
+                  }
+                ],
+                "ready": [],
+                "notify": 0
+              }
+            }
+          ]
+        },
+        {
+          "name": "deadline-is-floor-now-plus-retry-after",
+          "source": "broker-bindings.md \u00a71.1 (reserve Lua: deadline is whole epoch seconds, floor(now) + retry_after, matching Laravel's availableAt()); ADR-0033 \u00a72",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 30,
+          "state": {
+            "ready": [
+              "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0}"
+            ],
+            "notify": 1
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000.9,
+              "expect": {
+                "reserved": [
+                  {
+                    "member_json": {
+                      "job": "urn:bq:orders:created",
+                      "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+                      "data": {
+                        "order_id": 1042
+                      },
+                      "meta": {
+                        "id": "f1e2d3c4-b5a6-4789-90ab-cdef01234567",
+                        "queue": "orders",
+                        "lang": "php",
+                        "schema_version": 1,
+                        "created_at": 1749132727000
+                      },
+                      "attempts": 1
+                    },
+                    "score": 1030
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "fifo-one-message-one-token",
+          "source": "broker-bindings.md \u00a71.1 (reserve Lua, ack, release - zset layout)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "ready": [
+              "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0,\"n\":\"a\"}",
+              "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0,\"n\":\"b\"}"
+            ],
+            "notify": 2
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000,
+              "expect": {
+                "handler_body": "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0,\"n\":\"a\"}",
+                "ready": [
+                  "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0,\"n\":\"b\"}"
+                ],
+                "notify": 1
+              }
+            }
+          ]
+        },
+        {
+          "name": "empty-queue-changes-nothing",
+          "source": "broker-bindings.md \u00a71.1 (reserve Lua, ack, release - zset layout)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "notify": 0
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000,
+              "expect": {
+                "outcome": "empty",
+                "ready": [],
+                "reserved": [],
+                "notify": 0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "pcall_poison": {
+      "description": "A1 (\u00a71.1): a body the reserve Lua cannot decode (or whose `attempts` is not a number) MUST be written raw to `:reserved` and returned as `{job, job}`, i.e. delivered to the SDK as poison; the SDK then handles it as a poison message.",
+      "cases": [
+        {
+          "name": "not-json",
+          "source": "broker-bindings.md \u00a71.1 (reserve Lua MUST decode with pcall, A1)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "ready": [
+              "not-json"
+            ],
+            "notify": 1
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000,
+              "expect": {
+                "outcome": "poison",
+                "handler_body": "not-json",
+                "reserved": [
+                  {
+                    "member": "not-json",
+                    "score": 1090
+                  }
+                ],
+                "ready": []
+              }
+            }
+          ]
+        },
+        {
+          "name": "empty-string",
+          "source": "broker-bindings.md \u00a71.1 (reserve Lua MUST decode with pcall, A1)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "ready": [
+              ""
+            ],
+            "notify": 1
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000,
+              "expect": {
+                "outcome": "poison",
+                "handler_body": "",
+                "reserved": [
+                  {
+                    "member": "",
+                    "score": 1090
+                  }
+                ],
+                "ready": []
+              }
+            }
+          ]
+        },
+        {
+          "name": "truncated-json",
+          "source": "broker-bindings.md \u00a71.1 (reserve Lua MUST decode with pcall, A1)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "ready": [
+              "{\"job\":\"urn:bq:orders:created\",\"attempts\":"
+            ],
+            "notify": 1
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000,
+              "expect": {
+                "outcome": "poison",
+                "handler_body": "{\"job\":\"urn:bq:orders:created\",\"attempts\":",
+                "reserved": [
+                  {
+                    "member": "{\"job\":\"urn:bq:orders:created\",\"attempts\":",
+                    "score": 1090
+                  }
+                ],
+                "ready": []
+              }
+            }
+          ]
+        },
+        {
+          "name": "attempts-string",
+          "source": "broker-bindings.md \u00a71.1 (reserve Lua MUST decode with pcall, A1)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "ready": [
+              "{\"job\":\"urn:bq:orders:created\",\"attempts\":\"3\"}"
+            ],
+            "notify": 1
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000,
+              "expect": {
+                "outcome": "poison",
+                "handler_body": "{\"job\":\"urn:bq:orders:created\",\"attempts\":\"3\"}",
+                "reserved": [
+                  {
+                    "member": "{\"job\":\"urn:bq:orders:created\",\"attempts\":\"3\"}",
+                    "score": 1090
+                  }
+                ],
+                "ready": []
+              }
+            }
+          ]
+        },
+        {
+          "name": "attempts-null",
+          "source": "broker-bindings.md \u00a71.1 (reserve Lua MUST decode with pcall, A1)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "ready": [
+              "{\"job\":\"urn:bq:orders:created\",\"attempts\":null}"
+            ],
+            "notify": 1
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000,
+              "expect": {
+                "outcome": "poison",
+                "handler_body": "{\"job\":\"urn:bq:orders:created\",\"attempts\":null}",
+                "reserved": [
+                  {
+                    "member": "{\"job\":\"urn:bq:orders:created\",\"attempts\":null}",
+                    "score": 1090
+                  }
+                ],
+                "ready": []
+              }
+            }
+          ]
+        },
+        {
+          "name": "attempts-missing",
+          "source": "broker-bindings.md \u00a71.1 (reserve Lua MUST decode with pcall, A1)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "ready": [
+              "{\"job\":\"urn:bq:orders:created\",\"data\":{}}"
+            ],
+            "notify": 1
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000,
+              "expect": {
+                "outcome": "poison",
+                "handler_body": "{\"job\":\"urn:bq:orders:created\",\"data\":{}}",
+                "reserved": [
+                  {
+                    "member": "{\"job\":\"urn:bq:orders:created\",\"data\":{}}",
+                    "score": 1090
+                  }
+                ],
+                "ready": []
+              }
+            }
+          ]
+        },
+        {
+          "name": "top-level-number",
+          "source": "broker-bindings.md \u00a71.1 (reserve Lua MUST decode with pcall, A1)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "ready": [
+              "42"
+            ],
+            "notify": 1
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000,
+              "expect": {
+                "outcome": "poison",
+                "handler_body": "42",
+                "reserved": [
+                  {
+                    "member": "42",
+                    "score": 1090
+                  }
+                ],
+                "ready": []
+              }
+            }
+          ]
+        },
+        {
+          "name": "top-level-string",
+          "source": "broker-bindings.md \u00a71.1 (reserve Lua MUST decode with pcall, A1)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "ready": [
+              "\"text\""
+            ],
+            "notify": 1
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000,
+              "expect": {
+                "outcome": "poison",
+                "handler_body": "\"text\"",
+                "reserved": [
+                  {
+                    "member": "\"text\"",
+                    "score": 1090
+                  }
+                ],
+                "ready": []
+              }
+            }
+          ]
+        },
+        {
+          "name": "top-level-array",
+          "source": "broker-bindings.md \u00a71.1 (reserve Lua MUST decode with pcall, A1)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "ready": [
+              "[]"
+            ],
+            "notify": 1
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000,
+              "expect": {
+                "outcome": "poison",
+                "handler_body": "[]",
+                "reserved": [
+                  {
+                    "member": "[]",
+                    "score": 1090
+                  }
+                ],
+                "ready": []
+              }
+            }
+          ]
+        },
+        {
+          "name": "top-level-null",
+          "source": "broker-bindings.md \u00a71.1 (reserve Lua MUST decode with pcall, A1)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "ready": [
+              "null"
+            ],
+            "notify": 1
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000,
+              "expect": {
+                "outcome": "poison",
+                "handler_body": "null",
+                "reserved": [
+                  {
+                    "member": "null",
+                    "score": 1090
+                  }
+                ],
+                "ready": []
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "release": {
+      "description": "Release (A2, \u00a71.1; ADR-0031): the item leaves `:reserved` and the SDK-encoded body (attempts + 1) goes to `:delayed` with score `floor(now) + ceil(delay)`; only `attempts` changes, unknown keys, their types and `{}` / `[]` are preserved.",
+      "cases": [
+        {
+          "name": "attempts-0-to-1",
+          "source": "broker-bindings.md \u00a71.1 (reserve Lua, ack, release - zset layout)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "ready": [
+              "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0}"
+            ],
+            "notify": 1
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000.3,
+              "as": "r"
+            },
+            {
+              "op": "release",
+              "reservation": "r",
+              "delay": 5,
+              "now": 1000.3,
+              "expect": {
+                "reserved": [],
+                "ready": [],
+                "delayed": [
+                  {
+                    "body_json": {
+                      "job": "urn:bq:orders:created",
+                      "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+                      "data": {
+                        "order_id": 1042
+                      },
+                      "meta": {
+                        "id": "f1e2d3c4-b5a6-4789-90ab-cdef01234567",
+                        "queue": "orders",
+                        "lang": "php",
+                        "schema_version": 1,
+                        "created_at": 1749132727000
+                      },
+                      "attempts": 1
+                    },
+                    "score": 1005
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "attempts-2-to-3",
+          "source": "broker-bindings.md \u00a71.1 (reserve Lua, ack, release - zset layout)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "ready": [
+              "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":2}"
+            ],
+            "notify": 1
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000,
+              "as": "r"
+            },
+            {
+              "op": "release",
+              "reservation": "r",
+              "delay": 30,
+              "now": 1000,
+              "expect": {
+                "reserved": [],
+                "ready": [],
+                "delayed": [
+                  {
+                    "body_json": {
+                      "job": "urn:bq:orders:created",
+                      "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+                      "data": {
+                        "order_id": 1042
+                      },
+                      "meta": {
+                        "id": "f1e2d3c4-b5a6-4789-90ab-cdef01234567",
+                        "queue": "orders",
+                        "lang": "php",
+                        "schema_version": 1,
+                        "created_at": 1749132727000
+                      },
+                      "attempts": 3
+                    },
+                    "score": 1030
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "fractional-delay-rounds-up",
+          "source": "broker-bindings.md \u00a71.6 (Delay score = floor(now) + ceil(delay))",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "ready": [
+              "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0}"
+            ],
+            "notify": 1
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000.7,
+              "as": "r"
+            },
+            {
+              "op": "release",
+              "reservation": "r",
+              "delay": 1.5,
+              "now": 1000.7,
+              "expect": {
+                "reserved": [],
+                "ready": [],
+                "delayed": [
+                  {
+                    "body_json": {
+                      "job": "urn:bq:orders:created",
+                      "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+                      "data": {
+                        "order_id": 1042
+                      },
+                      "meta": {
+                        "id": "f1e2d3c4-b5a6-4789-90ab-cdef01234567",
+                        "queue": "orders",
+                        "lang": "php",
+                        "schema_version": 1,
+                        "created_at": 1749132727000
+                      },
+                      "attempts": 1
+                    },
+                    "score": 1002
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "unknown-keys-types-and-empty-containers-preserved",
+          "source": "ADR-0031 via broker-bindings.md \u00a71.1 (release body is SDK-encoded)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "ready": [
+              "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":1,\"x_flag\":true,\"x_nested\":{\"k\":[1,2.5,null],\"e\":{},\"l\":[]},\"x_empty_obj\":{},\"x_empty_arr\":[],\"x_text\":\"caf\u00e9 a/b \u2603\"}"
+            ],
+            "notify": 1
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000,
+              "as": "r"
+            },
+            {
+              "op": "release",
+              "reservation": "r",
+              "delay": 5,
+              "now": 1000,
+              "expect": {
+                "reserved": [],
+                "ready": [],
+                "delayed": [
+                  {
+                    "body_json": {
+                      "job": "urn:bq:orders:created",
+                      "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+                      "data": {},
+                      "meta": {
+                        "id": "f1e2d3c4-b5a6-4789-90ab-cdef01234567",
+                        "queue": "orders",
+                        "lang": "php",
+                        "schema_version": 1,
+                        "created_at": 1749132727000
+                      },
+                      "attempts": 2,
+                      "x_flag": true,
+                      "x_nested": {
+                        "k": [
+                          1,
+                          2.5,
+                          null
+                        ],
+                        "e": {},
+                        "l": []
+                      },
+                      "x_empty_obj": {},
+                      "x_empty_arr": [],
+                      "x_text": "caf\u00e9 a/b \u2603"
+                    },
+                    "score": 1005
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "15-digit-integer-not-exponent-encoded",
+          "source": "ADR-0031 via broker-bindings.md \u00a71.1 (the cjson exception covers only the :reserved member, not the SDK-encoded release body)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "ready": [
+              "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0,\"x_big\":123456789012345}"
+            ],
+            "notify": 1
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000,
+              "as": "r"
+            },
+            {
+              "op": "release",
+              "reservation": "r",
+              "delay": 5,
+              "now": 1000,
+              "expect": {
+                "reserved": [],
+                "ready": [],
+                "delayed": [
+                  {
+                    "body_json": {
+                      "job": "urn:bq:orders:created",
+                      "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+                      "data": {
+                        "order_id": 1042
+                      },
+                      "meta": {
+                        "id": "f1e2d3c4-b5a6-4789-90ab-cdef01234567",
+                        "queue": "orders",
+                        "lang": "php",
+                        "schema_version": 1,
+                        "created_at": 1749132727000
+                      },
+                      "attempts": 1,
+                      "x_big": 123456789012345
+                    },
+                    "score": 1005
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "processing_sweep": {
+      "description": "Legacy `:processing` sweep (S1 / C1-c, \u00a71.7): only members whose deadline is expired move, to the END of `<q>`, byte for byte with `attempts` unchanged; unexpired and deadline-less items stay.",
+      "cases": [
+        {
+          "name": "expired-moves-unexpired-and-deadlineless-stay",
+          "source": "broker-bindings.md \u00a71.7 (Legacy layout - the :processing sweep: deadline member, gate, sweep Lua, orphans, count)",
+          "layout": "legacy",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "ready": [
+              "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0,\"n\":\"ready0\"}"
+            ],
+            "processing": [
+              "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+              "{\"job\":\"urn:bq:orders:created\",\"attempts\":1,\"data\":{\"id\":2}}",
+              "{\"job\":\"urn:bq:orders:created\",\"attempts\":0,\"data\":{\"id\":3}}"
+            ],
+            "deadlines": [
+              {
+                "token": "0123456789abcdef0123456789abcdef",
+                "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                "score": 1000
+              },
+              {
+                "token": "fedcba9876543210fedcba9876543210",
+                "raw": "{\"job\":\"urn:bq:orders:created\",\"attempts\":1,\"data\":{\"id\":2}}",
+                "score": 1001
+              }
+            ]
+          },
+          "steps": [
+            {
+              "op": "sweep",
+              "now": 1000.6,
+              "expect": {
+                "ready": [
+                  "{\"job\":\"urn:bq:orders:created\",\"trace_id\":\"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\",\"data\":{\"order_id\":1042},\"meta\":{\"id\":\"f1e2d3c4-b5a6-4789-90ab-cdef01234567\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1749132727000},\"attempts\":0,\"n\":\"ready0\"}",
+                  "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+                ],
+                "processing": [
+                  "{\"job\":\"urn:bq:orders:created\",\"attempts\":1,\"data\":{\"id\":2}}",
+                  "{\"job\":\"urn:bq:orders:created\",\"attempts\":0,\"data\":{\"id\":3}}"
+                ],
+                "deadlines": [
+                  {
+                    "token": "fedcba9876543210fedcba9876543210",
+                    "raw": "{\"job\":\"urn:bq:orders:created\",\"attempts\":1,\"data\":{\"id\":2}}",
+                    "score": 1001
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "recovery-keeps-attempts-and-bytes",
+          "source": "broker-bindings.md \u00a71.7 (Legacy layout - the :processing sweep: deadline member, gate, sweep Lua, orphans, count)",
+          "layout": "legacy",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "processing": [
+              "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+            ],
+            "deadlines": [
+              {
+                "token": "0123456789abcdef0123456789abcdef",
+                "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                "score": 900
+              }
+            ]
+          },
+          "steps": [
+            {
+              "op": "sweep",
+              "now": 1000,
+              "expect": {
+                "ready": [
+                  "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+                ],
+                "processing": [],
+                "deadlines": []
+              }
+            }
+          ]
+        },
+        {
+          "name": "batch-size-limits-one-sweep",
+          "source": "broker-bindings.md \u00a71.7 (Legacy layout - the :processing sweep: deadline member, gate, sweep Lua, orphans, count)",
+          "layout": "legacy",
+          "queue": "orders",
+          "retry_after": 90,
+          "migration_batch_size": 1,
+          "state": {
+            "processing": [
+              "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+              "{\"job\":\"urn:bq:orders:created\",\"attempts\":1,\"data\":{\"id\":2}}"
+            ],
+            "deadlines": [
+              {
+                "token": "0123456789abcdef0123456789abcdef",
+                "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                "score": 900
+              },
+              {
+                "token": "fedcba9876543210fedcba9876543210",
+                "raw": "{\"job\":\"urn:bq:orders:created\",\"attempts\":1,\"data\":{\"id\":2}}",
+                "score": 901
+              }
+            ]
+          },
+          "steps": [
+            {
+              "op": "sweep",
+              "now": 1000,
+              "expect": {
+                "ready": [
+                  "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+                ],
+                "processing": [
+                  "{\"job\":\"urn:bq:orders:created\",\"attempts\":1,\"data\":{\"id\":2}}"
+                ],
+                "deadlines": [
+                  {
+                    "token": "fedcba9876543210fedcba9876543210",
+                    "raw": "{\"job\":\"urn:bq:orders:created\",\"attempts\":1,\"data\":{\"id\":2}}",
+                    "score": 901
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "sweep-runs-before-every-reserve",
+          "source": "broker-bindings.md \u00a71.7 (Legacy layout - the :processing sweep: deadline member, gate, sweep Lua, orphans, count)",
+          "layout": "legacy",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "processing": [
+              "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+            ],
+            "deadlines": [
+              {
+                "token": "0123456789abcdef0123456789abcdef",
+                "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                "score": 900
+              }
+            ]
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000,
+              "as": "r",
+              "expect": {
+                "outcome": "delivered",
+                "handler_body": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                "ready": [],
+                "processing": [
+                  "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+                ],
+                "deadlines": [
+                  {
+                    "token": "<any>",
+                    "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                    "score": 1090
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "processing_token": {
+      "description": "K1 member format (\u00a71.7): every reservation's deadline member is `<32 lowercase hex token>:<raw>`.",
+      "cases": [
+        {
+          "name": "member-is-token-colon-raw",
+          "source": "broker-bindings.md \u00a71.7 (Legacy layout - the :processing sweep: deadline member, gate, sweep Lua, orphans, count)",
+          "layout": "legacy",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "ready": [
+              "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+            ]
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000,
+              "as": "r",
+              "expect": {
+                "handler_body": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                "ready": [],
+                "processing": [
+                  "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+                ],
+                "deadlines": [
+                  {
+                    "token": "<any>",
+                    "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                    "score": 1090
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "late_ack": {
+      "description": "K1 late ack (\u00a71.7): acking with the token of a reservation that was already swept touches neither `:processing` nor the deadlines of the newer reservation.",
+      "cases": [
+        {
+          "name": "ack-with-swept-token-touches-nothing",
+          "source": "broker-bindings.md \u00a71.7 (Legacy layout - the :processing sweep: deadline member, gate, sweep Lua, orphans, count)",
+          "layout": "legacy",
+          "queue": "orders",
+          "retry_after": 10,
+          "state": {
+            "ready": [
+              "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+            ]
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000,
+              "as": "first"
+            },
+            {
+              "op": "sweep",
+              "now": 1011,
+              "expect": {
+                "ready": [
+                  "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+                ],
+                "processing": [],
+                "deadlines": []
+              }
+            },
+            {
+              "op": "reserve",
+              "now": 1011,
+              "as": "second",
+              "expect": {
+                "processing": [
+                  "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+                ],
+                "deadlines": [
+                  {
+                    "token": "<any>",
+                    "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                    "score": 1021
+                  }
+                ]
+              }
+            },
+            {
+              "op": "ack",
+              "reservation": "first",
+              "now": 1012,
+              "expect": {
+                "processing": [
+                  "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+                ],
+                "deadlines": [
+                  {
+                    "token": "<any>",
+                    "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                    "score": 1021
+                  }
+                ]
+              }
+            },
+            {
+              "op": "ack",
+              "reservation": "second",
+              "now": 1013,
+              "expect": {
+                "processing": [],
+                "deadlines": [],
+                "ready": []
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "identical_copies": {
+      "description": "K1 identical copies (\u00a71.7): two byte-identical messages get two distinct members; acking one never touches the other's member.",
+      "cases": [
+        {
+          "name": "two-identical-copies-two-members",
+          "source": "broker-bindings.md \u00a71.7 (Legacy layout - the :processing sweep: deadline member, gate, sweep Lua, orphans, count)",
+          "layout": "legacy",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "ready": [
+              "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+              "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+            ]
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000,
+              "as": "a"
+            },
+            {
+              "op": "reserve",
+              "now": 1000,
+              "as": "b",
+              "expect": {
+                "ready": [],
+                "processing": [
+                  "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                  "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+                ],
+                "deadlines": [
+                  {
+                    "token": "<any>",
+                    "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                    "score": 1090
+                  },
+                  {
+                    "token": "<any>",
+                    "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                    "score": 1090
+                  }
+                ],
+                "tokens_distinct": true
+              }
+            },
+            {
+              "op": "ack",
+              "reservation": "a",
+              "now": 1001,
+              "expect": {
+                "processing": [
+                  "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+                ],
+                "deadlines": [
+                  {
+                    "token": "<any>",
+                    "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                    "score": 1090
+                  }
+                ]
+              }
+            },
+            {
+              "op": "ack",
+              "reservation": "b",
+              "now": 1002,
+              "expect": {
+                "processing": [],
+                "deadlines": []
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "retry_after_null": {
+      "description": "K1 `retry_after: null` (\u00a71.7): the deadline member is written with score `+inf`, the sweep never moves it, and ack leaves `:processing` and the deadlines empty.",
+      "cases": [
+        {
+          "name": "member-score-plus-inf-never-swept",
+          "source": "broker-bindings.md \u00a71.7 (Legacy layout - the :processing sweep: deadline member, gate, sweep Lua, orphans, count)",
+          "layout": "legacy",
+          "queue": "orders",
+          "retry_after": null,
+          "state": {
+            "ready": [
+              "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+            ]
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000,
+              "as": "r",
+              "expect": {
+                "processing": [
+                  "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+                ],
+                "deadlines": [
+                  {
+                    "token": "<any>",
+                    "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                    "score": "+inf"
+                  }
+                ]
+              }
+            },
+            {
+              "op": "sweep",
+              "now": 9999999999,
+              "expect": {
+                "ready": [],
+                "processing": [
+                  "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+                ],
+                "deadlines": [
+                  {
+                    "token": "<any>",
+                    "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                    "score": "+inf"
+                  }
+                ]
+              }
+            },
+            {
+              "op": "ack",
+              "reservation": "r",
+              "now": 9999999999,
+              "expect": {
+                "processing": [],
+                "deadlines": [],
+                "ready": []
+              }
+            }
+          ]
+        },
+        {
+          "name": "null-consumer-still-sweeps-foreign-expired-member",
+          "source": "broker-bindings.md \u00a71.7 (Legacy layout - the :processing sweep: deadline member, gate, sweep Lua, orphans, count); \"null is not a kill switch\"",
+          "layout": "legacy",
+          "queue": "orders",
+          "retry_after": null,
+          "state": {
+            "ready": [
+              "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 0, \"data\": {\"id\": 1}}"
+            ],
+            "processing": [
+              "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+            ],
+            "deadlines": [
+              {
+                "token": "0123456789abcdef0123456789abcdef",
+                "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                "score": 1000
+              }
+            ]
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000.6,
+              "as": "r",
+              "expect": {
+                "handler_body": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 0, \"data\": {\"id\": 1}}",
+                "ready": [
+                  "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+                ],
+                "processing": [
+                  "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 0, \"data\": {\"id\": 1}}"
+                ],
+                "deadlines": [
+                  {
+                    "token": "<any>",
+                    "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 0, \"data\": {\"id\": 1}}",
+                    "score": "+inf"
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "lrem_count": {
+      "description": "K1 `LREM` count = 1 (\u00a71.7): with two byte-identical copies in `:processing`, an ack or a sweep removes exactly one copy.",
+      "cases": [
+        {
+          "name": "ack-removes-exactly-one-of-two-identical-copies",
+          "source": "broker-bindings.md \u00a71.7 (Legacy layout - the :processing sweep: deadline member, gate, sweep Lua, orphans, count)",
+          "layout": "legacy",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "processing": [
+              "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+              "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+            ],
+            "deadlines": [
+              {
+                "token": "0123456789abcdef0123456789abcdef",
+                "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                "score": 2000
+              },
+              {
+                "token": "fedcba9876543210fedcba9876543210",
+                "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                "score": 2000
+              }
+            ]
+          },
+          "steps": [
+            {
+              "op": "ack",
+              "reservation": {
+                "token": "0123456789abcdef0123456789abcdef",
+                "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+              },
+              "now": 1000,
+              "expect": {
+                "processing": [
+                  "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+                ],
+                "deadlines": [
+                  {
+                    "token": "fedcba9876543210fedcba9876543210",
+                    "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                    "score": 2000
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "sweep-removes-exactly-one-copy-per-expired-member",
+          "source": "broker-bindings.md \u00a71.7 (Legacy layout - the :processing sweep: deadline member, gate, sweep Lua, orphans, count)",
+          "layout": "legacy",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "processing": [
+              "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+              "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+            ],
+            "deadlines": [
+              {
+                "token": "0123456789abcdef0123456789abcdef",
+                "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                "score": 900
+              },
+              {
+                "token": "fedcba9876543210fedcba9876543210",
+                "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                "score": 2000
+              }
+            ]
+          },
+          "steps": [
+            {
+              "op": "sweep",
+              "now": 1000,
+              "expect": {
+                "ready": [
+                  "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+                ],
+                "processing": [
+                  "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+                ],
+                "deadlines": [
+                  {
+                    "token": "fedcba9876543210fedcba9876543210",
+                    "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                    "score": 2000
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "malformed_member": {
+      "description": "K1 malformed member (\u00a71.7): a deadline member that does not match `<32-hex>:<raw>` is only `ZREM`ed; nothing is pushed back.",
+      "cases": [
+        {
+          "name": "member-shorter-than-34-bytes-only-zrem",
+          "source": "broker-bindings.md \u00a71.7 (Legacy layout - the :processing sweep: deadline member, gate, sweep Lua, orphans, count)",
+          "layout": "legacy",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "processing": [
+              "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+            ],
+            "deadlines": [
+              {
+                "member": "short",
+                "score": 900
+              }
+            ]
+          },
+          "steps": [
+            {
+              "op": "sweep",
+              "now": 1000,
+              "expect": {
+                "ready": [],
+                "processing": [
+                  "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+                ],
+                "deadlines": []
+              }
+            }
+          ]
+        },
+        {
+          "name": "byte-33-not-colon-only-zrem",
+          "source": "broker-bindings.md \u00a71.7 (Legacy layout - the :processing sweep: deadline member, gate, sweep Lua, orphans, count)",
+          "layout": "legacy",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "processing": [
+              "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+            ],
+            "deadlines": [
+              {
+                "member": "0123456789abcdef0123456789abcdefx{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                "score": 900
+              }
+            ]
+          },
+          "steps": [
+            {
+              "op": "sweep",
+              "now": 1000,
+              "expect": {
+                "ready": [],
+                "processing": [
+                  "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+                ],
+                "deadlines": []
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "orphan": {
+      "description": "K1 orphan cleanup (\u00a71.7): an expired deadline whose `LREM` removes nothing is only `ZREM`ed; the message is not resurrected.",
+      "cases": [
+        {
+          "name": "lrem-zero-only-zrem-no-resurrection",
+          "source": "broker-bindings.md \u00a71.7 (Legacy layout - the :processing sweep: deadline member, gate, sweep Lua, orphans, count)",
+          "layout": "legacy",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "processing": [],
+            "deadlines": [
+              {
+                "token": "0123456789abcdef0123456789abcdef",
+                "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                "score": 900
+              }
+            ]
+          },
+          "steps": [
+            {
+              "op": "sweep",
+              "now": 1000,
+              "expect": {
+                "ready": [],
+                "processing": [],
+                "deadlines": []
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "legacy_release_gate": {
+      "description": "Legacy-layout release gate (broker-bindings.md \u00a71.7). A release carrying a reservation whose `<token>:<raw>` member is no longer in `:processing:deadlines` (swept or acked: a stale token) MUST touch nothing and log \"reservation expired\"; with the current token the member leaves `:processing` and `:processing:deadlines` and the body returns to the ready list in the same script. The pushed body, its position and its `attempts` are NOT pinned by the contract, hence the `ready_count` expectation (LLEN of the ready list).",
+      "cases": [
+        {
+          "name": "stale-token-touches-nothing",
+          "source": "broker-bindings.md \u00a71.7 (Legacy layout - the :processing sweep: deadline member, gate, sweep Lua, orphans, count); the gate: ZREM of <token>:<raw> first, 0 => touch nothing",
+          "layout": "legacy",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "processing": [
+              "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+            ],
+            "deadlines": [
+              {
+                "token": "fedcba9876543210fedcba9876543210",
+                "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                "score": 2000
+              }
+            ]
+          },
+          "steps": [
+            {
+              "op": "release",
+              "reservation": {
+                "token": "0123456789abcdef0123456789abcdef",
+                "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+              },
+              "now": 1000,
+              "expect": {
+                "processing": [
+                  "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+                ],
+                "deadlines": [
+                  {
+                    "token": "fedcba9876543210fedcba9876543210",
+                    "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                    "score": 2000
+                  }
+                ],
+                "ready_count": 0
+              },
+              "delay": 0
+            }
+          ]
+        },
+        {
+          "name": "valid-token-moves-out-of-processing",
+          "source": "broker-bindings.md \u00a71.7 (Legacy layout - the :processing sweep: deadline member, gate, sweep Lua, orphans, count); the gate: ZREM of <token>:<raw> first, 1 => LREM and the rest in the same script",
+          "layout": "legacy",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "processing": [
+              "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+            ],
+            "deadlines": [
+              {
+                "token": "0123456789abcdef0123456789abcdef",
+                "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                "score": 2000
+              }
+            ]
+          },
+          "steps": [
+            {
+              "op": "release",
+              "reservation": {
+                "token": "0123456789abcdef0123456789abcdef",
+                "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+              },
+              "now": 1000,
+              "expect": {
+                "processing": [],
+                "deadlines": [],
+                "ready_count": 1
+              },
+              "delay": 0
+            }
+          ]
+        }
+      ]
+    },
+    "legacy_dlq_gate": {
+      "description": "Legacy-layout dead-letter gate (broker-bindings.md \u00a71.7). The same ZREM gate guards the DLQ write: with a stale token nothing is touched (neither `:processing` nor `<queue>.dlq` change); with the current token the member leaves `:processing` / `:processing:deadlines` and one entry is pushed to `<queue>.dlq` in the same script. The DLQ entry's content is not pinned by the contract, hence the `dlq_count` expectation (LLEN of `<queue>.dlq`).",
+      "cases": [
+        {
+          "name": "stale-token-touches-nothing",
+          "source": "broker-bindings.md \u00a71.7 (Legacy layout - the :processing sweep: deadline member, gate, sweep Lua, orphans, count); the gate: ZREM of <token>:<raw> first, 0 => touch nothing",
+          "layout": "legacy",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "processing": [
+              "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+            ],
+            "deadlines": [
+              {
+                "token": "fedcba9876543210fedcba9876543210",
+                "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                "score": 2000
+              }
+            ]
+          },
+          "steps": [
+            {
+              "op": "dead_letter",
+              "reservation": {
+                "token": "0123456789abcdef0123456789abcdef",
+                "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+              },
+              "now": 1000,
+              "expect": {
+                "processing": [
+                  "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+                ],
+                "deadlines": [
+                  {
+                    "token": "fedcba9876543210fedcba9876543210",
+                    "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                    "score": 2000
+                  }
+                ],
+                "ready_count": 0,
+                "dlq_count": 0
+              }
+            }
+          ]
+        },
+        {
+          "name": "valid-token-moves-out-of-processing",
+          "source": "broker-bindings.md \u00a71.7 (Legacy layout - the :processing sweep: deadline member, gate, sweep Lua, orphans, count); the gate: ZREM of <token>:<raw> first, 1 => LREM and the rest in the same script",
+          "layout": "legacy",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "processing": [
+              "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+            ],
+            "deadlines": [
+              {
+                "token": "0123456789abcdef0123456789abcdef",
+                "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}",
+                "score": 2000
+              }
+            ]
+          },
+          "steps": [
+            {
+              "op": "dead_letter",
+              "reservation": {
+                "token": "0123456789abcdef0123456789abcdef",
+                "raw": "{\"job\": \"urn:bq:orders:created\",  \"attempts\": 2, \"data\": {\"id\": 1}}"
+              },
+              "now": 1000,
+              "expect": {
+                "processing": [],
+                "deadlines": [],
+                "ready_count": 0,
+                "dlq_count": 1
+              }
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "redis_delay": {
+    "description": "Redis delayed-score formula (broker-bindings.md \u00a71.6; ADR-0033). Scope: `redis`. Pure and clock-pinned, no Redis needed: for each case the SDK's score function called with the given `now` (fractional epoch seconds) and `delay` (seconds, may be fractional) MUST return `expect_score` = `floor(now) + ceil(delay)` (integer epoch seconds). The 1.0-3.5 s wall-clock window of a live delayed publish is a measurement, not a fixture: it is checked by the SDK's own live test, not here. The SQS `DelaySeconds` cases stay in `delay`. The behavioural block `redis_layout.delayed_score` checks the same formula against a live Redis.",
+    "cases": [
+      {
+        "name": "fractional-now-fractional-delay",
+        "source": "broker-bindings.md \u00a71.6 (Delay score = floor(now) + ceil(delay))",
+        "now": 1000.7,
+        "delay": 1.5,
+        "expect_score": 1002
+      },
+      {
+        "name": "integer-now-integer-delay",
+        "source": "broker-bindings.md \u00a71.6 (Delay score = floor(now) + ceil(delay))",
+        "now": 1000.0,
+        "delay": 5,
+        "expect_score": 1005
+      },
+      {
+        "name": "sub-second-delay-rounds-up",
+        "source": "broker-bindings.md \u00a71.6 (Delay score = floor(now) + ceil(delay))",
+        "now": 1000.2,
+        "delay": 0.1,
+        "expect_score": 1001
+      },
+      {
+        "name": "fractional-now-integer-delay-floors-now",
+        "source": "broker-bindings.md \u00a71.6 (Delay score = floor(now) + ceil(delay))",
+        "now": 1000.9,
+        "delay": 2,
+        "expect_score": 1002
+      },
+      {
+        "name": "just-below-next-second",
+        "source": "broker-bindings.md \u00a71.6 (Delay score = floor(now) + ceil(delay))",
+        "now": 1750000000.999,
+        "delay": 0.001,
+        "expect_score": 1750000001
+      },
+      {
+        "name": "exact-integer-delay-not-rounded-up",
+        "source": "broker-bindings.md \u00a71.6 (Delay score = floor(now) + ceil(delay))",
+        "now": 1000.5,
+        "delay": 3.0,
+        "expect_score": 1003
+      },
+      {
+        "name": "long-delay",
+        "source": "broker-bindings.md \u00a71.6 (Delay score = floor(now) + ceil(delay))",
+        "now": 1000.0,
+        "delay": 3600,
+        "expect_score": 4600
+      },
+      {
+        "name": "fraction-just-over-integer-rounds-up",
+        "source": "broker-bindings.md \u00a71.6 (Delay score = floor(now) + ceil(delay))",
+        "now": 1000.0,
+        "delay": 2.001,
+        "expect_score": 1003
+      }
+    ]
+  },
+  "kafka_poison": {
+    "description": "Kafka consumer-side body classification (ADR-0034 \u00a710, ADR-0032 \u00a76; broker-bindings.md \u00a76.5 terminal failure -> DLQ). Scope: `kafka`. Replaces the five vendored `poison-trigger-set.json` copies. For each case, feed `body` (a JSON string; it is the raw record value, so a case may hold invalid JSON, a BOM or duplicate keys) to the SDK core decoder and assert the verdict `expect`: `ok` - the body parses into the envelope and carries a valid identity; `no_identity` - the body parses (top-level JSON object or the literal `null`, every known member of the right type) but neither `job` nor `urn` is a valid identity; `poison` - the body cannot be decoded into the envelope (empty or invalid JSON, trailing data, a BOM, a non-finite or out-of-range number, a top-level value that is not an object, or a known member of the wrong type, including nested `meta.*`, `dead_letter.*`, integer-typed members that are fractional, exponent-form or overflowing). Identity rule (ADR-0032 \u00a76): a `job` that is not a string is ignored; a blank (empty or whitespace-only) string `job` falls back to `urn`; a `urn` that is not a non-blank string is ignored; when neither is valid the body has no identity. Duplicate top-level keys: the LAST value wins, then the identity rule applies (so `{\"job\":5,\"job\":\"urn:x\"}` is `ok` and `{\"job\":\"urn:x\",\"job\":5}` is `no_identity`). Member names are case-sensitive (`JOB` and `Meta` are unknown members). Unknown members and the forbidden envelope keys (message-envelope.md \u00a710) are not decode errors. On Kafka `no_identity` and `poison` have the same fate: the record goes to `<topic>.dlq` with `reason: poison` without calling the handler, so a runner tells the two apart with the core decoder and checks the fate through the transport. The old table's rows are kept (same names and bodies) but their expectations follow ADR-0032 \u00a76: old rows `{\"job\":5}` and `{\"job\":\"urn:x\",\"job\":5}` were `poison` and are now `no_identity` (a non-string `job` is ignored, it is not a type error), and the old row `duplicate job number then string` (`{\"job\":5,\"job\":\"urn:x\"}`) was `poison` and is now `ok` (the last duplicate wins, and it is a valid identity). Three old rows change in total. The first 78 cases keep the old table's order, names and bodies; the 14 cases after them are new in 1.6.0 (they pin the `job`/`urn` type rule and null optional members, which the old table did not cover).",
+    "cases": [
+      {
+        "name": "empty",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "",
+        "expect": "poison"
+      },
+      {
+        "name": "whitespace only",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "   ",
+        "expect": "poison"
+      },
+      {
+        "name": "not json",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "not-json",
+        "expect": "poison"
+      },
+      {
+        "name": "truncated",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"job\":\"urn:a\"",
+        "expect": "poison"
+      },
+      {
+        "name": "empty array",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "[]",
+        "expect": "poison"
+      },
+      {
+        "name": "array",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "[1]",
+        "expect": "poison"
+      },
+      {
+        "name": "string",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "\"str\"",
+        "expect": "poison"
+      },
+      {
+        "name": "number",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "123",
+        "expect": "poison"
+      },
+      {
+        "name": "boolean",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "true",
+        "expect": "poison"
+      },
+      {
+        "name": "null literal",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "null",
+        "expect": "no_identity"
+      },
+      {
+        "name": "empty object",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "full valid",
+        "source": "ADR-0032 \u00a76 (valid job or urn identity) via broker-bindings.md \u00a76.5",
+        "body": "{\"job\":\"urn:babel:orders:created\",\"trace_id\":\"t\",\"data\":{},\"meta\":{\"id\":\"i\",\"queue\":\"q\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1700000000000},\"attempts\":0}",
+        "expect": "ok"
+      },
+      {
+        "name": "job number",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{\"job\":5}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "job null",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{\"job\":null}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "urn alias number",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{\"urn\":5}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "urn alias string",
+        "source": "ADR-0032 \u00a76 (valid job or urn identity) via broker-bindings.md \u00a76.5",
+        "body": "{\"urn\":\"urn:x\"}",
+        "expect": "ok"
+      },
+      {
+        "name": "urn alias padded",
+        "source": "ADR-0032 \u00a76 (valid job or urn identity) via broker-bindings.md \u00a76.5",
+        "body": "{\"urn\":\"  urn:x  \"}",
+        "expect": "ok"
+      },
+      {
+        "name": "trace_id number",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"trace_id\":7}",
+        "expect": "poison"
+      },
+      {
+        "name": "data array",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"data\":[]}",
+        "expect": "poison"
+      },
+      {
+        "name": "data string",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"data\":\"x\"}",
+        "expect": "poison"
+      },
+      {
+        "name": "data null",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{\"data\":null}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "meta string",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"meta\":\"x\"}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta array",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"meta\":[]}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta null",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{\"meta\":null}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "meta.id number",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"meta\":{\"id\":5}}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta.queue number",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"meta\":{\"queue\":5}}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta.lang boolean",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"meta\":{\"lang\":true}}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta.created_at string",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"meta\":{\"created_at\":\"2026\"}}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta.created_at fractional",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"meta\":{\"created_at\":1.5}}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta.created_at integer",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{\"meta\":{\"created_at\":1700000000000}}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "meta.created_at exponent",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"meta\":{\"created_at\":1e3}}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta.created_at decimal zero",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"meta\":{\"created_at\":1.0}}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta.created_at int64 overflow",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"meta\":{\"created_at\":9223372036854775808}}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta.created_at int64 max",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{\"meta\":{\"created_at\":9223372036854775807}}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "meta.created_at negative",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{\"meta\":{\"created_at\":-1}}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "meta.created_at negative zero",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{\"meta\":{\"created_at\":-0}}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "meta.schema_version string",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"meta\":{\"schema_version\":\"1\"}}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta.schema_version two",
+        "source": "ADR-0032 \u00a76 (no valid job/urn); the meta.schema_version value gate is a separate check, see broker-bindings.md \u00a76.7",
+        "body": "{\"meta\":{\"schema_version\":2}}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "meta.schema_version decimal zero",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"meta\":{\"schema_version\":1.0}}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta.schema_version null",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{\"meta\":{\"schema_version\":null}}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "meta.schema_version boolean",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"meta\":{\"schema_version\":true}}",
+        "expect": "poison"
+      },
+      {
+        "name": "attempts fractional",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"attempts\":1.5}",
+        "expect": "poison"
+      },
+      {
+        "name": "attempts string",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"attempts\":\"3\"}",
+        "expect": "poison"
+      },
+      {
+        "name": "attempts integer",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{\"attempts\":2}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "attempts exponent",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"attempts\":1e0}",
+        "expect": "poison"
+      },
+      {
+        "name": "attempts upper exponent",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"attempts\":1E2}",
+        "expect": "poison"
+      },
+      {
+        "name": "attempts negative zero",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{\"attempts\":-0}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "attempts overflow",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"attempts\":9223372036854775808}",
+        "expect": "poison"
+      },
+      {
+        "name": "attempts null",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{\"attempts\":null}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "dead_letter string",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"dead_letter\":\"x\"}",
+        "expect": "poison"
+      },
+      {
+        "name": "dead_letter null",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{\"dead_letter\":null}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "dead_letter empty object",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{\"dead_letter\":{}}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "dead_letter.attempts string",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"dead_letter\":{\"attempts\":\"3\"}}",
+        "expect": "poison"
+      },
+      {
+        "name": "dead_letter.reason number",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"dead_letter\":{\"reason\":5}}",
+        "expect": "poison"
+      },
+      {
+        "name": "dead_letter.error number",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"dead_letter\":{\"error\":5}}",
+        "expect": "poison"
+      },
+      {
+        "name": "dead_letter nullable strings",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{\"dead_letter\":{\"error\":null,\"exception\":null}}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "dead_letter.failed_at string",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"dead_letter\":{\"failed_at\":\"x\"}}",
+        "expect": "poison"
+      },
+      {
+        "name": "dead_letter.failed_at fractional",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"dead_letter\":{\"failed_at\":1.5}}",
+        "expect": "poison"
+      },
+      {
+        "name": "dead_letter.original_queue array",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"dead_letter\":{\"original_queue\":[]}}",
+        "expect": "poison"
+      },
+      {
+        "name": "dead_letter.lang object",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"dead_letter\":{\"lang\":{}}}",
+        "expect": "poison"
+      },
+      {
+        "name": "dead_letter full",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{\"dead_letter\":{\"error\":\"e\",\"exception\":\"x\",\"failed_at\":1,\"original_queue\":\"q\",\"attempts\":1,\"lang\":\"go\",\"reason\":\"r\"}}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "upper-case job key with number is an unknown member (names are case-sensitive)",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{\"JOB\":5}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "mixed-case meta.id key with number is an unknown member (names are case-sensitive)",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{\"Meta\":{\"ID\":5}}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "upper-case job key with string",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{\"JOB\":\"urn:x\"}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "trailing garbage",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"job\":\"x\"} trailing",
+        "expect": "poison"
+      },
+      {
+        "name": "two objects",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"job\":\"x\"}{\"job\":\"y\"}",
+        "expect": "poison"
+      },
+      {
+        "name": "unknown keys",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{\"x\":1}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "forbidden keys with odd types",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{\"timestamp\":\"x\",\"meta\":{\"max_retries\":\"x\",\"attempts\":\"y\",\"source\":5,\"ts\":\"z\"}}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "nested lookalikes in data",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{\"data\":{\"a\":[1,2,{\"b\":null}],\"meta\":5,\"job\":5},\"extra\":{\"meta\":5}}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "duplicate job string then number",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{\"job\":\"urn:x\",\"job\":5}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "duplicate job number then string",
+        "source": "ADR-0032 \u00a76 (valid job or urn identity) via broker-bindings.md \u00a76.5",
+        "body": "{\"job\":5,\"job\":\"urn:x\"}",
+        "expect": "ok"
+      },
+      {
+        "name": "byte order mark",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "\ufeff{\"job\":\"x\"}",
+        "expect": "poison"
+      },
+      {
+        "name": "leading zero number",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"attempts\":01}",
+        "expect": "poison"
+      },
+      {
+        "name": "NaN literal",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"attempts\":NaN}",
+        "expect": "poison"
+      },
+      {
+        "name": "single quotes",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{'a':1}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta duplicate-case key",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{\"meta\":{\"id\":\"a\",\"queue\":\"b\",\"lang\":\"c\",\"schema_version\":1,\"created_at\":1,\"ID\":\"dup\"}}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "attempts huge exponent",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"attempts\":1e400}",
+        "expect": "poison"
+      },
+      {
+        "name": "data with huge number",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"data\":{\"n\":1e400}}",
+        "expect": "poison"
+      },
+      {
+        "name": "job number with valid urn alias",
+        "source": "ADR-0032 \u00a76 (valid job or urn identity) via broker-bindings.md \u00a76.5",
+        "body": "{\"job\":5,\"urn\":\"urn:x\"}",
+        "expect": "ok"
+      },
+      {
+        "name": "job blank with valid urn alias",
+        "source": "ADR-0032 \u00a76 (valid job or urn identity) via broker-bindings.md \u00a76.5",
+        "body": "{\"job\":\"  \",\"urn\":\"urn:x\"}",
+        "expect": "ok"
+      },
+      {
+        "name": "job valid with urn number",
+        "source": "ADR-0032 \u00a76 (valid job or urn identity) via broker-bindings.md \u00a76.5",
+        "body": "{\"job\":\"urn:x\",\"urn\":5}",
+        "expect": "ok"
+      },
+      {
+        "name": "job blank without urn",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{\"job\":\"  \"}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "job and urn both empty strings",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{\"job\":\"\",\"urn\":\"\"}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "job and urn both arrays",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{\"job\":[],\"urn\":[]}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "job object without urn",
+        "source": "ADR-0032 \u00a76 via broker-bindings.md \u00a76.5 (no valid job/urn identity -> DLQ with reason poison on Kafka)",
+        "body": "{\"job\":{}}",
+        "expect": "no_identity"
+      },
+      {
+        "name": "identity with null data",
+        "source": "ADR-0032 \u00a76 (valid job or urn identity) via broker-bindings.md \u00a76.5",
+        "body": "{\"job\":\"urn:x\",\"data\":null}",
+        "expect": "ok"
+      },
+      {
+        "name": "identity with null meta",
+        "source": "ADR-0032 \u00a76 (valid job or urn identity) via broker-bindings.md \u00a76.5",
+        "body": "{\"job\":\"urn:x\",\"meta\":null}",
+        "expect": "ok"
+      },
+      {
+        "name": "identity with null attempts",
+        "source": "ADR-0032 \u00a76 (valid job or urn identity) via broker-bindings.md \u00a76.5",
+        "body": "{\"job\":\"urn:x\",\"attempts\":null}",
+        "expect": "ok"
+      },
+      {
+        "name": "identity with null dead_letter",
+        "source": "ADR-0032 \u00a76 (valid job or urn identity) via broker-bindings.md \u00a76.5",
+        "body": "{\"job\":\"urn:x\",\"dead_letter\":null}",
+        "expect": "ok"
+      },
+      {
+        "name": "identity with integer attempts",
+        "source": "ADR-0032 \u00a76 (valid job or urn identity) via broker-bindings.md \u00a76.5",
+        "body": "{\"job\":\"urn:x\",\"attempts\":2}",
+        "expect": "ok"
+      },
+      {
+        "name": "identity with wrong typed attempts",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"job\":\"urn:x\",\"attempts\":\"3\"}",
+        "expect": "poison"
+      },
+      {
+        "name": "identity with wrong typed data",
+        "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
+        "body": "{\"job\":\"urn:x\",\"data\":[]}",
+        "expect": "poison"
       }
     ]
   }

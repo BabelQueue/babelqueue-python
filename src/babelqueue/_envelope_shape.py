@@ -5,7 +5,7 @@ Go reference's ``babelqueue.Decode``, except that member names are case-sensitiv
 
 * the body must be exactly one JSON value (no BOM, trailing tokens, ``NaN`` / ``Infinity``, malformed
   numbers); a bare ``null`` decodes to an empty envelope, any other non-object root is rejected;
-* ``job``, ``trace_id``, ``meta.id|queue|lang`` and ``dead_letter.reason|error|exception|original_queue|lang``
+* ``trace_id``, ``meta.id|queue|lang`` and ``dead_letter.reason|error|exception|original_queue|lang``
   are string-or-null;
 * ``attempts``, ``meta.schema_version|created_at`` and ``dead_letter.failed_at|attempts`` are
   integer-or-null: an integer literal (no fraction or exponent) that fits ``int64``;
@@ -14,6 +14,8 @@ Go reference's ``babelqueue.Decode``, except that member names are case-sensitiv
 * member names are matched exactly as spelled (case-sensitive, as the contract schema and the core
   decoder read them) and every occurrence of a duplicated key is checked; any other member (a
   differently-cased name or a non-string ``urn`` alias included) is only checked for syntax.
+  A non-string ``job`` is **not** poison either: the identity resolver ignores it (ADR-0032 section 6),
+  so the body is readable and simply carries no identity (conformance ``kafka_poison``, v1.6.0).
 
 A well-typed but non-conformant envelope is not poison: Go's consume path never calls ``Accepts``.
 """
@@ -64,7 +66,6 @@ _DEAD_LETTER = {
     "attempts": _INTEGER,
 }
 _TOP = {
-    "job": _STRING,
     "trace_id": _STRING,
     "attempts": _INTEGER,
     "data": _DATA,

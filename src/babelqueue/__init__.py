@@ -31,6 +31,7 @@ from .replay import HEADER_REPLAY_BYPASS, bypass_external_effects, is_replay
 from .routing import UnknownUrnStrategy
 from .transport import (
     BatchPopper,
+    DeadLetterWriter,
     HeaderPublisher,
     InMemoryTransport,
     ReceivedMessage,
@@ -55,6 +56,7 @@ __all__ = [
     "InMemoryTransport",
     "ReceivedMessage",
     "BatchPopper",
+    "DeadLetterWriter",
     "HeaderPublisher",
     "Redeliverer",
     "Rewinder",

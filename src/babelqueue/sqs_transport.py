@@ -42,10 +42,12 @@ from typing import Any, Dict, Optional, Set
 from urllib.parse import parse_qs, quote, urlsplit
 
 from .codec import ASCII_WHITESPACE, SCHEMA_VERSION, EnvelopeCodec, parse_envelope
+from .exceptions import BabelQueueError
 from .transport import ReceivedMessage, Transport, truncate_declared_version
 
 #: SQS's upper bound for ``ChangeMessageVisibility`` (12 hours).
 MAX_VISIBILITY_TIMEOUT = 43200
+MAX_PUBLISH_DELAY = 900  # SQS DelaySeconds cap (broker-bindings.md §3.4)
 
 logger = logging.getLogger("babelqueue.sqs")
 
@@ -221,8 +223,12 @@ class SqsTransport(Transport):
 
     # -- Transport ----------------------------------------------------------
 
-    def publish(self, queue: str, body: str) -> None:
-        self._send(queue, body, None)
+    def publish(self, queue: str, body: str, delay_seconds: Optional[int] = None) -> None:
+        """Send ``body`` to ``queue``. ``delay_seconds`` sets the per-message ``DelaySeconds``
+        (broker-bindings.md §3.4): 0..900 on a standard queue. A larger delay, or any per-message
+        delay on a FIFO queue (SQS does not support it), raises :class:`BabelQueueError` — the
+        delay is never silently truncated or dropped."""
+        self._send(queue, body, None, delay_seconds)
 
     def publish_with_headers(self, queue: str, body: str, headers: Dict[str, str]) -> None:
         """Send ``body`` with out-of-band ``headers`` projected onto SQS ``MessageAttributes``
@@ -230,8 +236,29 @@ class SqsTransport(Transport):
         attributes win a key collision and the merge is capped at SQS's 10-attribute limit."""
         self._send(queue, body, headers)
 
-    def _send(self, queue: str, body: str, headers: Optional[Dict[str, str]]) -> None:
+    def _send(
+        self,
+        queue: str,
+        body: str,
+        headers: Optional[Dict[str, str]],
+        delay_seconds: Optional[int] = None,
+    ) -> None:
         params: Dict[str, Any] = {"QueueUrl": self._resolve_url(queue), "MessageBody": body}
+        if delay_seconds is not None:
+            if isinstance(delay_seconds, bool) or not isinstance(delay_seconds, int):
+                raise BabelQueueError(f"SQS delay_seconds must be an integer, got {delay_seconds!r}.")
+            if self._fifo:
+                raise BabelQueueError(
+                    "SQS FIFO queues do not support a per-message delay (broker-bindings.md §3.4); "
+                    "set DelaySeconds on the queue instead."
+                )
+            if delay_seconds < 0 or delay_seconds > MAX_PUBLISH_DELAY:
+                raise BabelQueueError(
+                    f"SQS delay_seconds {delay_seconds} is outside 0..{MAX_PUBLISH_DELAY} "
+                    "(broker-bindings.md §3.4)."
+                )
+            if delay_seconds > 0:
+                params["DelaySeconds"] = delay_seconds
         attrs = self._merge_attributes(self._attributes(body), headers)
         if attrs:
             params["MessageAttributes"] = attrs

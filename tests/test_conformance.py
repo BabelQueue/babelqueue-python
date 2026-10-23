@@ -96,8 +96,10 @@ _RUNNERS: Dict[str, List[Tuple[str, str, str]]] = {
     "redis_layout": [("test_behaviour_conformance", "RedisLayoutConformanceTest", "test_redis_layout_cases")],
     "rabbitmq": [("test_behaviour_conformance", "RabbitmqConformanceTest", "test_property_projection")],
     "delay": [("test_behaviour_conformance", "DelayConformanceTest", "test_delay_cases")],
-    # Every backoff case is a known gap (Kafka tiers); the method only asserts that bookkeeping.
     "backoff": [("test_behaviour_conformance", "BackoffConformanceTest", "test_backoff_cases")],
+    "retry_backoff": [("test_behaviour_conformance", "RetryBackoffConformanceTest", "test_retry_backoff_cases")],
+    "redis_delay": [("test_behaviour_conformance", "RedisDelayConformanceTest", "test_redis_delay_cases")],
+    "kafka_poison": [("test_behaviour_conformance", "KafkaPoisonConformanceTest", "test_kafka_poison_cases")],
     # The broker bindings are evidenced per runner, not per case (every method must pass).
     "sqs": [("test_sqs_conformance", "SqsConformanceTest", m) for m in (
         "test_attribute_projection", "test_attempts_reconciliation", "test_schema_version_gate")],
@@ -248,14 +250,19 @@ class ResultsJsonTest(unittest.TestCase):
         self.assertEqual([], missing, "sections without a runner would be missing from results.json")
         self.assertEqual([], [n for n in _RUNNERS if n not in MANIFEST["sections"]])
 
-    def test_a_non_assertion_error_in_an_all_gap_section_is_not_reported_as_a_known_gap(self) -> None:
-        # ``backoff`` has no non-gap case, so nothing else would notice an evaluator bug there.
+    def test_a_non_assertion_error_in_a_known_gap_case_is_not_reported_as_a_known_gap(self) -> None:
+        # The gap list is empty today, so a synthetic gap proves the guard: an evaluator bug
+        # (anything but an ``AssertionError``) must never be written to results.json as a gap.
         import test_behaviour_conformance as behaviour
+
+        first_case = behaviour.iter_cases(MANIFEST, "backoff")[0][0]
 
         def broken(case: Any) -> None:
             raise KeyError("tiers")
 
-        with mock.patch.object(behaviour, "_eval_backoff", broken), mock.patch.dict(behaviour.GAP_RESULTS):
+        with mock.patch.object(behaviour, "_eval_backoff", broken), \
+                mock.patch.dict(behaviour.KNOWN_GAPS, {"backoff": {first_case: "synthetic"}}), \
+                mock.patch.dict(behaviour.GAP_RESULTS):
             with self.assertRaisesRegex(RuntimeError, r"backoff/.*produced no outcome.*KeyError"):
                 run_section("backoff")
 

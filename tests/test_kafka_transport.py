@@ -15,6 +15,7 @@ from urllib.parse import quote
 
 from babelqueue import BabelQueue, EnvelopeCodec, dead_letter
 from babelqueue.kafka_transport import (
+    DEFAULT_RETRY_TIERS_MS,
     NON_UTF8_ROUTE,
     POISON_ROUTE,
     KafkaDeliveryError,
@@ -183,7 +184,9 @@ class OffsetConsumer:
 def transport(producer=None, consumer=None) -> KafkaTransport:
     producer = producer if producer is not None else FakeProducer()
     consumer = consumer if consumer is not None else FakeConsumer()
-    return KafkaTransport(producer=producer, consumer_factory=lambda _q: consumer)
+    return KafkaTransport(
+        producer=producer, consumer_factory=lambda _q: consumer, retry_tiers_ms=DEFAULT_RETRY_TIERS_MS
+    )
 
 
 class KafkaProjectionTest(unittest.TestCase):
@@ -740,7 +743,7 @@ class KafkaDeliveryConfirmationTest(unittest.TestCase):
 
         app.publish("urn:babel:other", {"x": 1}, queue="other")  # must not raise
 
-        self.assertEqual(producer.confirmed, ["orders"])
+        self.assertEqual(producer.confirmed, ["orders.retry.1"])
 
     def test_unrelated_queued_messages_do_not_fail_a_confirmed_settle_write(self):
         consumer = OffsetConsumer([OffsetMessage(body().encode("utf-8"), [], offset=0)])
@@ -761,7 +764,7 @@ class KafkaDeliveryConfirmationTest(unittest.TestCase):
 
         app.consume(queue="orders", max_messages=1)
 
-        self.assertEqual(producer.confirmed, ["orders"])
+        self.assertEqual(producer.confirmed, ["orders.retry.1"])
         self.assertEqual(consumer.commits, [0])
 
     def test_retry_delivery_error_does_not_commit_and_is_redelivered(self):
@@ -1057,7 +1060,7 @@ class KafkaKeyPreservationTest(unittest.TestCase):
         for key in self.KEYS:
             with self.subTest(key=key):
                 record = self._run(body().encode(), key, max_attempts=3)
-                self.assertEqual(record["topic"], "orders")
+                self.assertEqual(record["topic"], "orders.retry.1")
                 self.assertEqual(record["key"], key)
 
     def test_envelope_dead_letter_keeps_the_key(self):
@@ -1662,8 +1665,9 @@ class KafkaPoisonWrapTest(unittest.TestCase):
     def test_poison_is_dropped_and_committed_without_a_dlq(self):
         self.assertEqual(self._poison(b"nope", dead_letter=False), [])
 
-    def test_a_valid_object_without_a_urn_is_not_poison(self):
-        # A body that decodes but names no URN goes down the generic unknown-URN path (as in Go).
+    def test_a_valid_object_without_a_urn_is_poison_on_kafka(self):
+        # ADR-0032 section 6 / conformance ``kafka_poison``: a readable body that names no valid
+        # job/urn shares the poison fate (DLQ reason ``poison``, the handler is never called).
         consumer = OffsetConsumer([OffsetMessage(b'{"data":{"x":1}}', [], offset=0)])
         producer = ReportingProducer()
         app = BabelQueue(
@@ -1672,7 +1676,8 @@ class KafkaPoisonWrapTest(unittest.TestCase):
         app._rewind_pause = 0.0  # noqa: SLF001
         app.consume(queue="orders", max_messages=1)
         dead = json.loads(producer.produced[0]["value"].decode("utf-8"))
-        self.assertEqual(dead["dead_letter"]["reason"], "unknown_urn")
+        self.assertEqual(dead["dead_letter"]["reason"], "poison")
+        self.assertEqual(producer.produced[0]["topic"], "orders.dlq")
 
     def test_the_version_gate_still_dead_letters_the_record_raw(self):
         raw = b"not even json"
@@ -1751,38 +1756,67 @@ if __name__ == "__main__":
 
 
 class PoisonTriggerSetTest(unittest.TestCase):
-    """The table-driven poison trigger set, shared byte for byte by every SDK. ``poison`` is what the
-    Go reference's typed ``Decode`` decides for each body; the Kafka transport must agree."""
+    """The conformance ``kafka_poison`` table (ADR-0034 section 10, ADR-0032 section 6): the core
+    decoder tells ``ok`` / ``no_identity`` / ``poison`` apart, and on Kafka the last two share one
+    fate -- the raw record goes to ``<topic>.dlq`` as poison without a handler call."""
 
     @staticmethod
     def _cases():
         import os
 
-        path = os.path.join(os.path.dirname(__file__), "poison-trigger-set.json")
+        path = os.path.join(os.path.dirname(__file__), "conformance", "manifest.json")
         with open(path, encoding="utf-8") as handle:
-            return json.load(handle)
+            return json.load(handle)["kafka_poison"]["cases"]
 
-    def test_the_trigger_set_matches_the_go_reference(self):
+    @staticmethod
+    def _verdict(text):
+        if KafkaTransport._decode_failure(text) is not None:
+            return "poison"
+        return "ok" if EnvelopeCodec.urn(EnvelopeCodec.decode_lenient(text)) else "no_identity"
+
+    def test_the_decoder_verdict_matches_the_manifest(self):
         cases = self._cases()
-        self.assertGreaterEqual(len(cases), 70)
+        self.assertEqual(len(cases), 92)
         for case in cases:
+            with self.subTest(name=case["name"]):
+                self.assertEqual(self._verdict(case["body"]), case["expect"])
+
+    def test_the_transport_fate_matches_the_manifest(self):
+        for case in self._cases():
             with self.subTest(name=case["name"]):
                 consumer = OffsetConsumer([OffsetMessage(case["body"].encode("utf-8"), [], offset=0)])
                 message = transport(ReportingProducer(), consumer).pop("orders")
                 self.assertIsNotNone(message)
-                if case["poison"]:
+                if case["expect"] == "ok":
+                    self.assertNotIsInstance(message.route_urn, PoisonRoute)
+                    self.assertNotEqual(message.route_urn, NON_NUMERIC_ATTEMPTS_ROUTE)
+                else:  # no_identity and poison share the fate
                     self.assertIsInstance(message.route_urn, PoisonRoute)
                     self.assertEqual(message.route_urn, POISON_ROUTE)
                     self.assertEqual(message.body, case["body"])  # handed over raw
-                else:
-                    self.assertNotIsInstance(message.route_urn, PoisonRoute)
-                    self.assertNotEqual(message.route_urn, NON_NUMERIC_ATTEMPTS_ROUTE)
+
+    def test_no_identity_and_poison_are_dead_lettered_with_reason_poison_and_no_handler_call(self):
+        for case in self._cases():
+            if case["expect"] == "ok":
+                continue
+            with self.subTest(name=case["name"]):
+                consumer = OffsetConsumer([OffsetMessage(case["body"].encode("utf-8"), [], offset=0)])
+                producer = ReportingProducer()
+                app = BabelQueue(transport=transport(producer, consumer), dead_letter=True)
+                app._rewind_pause = 0.0  # noqa: SLF001
+                called = []
+                app.register("urn:x", lambda env: called.append(env))
+                app.consume(queue="orders", max_messages=1)
+                self.assertEqual(called, [])
+                self.assertEqual(consumer.commits, [0])
+                self.assertEqual(len(producer.produced), 1)
+                self.assertEqual(producer.produced[0]["topic"], "orders.dlq")
 
     def test_a_typed_valid_but_non_conformant_envelope_is_routed_not_poisoned(self):
-        # Go's consume path never calls ``Accepts``: a non-string ``urn`` alias, a missing ``data``
-        # and an unknown ``schema_version`` all decode, so they reach the URN router.
+        # Go's consume path never calls ``Accepts``: a missing ``data`` and an unknown
+        # ``schema_version`` still decode, so they reach the URN router. (A body without a valid
+        # job/urn identity is poison on Kafka, see ``PoisonTriggerSetTest``.)
         for text in (
-            '{"urn":5,"data":{}}',
             '{"job":"urn:x"}',
             '{"job":"urn:x","meta":{"schema_version":2}}',
             '{"job":"urn:x","meta":{"schema_version":0}}',

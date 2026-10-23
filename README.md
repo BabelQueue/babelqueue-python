@@ -141,7 +141,7 @@ app.run()                               # consume forever (Ctrl-C to stop)
   messages on `<queue>.dlq`. `on_unknown_urn` = `fail` | `delete` | `release` | `dead_letter`.
 - **Transports:** `redis://` (reliable-queue pattern; add `?laravel=1` to share a
   Redis queue with a Laravel BabelQueue worker using its reserved-set semantics —
-  see below), `amqp://` (RabbitMQ via `pika`, with the contract AMQP properties)
+  see below), `kafka://` (opt-in retry tiers, see below), `amqp://` (RabbitMQ via `pika`, with the contract AMQP properties)
   and `memory://` (in-process, great for tests/local). Bring your own by passing
   `transport=...`.
 
@@ -194,7 +194,10 @@ transport **always** releases with `ChangeMessageVisibility` (broker-bindings
 attempt counter, so a shutdown release also consumes an attempt. The default
 delay is **0 s** (`retry_backoff` / `unknown_urn_release_delay`), i.e. the
 message is visible again immediately; delays outside 0..43200 s are clamped with
-a warning.
+a warning. A **per-message delay** at publish time is
+`SqsTransport.publish(queue, body, delay_seconds=n)` (`DelaySeconds`, 0..900 on a
+standard queue; a larger value, or any per-message delay on a FIFO queue, raises
+`BabelQueueError` instead of being truncated or dropped).
 
 **Poison-loop risk:** a message that always fails is redelivered at once until
 `max_attempts` is reached. If the receive count is unavailable the SDK cannot
@@ -203,11 +206,68 @@ advance attempts at all. **Configure a native `RedrivePolicy`**
 queue as the broker-side backstop, and set a non-zero `retry_backoff` if the
 handler's dependencies need time to recover.
 
+### Retry back-off
+
+`BabelQueue(..., retry_backoff=, retry_backoff_multiplier=, retry_backoff_max=, retry_jitter=)`
+set the worker-side retry delay (ADR-0034 section 9): after the n-th failure the message is
+released with `d(n) = min(retry_backoff_max, retry_backoff * retry_backoff_multiplier ** (n - 1))`
+seconds (`retry_backoff_max=0` means no cap) and `retry_jitter="full"` draws `uniform(0, d(n))`.
+The defaults (`retry_backoff=0`, multiplier 1, jitter `"none"`) keep the previous behaviour: an
+immediate release. How the delay is honoured depends on the transport: SQS uses it as the
+visibility timeout, the Laravel-compatible Redis layout as the `:delayed` score and Kafka picks a
+retry tier (see below).
+
+### Kafka retry tiers and the re-inject consumer
+
+Kafka has no per-message delay, so delayed delivery and retry back-off are SDK-owned **retry
+topics** (broker-bindings section 6.4, ADR-0034). They are opt-in: pass `retry_tiers_ms` to the
+transport (the recommended set is `DEFAULT_RETRY_TIERS_MS` = 5 s, 30 s, 5 min, 30 min):
+
+```python
+from babelqueue import BabelQueue
+from babelqueue.kafka_transport import KafkaTransport, DEFAULT_RETRY_TIERS_MS
+from babelqueue.kafka_retry import RetryReinjector
+
+transport = KafkaTransport("kafka://localhost:9092", retry_tiers_ms=DEFAULT_RETRY_TIERS_MS)
+app = BabelQueue(transport=transport, queue="orders", max_attempts=5, dead_letter=True)
+
+# Run one next to the workers, otherwise a parked message is never delivered again:
+RetryReinjector("kafka://localhost:9092", work_topics=["orders"],
+                retry_tiers_ms=DEFAULT_RETRY_TIERS_MS).run()
+```
+
+A failed message is republished (attempts + 1) to `<queue>.retry.<n>`, where
+`n = min(attempts, N - 1) + 1`; `publish_delayed` picks the smallest tier that covers the requested
+delay. Create the `<queue>.retry.<n>` topics up front. The `RetryReinjector` copies each record's
+value and key byte for byte back to its work topic once the tier delay has elapsed (headers
+`bq-delay` / `bq-original-topic` are dropped) and commits only after the broker confirmed the
+write, so delivery stays at-least-once. It holds every record it has accepted per partition (oldest
+first, a record never overtakes the one before it) and a failed write rewinds the partition to the
+failed record. Without `retry_tiers_ms`, `publish_delayed` and a retry
+raise `BabelQueueError` and nothing is produced. A worker started without tiers while
+`max_attempts` is above 1 logs a warning at start-up: the first handler failure stops that worker
+and leaves the record uncommitted (it is not lost, but it is not retried either) until tiers are
+configured. The re-inject delay is measured from the record
+timestamp: set `message.timestamp.type=LogAppendTime` on the `.retry.<n>` topics so that
+timestamp is the broker's, not a producer clock's.
+
+**Records without an identity are poison.** A Kafka record whose JSON object has neither a valid
+string `job` nor a valid string `urn` (ADR-0034 section 10) is dead-lettered as poison (wrapped with
+`dead_letter.reason: "poison"`, key preserved) and never retried; it is not routed by
+`on_unknown_urn`.
+
 ### Sharing a Redis queue with Laravel
 
 By default the Redis transport owns its queue end-to-end (`RPUSH` to produce;
-`BLMOVE` into a `<queue>:processing` list to reserve; `LREM` on ack). To consume a
-**shared** Laravel BabelQueue Redis queue instead, enable Laravel-compatible mode:
+`BLMOVE` into a `<queue>:processing` list to reserve; `LREM` on ack). Each reservation also
+writes a `<token>:<raw>` member (32 lowercase hex characters of token) into the
+`<queue>:processing:deadlines` sorted set, and before every reserve a sweep moves the lapsed
+reservations back to the end of the list, so a `kill -9` no longer strands a message in
+`:processing`; a late ack of a swept reservation touches nothing of the newer one. `retry_after`
+(default **90** seconds; `None` / `?retry_after=null` disables recovery) sets that deadline, and
+`migration_batch_size` (`-1` = all, otherwise `>= 1`) bounds how many due members one sweep or
+migration moves. To consume a **shared** Laravel BabelQueue Redis queue instead, enable
+Laravel-compatible mode:
 
 ```python
 app = BabelQueue("redis://localhost:6379/0?laravel=1", queue="orders")
@@ -224,8 +284,21 @@ member a Python worker writes is identical to a Laravel worker's — either side
 ack (`ZREM`) the other's reservation, so a Python worker and a Laravel worker share
 one queue without losing or double-processing messages. Before each pop, expired
 reserved/delayed jobs migrate back to the ready list, so a crashed worker's
-in-flight job is re-reserved. Options: `?prefix=queues:` and `?retry_after=60`
-(or the `key_prefix` / `retry_after` constructor args).
+in-flight job is re-reserved. Options: `?prefix=queues:` and `?retry_after=90`
+(or the `key_prefix` / `retry_after` / `migration_batch_size` constructor args). A job whose body
+does not decode, or whose `attempts` is not a number, is reserved raw, dead-lettered byte for byte
+and acked, so it never lingers in `:reserved`. That holds when the body cannot be re-encoded
+either (for example a number such as `1e400`, which real Redis' `cjson` refuses to serialise), and
+it holds under `on_unknown_urn="delete"` too: such a message is dead-lettered, never deleted. Without
+a dead-letter queue it is dropped, and the drop is logged as a warning. Dead-lettering a
+reserved message is one atomic script (`ZREM` the reservation, then `RPUSH` the dead-letter
+record and its notify entry); if the reservation expired first, nothing is written and a warning
+says so, because the job was already migrated back and will be delivered again.
+
+**Limit (A3):** the Laravel-compatible layout stores the bare envelope (Laravel's reserve script
+has to decode it), so out-of-band transport headers such as the W3C `traceparent` cannot be
+carried there. They are dropped without an error; the `trace_id` inside the envelope is still
+preserved. The default (legacy) layout carries them.
 
 ## Framework adapters — Celery & Django
 

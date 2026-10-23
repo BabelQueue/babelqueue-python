@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import random
 import signal
 import threading
 from types import FrameType
@@ -40,6 +41,8 @@ from .headers import _headers_scope
 from .replay import HEADER_REPLAY_BYPASS, _replay_scope
 from .routing import UnknownUrnStrategy
 from .transport import (
+    NON_NUMERIC_ATTEMPTS_ROUTE,
+    DeadLetterWriter,
     HeaderPublisher,
     PoisonRoute,
     ReceivedMessage,
@@ -51,6 +54,28 @@ from .transport import (
 )
 
 Handler = Callable[..., None]
+
+#: Accepted ``retry_jitter`` values: no jitter, or "full" jitter (``uniform(0, d(n))``).
+RETRY_JITTERS = ("none", "full")
+
+
+def retry_delay(
+    n: int,
+    base: float = 0.0,
+    multiplier: float = 1.0,
+    maximum: float = 0.0,
+    jitter: str = "none",
+    uniform: Callable[[float, float], float] = random.uniform,
+) -> float:
+    """The worker-side retry backoff (ADR-0034 §9) for the ``n``-th attempt (1-based, the new
+    ``attempts`` value): ``d(n) = min(maximum, base * multiplier ** (n - 1))`` with ``maximum``
+    of 0 meaning no cap; ``jitter="full"`` returns ``uniform(0, d(n))``."""
+    delay = float(base) * float(multiplier) ** max(int(n) - 1, 0)
+    if maximum and maximum > 0:
+        delay = min(float(maximum), delay)
+    if jitter == "full":
+        return uniform(0.0, delay)
+    return delay
 
 #: Logger the runtime reports settlement failures on (e.g. a failed ack after a successful handler).
 logger = logging.getLogger("babelqueue.app")
@@ -85,16 +110,26 @@ class BabelQueue:
         dead_letter_queue: Optional[str] = None,
         dead_letter_suffix: str = ".dlq",
         retry_backoff: float = 0.0,
+        retry_backoff_multiplier: float = 1.0,
+        retry_backoff_max: float = 0.0,
+        retry_jitter: str = "none",
         unknown_urn_release_delay: float = 0.0,
         shutdown_timeout: float = 30.0,
     ) -> None:
         """
         ``retry_backoff`` / ``unknown_urn_release_delay`` are the seconds a released message
         stays invisible before redelivery on transports that release natively
-        (:class:`~babelqueue.transport.Redeliverer`, e.g. SQS ``ChangeMessageVisibility``);
-        other transports re-publish immediately, as before. Both default to 0 s (immediate
-        redelivery); on SQS every release bumps ``ApproximateReceiveCount``, so pair
+        (:class:`~babelqueue.transport.Redeliverer`, e.g. SQS ``ChangeMessageVisibility``,
+        Redis ``:delayed``); other transports re-publish immediately, as before. Both default to
+        0 s (immediate redelivery); on SQS every release bumps ``ApproximateReceiveCount``, so pair
         ``max_attempts`` with a queue ``RedrivePolicy`` to bound poison-message loops.
+
+        ``retry_backoff`` is the *base* of the worker-side retry backoff (ADR-0034 §9):
+        ``d(n) = min(retry_backoff_max, retry_backoff * retry_backoff_multiplier ** (n - 1))``
+        seconds, ``n`` being the new ``attempts`` value; ``retry_backoff_max`` of 0 means no cap
+        and ``retry_jitter="full"`` draws ``uniform(0, d(n))``. The defaults (multiplier 1, max 0,
+        jitter ``"none"``) keep the historical constant delay. Kafka does not apply it: its retry
+        delay is the retry-topic tier.
 
         ``shutdown_timeout`` bounds how long a graceful shutdown waits for the in-flight handler
         before releasing its message. Keep it above your longest handler run: a released
@@ -109,6 +144,11 @@ class BabelQueue:
         self.dead_letter_queue = dead_letter_queue
         self.dead_letter_suffix = dead_letter_suffix
         self.retry_backoff = float(retry_backoff)
+        if retry_jitter not in RETRY_JITTERS:
+            raise ValueError(f"retry_jitter must be one of {RETRY_JITTERS}, got {retry_jitter!r}")
+        self.retry_backoff_multiplier = float(retry_backoff_multiplier)
+        self.retry_backoff_max = float(retry_backoff_max)
+        self.retry_jitter = retry_jitter
         self.unknown_urn_release_delay = float(unknown_urn_release_delay)
         self.shutdown_timeout = float(shutdown_timeout)
         self._handlers: Dict[str, Handler] = {}
@@ -215,6 +255,7 @@ class BabelQueue:
         and therefore advances ``attempts`` — keep ``shutdown_timeout`` above the handler time.
         """
         target = queue or self.queue
+        self._warn_if_retries_cannot_redeliver()
         processed = 0
         self._signalled = False
         self._deadline_hit = False
@@ -398,6 +439,16 @@ class BabelQueue:
         if timer is not None:
             timer.cancel()
 
+    def _retry_delay(self, attempts: int) -> float:
+        """Seconds to hold a failed message before redelivery; ``attempts`` is the new count."""
+        return retry_delay(
+            attempts,
+            self.retry_backoff,
+            self.retry_backoff_multiplier,
+            self.retry_backoff_max,
+            self.retry_jitter,
+        )
+
     def _release(self, received: ReceivedMessage, body: str, delay: float) -> None:
         """Give ``received`` back to the broker for redelivery.
 
@@ -417,6 +468,17 @@ class BabelQueue:
         delivery when the transport can pin it (:class:`RoutedPublisher`), so a property/body
         mismatch does not flip to the body URN on the next attempt or in the DLQ."""
         publish_keeping_route(self.transport, queue, body, received.route_urn, received.key)
+
+    def _write_dead_letter(self, received: ReceivedMessage, queue: str, body: str) -> None:
+        """Write the dead-letter record ``body`` to ``queue`` and settle ``received``.
+
+        A :class:`~babelqueue.transport.DeadLetterWriter` transport does both as one guarded step
+        (a failed write propagates, never acks); otherwise publish, then acknowledge."""
+        if isinstance(self.transport, DeadLetterWriter):
+            self.transport.dead_letter(received, queue, body)
+            return
+        self._publish_for(received, queue, body)
+        self._ack_settled(received)
 
     def _ack_settled(self, received: ReceivedMessage) -> None:
         """Acknowledge a message whose outcome is already final (handled, dead-lettered,
@@ -462,7 +524,21 @@ class BabelQueue:
         (normalised only if it carries a forbidden key or a ``urn`` alias), no backoff, and the
         runtime adds no ``attempts`` increment. A broker that counts
         deliveries still counts it: on SQS the release bumps ``ApproximateReceiveCount``, so the
-        redelivered envelope reads one more attempt (and a ``RedrivePolicy`` sees it too)."""
+        redelivered envelope reads one more attempt (and a ``RedrivePolicy`` sees it too).
+
+        A :class:`~babelqueue.transport.Rewinder` transport (Kafka) is rewound instead: its record
+        was never committed, so seeking back redelivers it untouched, with no retry-tier hop and
+        no attempt counted."""
+        if isinstance(self.transport, Rewinder):
+            try:
+                self.transport.rewind(received)
+            except Exception:  # noqa: BLE001 - reported, shutdown goes on
+                logger.error(
+                    "Failed to rewind an unprocessed message on queue %r at shutdown.",
+                    received.queue,
+                    exc_info=True,
+                )
+            return
         self._release(received, received.body, 0.0)
 
     def _invoke(self, handler: Handler, envelope: Mapping[str, Any]) -> None:
@@ -476,6 +552,23 @@ class BabelQueue:
         # window in which a shutdown deadline would release an already-handled message.
         self._phase = _SETTLING
 
+    def _warn_if_retries_cannot_redeliver(self) -> None:
+        """Warn at start-up when a failing handler would stop the worker (Kafka without tiers).
+
+        A tierless :class:`~babelqueue.kafka_transport.KafkaTransport` has no way to delay a
+        retry: ``redeliver`` raises, the loop stops and the record stays uncommitted. That only
+        happens once a handler fails, so it is a warning (not a start-up error) -- a worker whose
+        handlers never fail keeps working.
+        """
+        tiers = getattr(self.transport, "retry_tiers_ms", None)
+        if isinstance(tiers, list) and not tiers and self.max_attempts > 1 and isinstance(self.transport, Redeliverer):
+            logger.warning(
+                "The Kafka transport has no retry tiers but max_attempts=%d: the first handler "
+                "failure will stop this worker and leave the record uncommitted. Configure "
+                "retry_tiers_ms (or set max_attempts=1) to retry without stopping.",
+                self.max_attempts,
+            )
+
     def _route_unknown(self, urn: str, received: ReceivedMessage, envelope: Mapping[str, Any]) -> None:
         strategy = self.on_unknown_urn
         # A Kafka poison record (§6.5: not valid UTF-8 / not a decodable body) is not an unknown URN: it
@@ -483,8 +576,17 @@ class BabelQueue:
         # DELETE strategy and settled like the Go reference does -- dead-lettered (wrapped, reason
         # ``poison``) and committed, or dropped only when no DLQ is configured. Other transports'
         # version-gated deliveries keep their existing order below.
+        # The Redis (Laravel layout) poison reservation (ADR-0033 A1: a body that does not decode or
+        # has no numeric ``attempts``) is the same kind of delivery: it is dead-lettered raw, and
+        # ``on_unknown_urn=DELETE`` must not silently discard it. Only that one route is lifted
+        # ahead of DELETE; the generic version-gated prefix below keeps its order.
         if isinstance(received.route_urn, PoisonRoute):
             self._settle_version_gated(received)
+            return
+        if received.route_urn == NON_NUMERIC_ATTEMPTS_ROUTE:
+            # broker-bindings §1.1 / ADR-0033: the DLQ write is an unconditional MUST, so it does
+            # not depend on ``dead_letter_enabled`` (Go ``settleTransportPoison`` does the same).
+            self._settle_version_gated(received, always=True)
             return
         if strategy == UnknownUrnStrategy.DELETE:
             self._ack_settled(received)
@@ -515,18 +617,26 @@ class BabelQueue:
         """The queue a dead-lettered delivery is written to (configured DLQ or ``<queue><suffix>``)."""
         return self.dead_letter_queue or (received.queue + self.dead_letter_suffix)
 
-    def _settle_version_gated(self, received: ReceivedMessage) -> None:
+    def _settle_version_gated(self, received: ReceivedMessage, always: bool = False) -> None:
         """Dead-letter a version-gated delivery directly (no retry); drop it when no DLQ is set.
+
+        ``always`` (the Redis poison reservation, §1.1 / ADR-0033) writes the DLQ record in every
+        configuration, ignoring ``dead_letter_enabled``.
 
         The gate rejects the message *without decoding it*, so the DLQ record is the incoming raw
         body, byte-identical, with no ``dead_letter`` block (matching the Java, .NET and Node
         SDKs). A failed DLQ write propagates: the delivery is left unacknowledged and handed back
         (see :meth:`dispatch`), never retried.
         """
-        if self.dead_letter_enabled or self.on_unknown_urn == UnknownUrnStrategy.DEAD_LETTER:
-            self._publish_for(received, self._dead_letter_target(received), received.body)
-            self._ack_settled(received)
+        if always or self.dead_letter_enabled or self.on_unknown_urn == UnknownUrnStrategy.DEAD_LETTER:
+            self._write_dead_letter(received, self._dead_letter_target(received), received.body)
             return
+        # No DLQ to hold it: the drop is deliberate, but it must not be silent.
+        logger.warning(
+            "Dropping an undeliverable message on queue %r (route %r, %d body characters): it can "
+            "never be handled and no dead-letter queue is configured.",
+            received.queue, received.route_urn, len(received.body),
+        )
         self._ack_settled(received)
 
     def _retry_or_dead_letter(
@@ -536,7 +646,7 @@ class BabelQueue:
         envelope["attempts"] = attempts
 
         if attempts < self.max_attempts:
-            self._release(received, EnvelopeCodec.encode(envelope), self.retry_backoff)
+            self._release(received, EnvelopeCodec.encode(envelope), self._retry_delay(attempts))
             return
 
         if self.dead_letter_enabled:
@@ -563,10 +673,9 @@ class BabelQueue:
             error=(str(exc) if exc is not None else None),
             exception=(type(exc).__name__ if exc is not None else None),
         )
-        self._publish_for(
+        self._write_dead_letter(
             received, self._dead_letter_target(received), EnvelopeCodec.encode(annotated)
         )
-        self._ack_settled(received)
 
 
 #: Reserved ``ReceivedMessage.route_urn`` prefix a transport uses to hand over a delivery it

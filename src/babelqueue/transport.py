@@ -185,6 +185,20 @@ class Redeliverer(Protocol):
 
 
 @runtime_checkable
+class DeadLetterWriter(Protocol):
+    """Optional :class:`Transport` capability: write a dead-letter record and settle the
+    delivery as ONE guarded step (Redis legacy layout, ADR-0033: a reservation that expired and
+    was swept must write nothing and ack nothing, so a late settle cannot duplicate the message).
+
+    ``body`` is the record to write to ``queue``. A transport that does not implement it gets the
+    default publish-then-ack."""
+
+    def dead_letter(self, message: ReceivedMessage, queue: str, body: str) -> None:
+        """Write ``body`` to ``queue`` and settle ``message``."""
+        ...
+
+
+@runtime_checkable
 class Rewinder(Protocol):
     """Optional :class:`Transport` capability: make an *unacknowledged* delivery come back.
 
@@ -202,7 +216,8 @@ class Rewinder(Protocol):
 #: Reserved ``route_urn`` of a record whose envelope carries a non-numeric ``attempts`` (a foreign
 #: producer). It sits under the version-gated prefix, so the runtime dead-letters it directly, raw
 #: and never retried (retrying needs a numeric attempt counter); ``redrive`` restores it to the DLQ
-#: instead of replaying it to a work topic. Delivered by :class:`~babelqueue.kafka_transport.KafkaTransport`.
+#: instead of replaying it to a work topic. Produced only by :class:`~babelqueue.redis_transport.RedisTransport`
+#: for a poison body in the Laravel layout (ADR-0033 A1), which the runtime dead-letters unconditionally.
 NON_NUMERIC_ATTEMPTS_ROUTE = "babelqueue:unsupported-schema-version:non-numeric-attempts"
 
 

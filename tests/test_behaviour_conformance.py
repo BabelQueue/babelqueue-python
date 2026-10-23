@@ -1,8 +1,10 @@
 """Runs the behavioural sections of the shared cross-SDK conformance suite
 (``roundtrip``, ``extension_write``, ``encode_reject``, ``data_shape``, ``forbidden_keys``,
-``payload_schema_unicode``) and the conformance 1.5.0 sections (``trim``, ``job_type``,
-``traceparent``, ``redis_layout``, ``delay``, ``backoff``) plus the previously unexercised
-``idempotency``, ``redis`` and ``rabbitmq`` blocks.
+``payload_schema_unicode``) and the conformance 1.5.0 / 1.6.0 sections (``trim``, ``job_type``,
+``traceparent``, ``redis_layout``, ``redis_delay``, ``delay``, ``backoff``, ``retry_backoff``,
+``kafka_poison``) plus the previously unexercised ``idempotency``, ``redis`` and ``rabbitmq``
+blocks. ``redis_layout`` drives the real Lua scripts: it needs a real Redis (``BQ_REQUIRE_REDIS``;
+CI) and falls back to the in-process fakeredis + lupa emulator only when none is required.
 
 These sections are mandatory: unlike the optional broker sections, a missing section fails
 the run instead of skipping it. Pointers are RFC 6901 and equality is type-strict and deep
@@ -15,6 +17,7 @@ import contextlib
 import inspect
 import json
 import logging
+import re
 import time
 import unittest
 from importlib.util import find_spec
@@ -22,27 +25,38 @@ from unittest import mock
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple
 
-from test_kafka_transport import FakeConsumer, FakeProducer
-from test_redis_transport import FakeRedis
+import redis_backend
+from test_kafka_transport import FakeConsumer, FakeProducer, OffsetConsumer, OffsetMessage, ReportingProducer
+from test_kafka_transport import transport as poison_transport
 from test_sqs_transport import FakeSQS
 
 from babelqueue import BabelQueue, BabelQueueError, EnvelopeCodec
+from babelqueue.app import retry_delay
 from babelqueue.dead_letter import annotate
 from babelqueue.exceptions import EnvelopeKeyError
 from babelqueue.idempotency import InMemoryStore
 from babelqueue.idempotency import wrap as idempotency_wrap
-from babelqueue.kafka_transport import KafkaTransport
+from babelqueue.kafka_transport import DEFAULT_RETRY_TIERS_MS, POISON_ROUTE, KafkaTransport, retry_topic
 from babelqueue.pika_transport import PikaTransport
-from babelqueue.redis_transport import RedisTransport
+from babelqueue.redis_transport import RedisTransport, _LegacyHandle
 from babelqueue.schema import validate_schema
 from babelqueue.sqs_transport import SqsTransport
-from babelqueue.transport import ReceivedMessage
+from babelqueue.transport import NON_NUMERIC_ATTEMPTS_ROUTE, PoisonRoute, ReceivedMessage
 
 SUITE = Path(__file__).parent / "conformance"
 MANIFEST = json.loads((SUITE / "manifest.json").read_text(encoding="utf-8"))
 
 _MISSING = object()
-_HAS_OTEL = find_spec("opentelemetry.trace") is not None
+
+
+def _has_module(name: str) -> bool:
+    try:
+        return find_spec(name) is not None
+    except ModuleNotFoundError:  # the parent package itself is absent
+        return False
+
+
+_HAS_OTEL = _has_module("opentelemetry.trace")
 
 
 def _pointer(doc: Any, pointer: str) -> Any:
@@ -769,30 +783,30 @@ def _eval_traceparent(case: Mapping[str, Any]) -> None:
         _ensure(actual.get(field) == expected, f"{field}: {actual.get(field)!r} != {expected!r}")
 
 
-class _RecordingRedis(FakeRedis):
-    """FakeRedis that records the KEYS of every Lua script the transport evaluates."""
+class _KeyRecorder:
+    """A client stub that records the KEYS of every Lua script the transport evaluates.
+
+    The key-name cases need no broker: ``RedisTransport`` never imports ``redis`` when it is
+    given a client, and only the key names it hands to ``eval`` are under test.
+    """
 
     def __init__(self) -> None:
-        super().__init__()
         self.eval_keys: List[List[str]] = []
 
-    def eval(self, script: Any, numkeys: Any, *args: Any) -> Any:
+    def eval(self, script: Any, numkeys: Any, *args: Any) -> None:
         self.eval_keys.append([str(k) for k in args[:numkeys]])
-        return super().eval(script, numkeys, *args)
 
 
-def _eval_redis_layout(case: Mapping[str, Any]) -> None:
-    client = _RecordingRedis()
+def _eval_redis_key_names(case: Mapping[str, Any]) -> None:
+    client = _KeyRecorder()
     transport = RedisTransport(
         "redis://x", client=client, laravel_compat=True, key_prefix=case["key_prefix"]
     )
     queue = case["queue"]
-    transport.publish(queue, EnvelopeCodec.encode(EnvelopeCodec.make("urn:acme:a", {"n": 1})))
-    message = transport.pop(queue, timeout=0)
-    _ensure(message is not None, "the published job must be reservable")
-    assert message is not None
-    transport.release(message, 30)
-    # publish evals [ready, notify]; pop evals [ready, reserved, notify]; release [delayed, reserved].
+    body = EnvelopeCodec.encode(EnvelopeCodec.make("urn:acme:a", {"n": 1}))
+    transport.publish(queue, body)
+    transport.release(ReceivedMessage(body=body, queue=queue, handle=body), 30)
+    # publish evals [ready, notify]; release evals [delayed, reserved].
     publish_keys, release_keys = client.eval_keys[0], client.eval_keys[-1]
     actual = {
         "ready": publish_keys[0],
@@ -802,6 +816,221 @@ def _eval_redis_layout(case: Mapping[str, Any]) -> None:
     }
     for name, expected in case["expect"].items():
         _ensure(actual[name] == expected, f"{name} key: {actual[name]!r} != {expected!r}")
+
+
+def _eval_redis_delay(case: Mapping[str, Any]) -> None:
+    transport = RedisTransport("redis://x", client=object(), laravel_compat=True, clock=lambda: case["now"])
+    actual = transport._available_at(case["delay"])  # noqa: SLF001 - the SDK's score function
+    _ensure(actual == case["expect_score"], f"score: {actual!r} != {case['expect_score']!r}")
+
+
+_DEADLINE_ANY = "<any>"
+
+
+def _score_of(value: Any) -> float:
+    return float("inf") if value == "+inf" else float(value)
+
+
+def _redis_for_layout() -> Any:
+    client, _kind = redis_backend.connect()
+    if client is None:
+        if redis_backend.require_real_redis():
+            raise AssertionError(
+                f"BQ_REQUIRE_REDIS is set but no real Redis is reachable at {redis_backend.REDIS_URL}"
+            )
+        raise unittest.SkipTest("redis_layout needs a Redis (real, or fakeredis + lupa): none available")
+    return client
+
+
+def _entry_matches(member: str, score: float, expected: Mapping[str, Any]) -> bool:
+    """Does one ``(member, score)`` of a zset match one expected ``{member|member_json|body_json|token+raw, score}``?"""
+    if score != _score_of(expected["score"]):
+        return False
+    if "member" in expected:
+        return member == expected["member"]
+    if "token" in expected:
+        if expected["token"] == _DEADLINE_ANY:
+            return re.fullmatch(r"[0-9a-f]{32}:" + re.escape(expected["raw"]), member) is not None
+        return member == f"{expected['token']}:{expected['raw']}"
+    want = expected["member_json"] if "member_json" in expected else expected["body_json"]
+    try:
+        return _strict_equal(json.loads(member), want)
+    except ValueError:
+        return False
+
+
+def _zset_violation(label: str, actual: List[Tuple[str, float]], expected: List[Mapping[str, Any]]) -> Optional[str]:
+    remaining = list(actual)
+    for want in expected:
+        for index, (member, score) in enumerate(remaining):
+            if _entry_matches(member, score, want):
+                del remaining[index]
+                break
+        else:
+            return f"{label}: no entry matches {want!r} in {actual!r}"
+    if remaining:
+        return f"{label}: unexpected entries {remaining!r}"
+    return None
+
+
+class _LayoutScenario:
+    """One ``redis_layout`` behavioural case against a Redis: state, steps, per-step expectations."""
+
+    def __init__(self, case: Mapping[str, Any]) -> None:
+        self.case = case
+        self.client = _redis_for_layout()
+        self.queue = redis_backend.unique_queue("bqlayout")
+        self.zset = case["layout"] == "zset"
+        self.now = [0.0]
+        options: Dict[str, Any] = {}
+        if "retry_after" in case:  # JSON null is ``None``: the deadline is +inf
+            options["retry_after"] = case["retry_after"]
+        if "migration_batch_size" in case:
+            options["migration_batch_size"] = case["migration_batch_size"]
+        self.transport = RedisTransport(
+            "redis://x", client=self.client, laravel_compat=self.zset, clock=lambda: self.now[0], **options
+        )
+        self.held: Dict[str, Optional[ReceivedMessage]] = {}
+        self.last: Optional[ReceivedMessage] = None
+
+    # -- keys
+    @property
+    def ready_key(self) -> str:
+        return f"queues:{self.queue}" if self.zset else self.queue
+
+    def key(self, name: str) -> str:
+        return {
+            "delayed": f"{self.ready_key}:delayed",
+            "reserved": f"{self.ready_key}:reserved",
+            "notify": f"{self.ready_key}:notify",
+            "processing": f"{self.queue}:processing",
+            "deadlines": f"{self.queue}:processing:deadlines",
+        }[name]
+
+    def zrange(self, key: str) -> List[Tuple[str, float]]:
+        return [(str(m), float(sc)) for m, sc in self.client.zrange(key, 0, -1, withscores=True)]
+
+    # -- state
+    def seed(self) -> None:
+        state = self.case["state"]
+        for member in state.get("ready", []):
+            self.client.rpush(self.ready_key, member)
+        for member in state.get("processing", []):
+            self.client.rpush(self.key("processing"), member)
+        for name in ("delayed", "reserved", "deadlines"):
+            for entry in state.get(name, []):
+                member = entry["member"] if "member" in entry else f"{entry['token']}:{entry['raw']}"
+                self.client.zadd(self.key(name), {member: _score_of(entry["score"])})
+        generate = state.get("delayed_generate")
+        if generate:
+            for i in range(generate["count"]):
+                self.client.zadd(self.key("delayed"), {generate["member"] % i: _score_of(generate["score"])})
+        for _ in range(state.get("notify", 0)):
+            self.client.rpush(self.key("notify"), "1")
+
+    # -- steps
+    def reservation(self, ref: Any) -> ReceivedMessage:
+        if isinstance(ref, str):
+            held = self.held.get(ref)
+            _ensure(held is not None, f"reservation {ref!r} is not held")
+            assert held is not None
+            return held
+        return ReceivedMessage(body=ref["raw"], queue=self.queue, handle=_LegacyHandle(ref["raw"], ref["token"]))
+
+    def run_step(self, step: Mapping[str, Any]) -> Dict[str, Any]:
+        self.now[0] = step["now"]
+        op = step["op"]
+        observed: Dict[str, Any] = {}
+        if op == "reserve":
+            message = self.transport.pop(self.queue, timeout=0)
+            self.last = message
+            if "as" in step:
+                self.held[step["as"]] = message
+            observed["message"] = message
+        elif op == "push_delayed":
+            self.transport.publish_delayed(self.queue, step["body"], step["delay"])
+        elif op == "migrate":
+            self.transport._migrate(self.ready_key)  # noqa: SLF001 - the contract names the script, not an API
+        elif op == "sweep":
+            self.transport._sweep(self.queue)  # noqa: SLF001
+        elif op == "release":
+            self.transport.release(self.reservation(step["reservation"]), step["delay"])
+        elif op == "ack":
+            self.transport.ack(self.reservation(step["reservation"]))
+        elif op == "dead_letter":
+            message = self.reservation(step["reservation"])
+            self.transport.dead_letter(message, f"{self.queue}.dlq", message.body)
+        else:
+            raise AssertionError(f"unknown redis_layout op {op!r}")
+        return observed
+
+    # -- expectations
+    def check(self, expect: Mapping[str, Any], observed: Mapping[str, Any]) -> None:
+        message: Optional[ReceivedMessage] = observed.get("message")
+        if "outcome" in expect:
+            if message is None:
+                actual = "empty"
+            elif message.route_urn == NON_NUMERIC_ATTEMPTS_ROUTE:
+                actual = "poison"
+            else:
+                actual = "delivered"
+            _ensure(actual == expect["outcome"], f"outcome: {actual!r} != {expect['outcome']!r}")
+        if "handler_body" in expect:
+            _ensure(message is not None, "handler_body expected but nothing was reserved")
+            assert message is not None
+            _ensure(message.body == expect["handler_body"], f"handler body: {message.body!r} != {expect['handler_body']!r}")
+        if "reported_attempts" in expect:
+            _ensure(message is not None, "reported_attempts expected but nothing was reserved")
+            assert message is not None
+            reported = json.loads(message.handle)["attempts"]
+            _ensure(reported == expect["reported_attempts"], f"attempts: {reported!r} != {expect['reported_attempts']!r}")
+        if "ready" in expect:
+            actual_ready = list(self.client.lrange(self.ready_key, 0, -1))
+            _ensure(actual_ready == expect["ready"], f"ready: {actual_ready!r} != {expect['ready']!r}")
+        if "ready_generate" in expect:
+            wanted = [expect["ready_generate"]["member"] % i for i in range(expect["ready_generate"]["count"])]
+            actual_ready = list(self.client.lrange(self.ready_key, 0, -1))
+            _ensure(actual_ready == wanted, f"ready (generated): {actual_ready[:3]!r}... != {wanted[:3]!r}...")
+        if "ready_count" in expect:
+            count = self.client.llen(self.queue)
+            _ensure(count == expect["ready_count"], f"ready_count: {count} != {expect['ready_count']}")
+        if "dlq_count" in expect:
+            count = self.client.llen(f"{self.queue}.dlq")
+            _ensure(count == expect["dlq_count"], f"dlq_count: {count} != {expect['dlq_count']}")
+        if "notify" in expect:
+            count = self.client.llen(self.key("notify"))
+            _ensure(count == expect["notify"], f"notify: {count} != {expect['notify']}")
+        if "processing" in expect:
+            actual_processing = list(self.client.lrange(self.key("processing"), 0, -1))
+            _ensure(
+                actual_processing == expect["processing"],
+                f"processing: {actual_processing!r} != {expect['processing']!r}",
+            )
+        for name in ("delayed", "reserved", "deadlines"):
+            if name in expect:
+                violation = _zset_violation(name, self.zrange(self.key(name)), expect[name])
+                _ensure(violation is None, str(violation))
+        if expect.get("tokens_distinct"):
+            tokens = [member.split(":", 1)[0] for member, _ in self.zrange(self.key("deadlines"))]
+            _ensure(len(tokens) == len(set(tokens)), f"deadline tokens are not distinct: {tokens!r}")
+
+    def run(self) -> None:
+        try:
+            self.seed()
+            for step in self.case["steps"]:
+                observed = self.run_step(step)
+                if "expect" in step:
+                    self.check(step["expect"], observed)
+        finally:
+            redis_backend.purge(self.client, self.queue)
+
+
+def _eval_redis_layout(case: Mapping[str, Any]) -> None:
+    """``redis_layout``: the three key-name cases (no broker) and the behavioural scenarios (Redis)."""
+    if "layout" in case:
+        _LayoutScenario(case).run()
+    else:
+        _eval_redis_key_names(case)
 
 
 def _eval_release_visibility(case: Mapping[str, Any]) -> None:
@@ -867,12 +1096,16 @@ def _eval_idempotency_sequence(case: Mapping[str, Any]) -> None:
 
 def _eval_redis_payload_identity(case: Mapping[str, Any]) -> None:
     raw = (SUITE / case["envelope_file"]).read_text(encoding="utf-8")
-    client = _RecordingRedis()
-    transport = RedisTransport("redis://x", client=client)
-    transport.publish("orders", raw)
-    _ensure(client.lists["orders"] == [raw], "the queue element must be the envelope, unwrapped")
-    message = transport.pop("orders", timeout=0)
-    _ensure(message is not None and message.body == raw, "reserve must return identical bytes")
+    client = _redis_for_layout()
+    queue = redis_backend.unique_queue("bqidentity")
+    try:
+        transport = RedisTransport("redis://x", client=client)
+        transport.publish(queue, raw)
+        _ensure(list(client.lrange(queue, 0, -1)) == [raw], "the queue element must be the envelope, unwrapped")
+        message = transport.pop(queue, timeout=0)
+        _ensure(message is not None and message.body == raw, "reserve must return identical bytes")
+    finally:
+        redis_backend.purge(client, queue)
 
 
 class _FakeBasicProperties:
@@ -896,15 +1129,12 @@ def _eval_rabbitmq_property_projection(case: Mapping[str, Any]) -> None:
         _ensure(_strict_equal(actual, expected), f"header {name}: {actual!r} != {expected!r}")
 
 
-# -- delay (SQS section 3.4) and backoff (Kafka sections 6.4/6.5) -------------------------------
-# These probe the transports' PUBLIC surface for the features the contract requires:
+# -- delay (SQS section 3.4), backoff (Kafka sections 6.4/6.5) and the worker retry formula --------
+# These probe the transports' PUBLIC surface:
 #   SqsTransport.publish(queue, body, delay_seconds=N)      -> SendMessage DelaySeconds
 #   KafkaTransport(retry_tiers_ms=[...]).publish_delayed(queue, body, delay_ms)
-#   KafkaTransport.redeliver(message, body, delay_seconds)  -> retry-topic republish
-# None exists yet, so each such case fails with an explicit message and is listed in
-# conformance-known-gaps.json. Whoever implements a feature must use (or update) these call
-# shapes AND delete the gap entries in the same change: a case that passes while still listed is
-# a stale gap and fails both the unit test and the completeness gate.
+#   KafkaTransport.redeliver(message, body, delay)          -> retry-tier republish
+#   babelqueue.app.retry_delay(n, base, multiplier, maximum, jitter)
 
 
 def _eval_sqs_delay(case: Mapping[str, Any]) -> None:
@@ -946,56 +1176,53 @@ def _check_retry_record(case: Mapping[str, Any], producer: FakeProducer) -> None
     expect = case["expect"]
     _ensure(len(producer.produced) == 1, f"expected one retry-topic record, got {len(producer.produced)}")
     record = producer.produced[0]
-    index = list(case["retry_tiers_ms"]).index(expect["tier_ms"])
-    # The contract fixes the `<topic>.retry.<n>` shape, not whether <n> counts from 0 or 1.
-    allowed = {f"{case['work_topic']}.retry.{index}", f"{case['work_topic']}.retry.{index + 1}"}
-    _ensure(record["topic"] in allowed, f"retry topic {record['topic']!r} is not the {expect['tier_ms']} ms tier")
+    tiers = list(case["retry_tiers_ms"])
+    wanted_topic = expect.get("topic") or retry_topic(case["work_topic"], tiers.index(expect["tier_ms"]) + 1)
+    _ensure(record["topic"] == wanted_topic, f"retry topic {record['topic']!r} != {wanted_topic!r}")
     headers = {
         key: (value.decode("utf-8") if isinstance(value, bytes) else str(value))
         for key, value in (record["headers"] or [])
     }
     for name, value in expect["headers"].items():
         _ensure(headers.get(name) == value, f"header {name}: {headers.get(name)!r} != {value!r}")
+    if "key" in expect:
+        _ensure(record.get("key") == expect["key"].encode("utf-8"), f"record key: {record.get('key')!r}")
 
 
 def _eval_kafka_tier(case: Mapping[str, Any]) -> None:
     transport, producer = _kafka_transport(case)
-    publish_delayed = getattr(transport, "publish_delayed", None)
-    _ensure(publish_delayed is not None, "KafkaTransport has no retry-tier publish path (publish_delayed)")
-    assert publish_delayed is not None
     body = EnvelopeCodec.encode(EnvelopeCodec.make("urn:acme:a", {"n": 1}))
     if case["expect"] == "reject":
         try:
-            publish_delayed(case["work_topic"], body, case["delay_ms"])
+            transport.publish_delayed(case["work_topic"], body, case["delay_ms"])
         except BabelQueueError:
             _ensure(not producer.produced, "a rejected delay must not produce a record")
             return
         raise AssertionError(f"delay {case['delay_ms']} ms must raise BabelQueueError")
-    publish_delayed(case["work_topic"], body, case["delay_ms"])
+    transport.publish_delayed(case["work_topic"], body, case["delay_ms"])
     _check_retry_record(case, producer)
 
 
 def _eval_kafka_retry_republish(case: Mapping[str, Any]) -> None:
+    """``retry_republish`` (``attempts``) and ``retry_attempt_tier`` (``attempts_before``): redeliver
+    a record that had ``attempts`` attempts before this failure; the runtime hands over the body
+    with ``attempts`` already advanced, and the transport picks the tier from the attempts before."""
+    before = case["attempts"] if "attempts" in case else case["attempts_before"]
     transport, producer = _kafka_transport(case)
-    redeliver = getattr(transport, "redeliver", None)
-    _ensure(redeliver is not None, "KafkaTransport has no tiered release path (redeliver)")
-    assert redeliver is not None
     envelope = EnvelopeCodec.make("urn:acme:a", {"n": 1})
-    envelope["attempts"] = case["attempts"]
-    message = ReceivedMessage(body=EnvelopeCodec.encode(envelope), queue=case["work_topic"])
-    # `Redeliverer.redeliver` receives the envelope the runtime would republish, `attempts`
-    # already advanced (App._retry_or_dead_letter); the transport must not advance it again.
-    envelope["attempts"] = case["attempts"] + 1
+    envelope["attempts"] = before
+    key = case["key"].encode("utf-8") if "key" in case else None
+    message = ReceivedMessage(body=EnvelopeCodec.encode(envelope), queue=case["work_topic"], key=key)
+    envelope["attempts"] = before + 1
     body = EnvelopeCodec.encode(envelope)
-    delay_seconds = case["release_delay_ms"] / 1000
     if case["expect"] == "reject":
         try:
-            redeliver(message, body, delay_seconds)
+            transport.redeliver(message, body, 0)
         except BabelQueueError:
             _ensure(not producer.produced, "a rejected release must not produce a record")
             return
         raise AssertionError("a release with no retry tiers must raise BabelQueueError")
-    redeliver(message, body, delay_seconds)
+    transport.redeliver(message, body, 0)
     _check_retry_record(case, producer)
     sent = json.loads(producer.produced[0]["value"])
     _ensure(
@@ -1004,13 +1231,81 @@ def _eval_kafka_retry_republish(case: Mapping[str, Any]) -> None:
     )
 
 
+def _eval_kafka_topic_names(case: Mapping[str, Any]) -> None:
+    actual = retry_topic(case["work_topic"], case["n"])
+    _ensure(actual == case["expect_topic"], f"retry topic: {actual!r} != {case['expect_topic']!r}")
+
+
+def _eval_kafka_default_tiers(case: Mapping[str, Any]) -> None:
+    _ensure(case["constant"] == "DEFAULT_RETRY_TIERS_MS", f"unknown constant {case['constant']!r}")
+    _ensure(
+        list(DEFAULT_RETRY_TIERS_MS) == case["expect"],
+        f"DEFAULT_RETRY_TIERS_MS: {DEFAULT_RETRY_TIERS_MS!r} != {case['expect']!r}",
+    )
+
+
+def _eval_retry_backoff(case: Mapping[str, Any]) -> None:
+    def delay(uniform: Optional[Callable[[float, float], float]] = None) -> float:
+        extra = {"uniform": uniform} if uniform is not None else {}
+        return retry_delay(
+            case["n"],
+            case["retry_backoff"],
+            case["retry_backoff_multiplier"],
+            case["retry_backoff_max"],
+            case["retry_jitter"],
+            **extra,
+        )
+
+    if "expect_delay_seconds" in case:
+        _ensure(case["retry_jitter"] == "none", "an exact expectation is only legal without jitter")
+        actual = delay()
+        _ensure(actual == case["expect_delay_seconds"], f"delay: {actual!r} != {case['expect_delay_seconds']!r}")
+        return
+    low, high = case["expect_delay_range_seconds"]["min"], case["expect_delay_range_seconds"]["max"]
+    draws = [delay() for _ in range(25)] + [delay(lambda a, b: a), delay(lambda a, b: b)]
+    for actual in draws:
+        _ensure(low <= actual <= high, f"jittered delay {actual!r} outside [{low}, {high}]")
+
+
+def _eval_kafka_poison(case: Mapping[str, Any]) -> None:
+    """``kafka_poison``: the core decoder's verdict, then the Kafka fate (ADR-0034 section 10)."""
+    body = case["body"]
+    if KafkaTransport._decode_failure(body) is not None:  # noqa: SLF001 - the transport's own verdict
+        verdict = "poison"
+    else:
+        verdict = "ok" if EnvelopeCodec.urn(EnvelopeCodec.decode_lenient(body)) else "no_identity"
+    _ensure(verdict == case["expect"], f"verdict: {verdict!r} != {case['expect']!r}")
+    consumer = OffsetConsumer([OffsetMessage(body.encode("utf-8"), [], offset=0)])
+    message = poison_transport(ReportingProducer(), consumer).pop("orders")
+    _ensure(message is not None, "the record must be delivered to the runtime")
+    assert message is not None
+    if case["expect"] == "ok":
+        _ensure(not isinstance(message.route_urn, PoisonRoute), "a record with an identity is not poison")
+    else:  # no_identity and poison share one fate: dead-lettered raw as poison, no handler call
+        _ensure(
+            isinstance(message.route_urn, PoisonRoute) and message.route_urn == POISON_ROUTE,
+            f"route: {message.route_urn!r} is not the poison route",
+        )
+        _ensure(message.body == body, "a poison record is handed over raw")
+
+
 def _eval_delay(case: Mapping[str, Any]) -> None:
     # Cases carrying `queue_type` are the section 3.4 publish-delay cases; the rest are releases.
     (_eval_sqs_delay if "queue_type" in case else _eval_release_visibility)(case)
 
 
 def _eval_backoff(case: Mapping[str, Any]) -> None:
-    (_eval_kafka_retry_republish if "release_delay_ms" in case else _eval_kafka_tier)(case)
+    """``backoff``: dispatch on the case shape (the evaluator only sees the case body)."""
+    if "delay_ms" in case:
+        _eval_kafka_tier(case)
+    elif "attempts" in case or "attempts_before" in case:
+        _eval_kafka_retry_republish(case)
+    elif "expect_topic" in case:
+        _eval_kafka_topic_names(case)
+    elif "constant" in case:
+        _eval_kafka_default_tiers(case)
+    else:
+        raise AssertionError(f"unrecognised backoff case shape: {sorted(case)}")
 
 
 def _run_cases(
@@ -1068,12 +1363,19 @@ class JobTypeConformanceTest(unittest.TestCase):
 
 
 class RunnerCaseIdTest(unittest.TestCase):
+    #: ``section -> number of case ids`` of the vendored conformance 1.6.0 manifest.
+    EXPECTED_COUNTS = {"trim": 35, "job_type": 11, "traceparent": 14, "delay": 9, "backoff": 29, "redis_layout": 55, "redis_delay": 8, "retry_backoff": 18, "kafka_poison": 92, "idempotency": 7, "redis": 1, "rabbitmq": 1}
+
     def test_case_id_counts_match_the_manifest(self) -> None:
-        expected = {"trim": 35, "job_type": 11, "traceparent": 14, "delay": 9, "backoff": 10,
-                    "redis_layout": 3, "idempotency": 7, "redis": 1, "rabbitmq": 1}
-        for section, count in expected.items():
+        for section, count in self.EXPECTED_COUNTS.items():
             with self.subTest(section=section):
                 self.assertEqual(count, len(iter_cases(MANIFEST, section)))
+
+    def test_case_ids_are_unique_within_a_section(self) -> None:
+        for section in self.EXPECTED_COUNTS:
+            ids = [case_id for case_id, _ in iter_cases(MANIFEST, section)]
+            with self.subTest(section=section):
+                self.assertEqual(len(ids), len(set(ids)))
 
     def test_known_gaps_name_only_real_case_ids_with_a_reason(self) -> None:
         for section, gaps in KNOWN_GAPS.items():
@@ -1082,8 +1384,7 @@ class RunnerCaseIdTest(unittest.TestCase):
             for case_id, reason in gaps.items():
                 with self.subTest(section=section, case=case_id):
                     self.assertIn(case_id, ids)
-                    self.assertRegex(reason, r"section[s]? \d")
-                    self.assertIn("r1 follow-up plan", reason)
+                    self.assertTrue(reason.strip())
 
     def test_known_gap_entries_are_unique(self) -> None:
         document = json.loads(KNOWN_GAPS_FILE.read_text(encoding="utf-8"))
@@ -1091,12 +1392,10 @@ class RunnerCaseIdTest(unittest.TestCase):
         self.assertEqual(len(keys), len(set(keys)))
         self.assertEqual(sum(len(c) for c in KNOWN_GAPS.values()), len(keys))
 
-    def test_release_visibility_and_wire_cases_are_never_known_gaps(self) -> None:
-        # Only the unimplemented features are gaps; the release-visibility cases are implemented.
-        gaps = KNOWN_GAPS["delay"]
-        for case_id, _ in iter_cases(MANIFEST, "delay"):
-            if case_id.startswith("release_visibility/"):
-                self.assertNotIn(case_id, gaps)
+    def test_there_are_no_known_gaps(self) -> None:
+        # Every conformance 1.6.0 case is implemented (r1 Faz 08): the gap list stays empty, and a
+        # new entry is a deliberate, reviewed change to this test as well.
+        self.assertEqual({}, KNOWN_GAPS)
 
 
 @unittest.skipUnless(_HAS_OTEL, "the traceparent section needs the opentelemetry-api package")
@@ -1108,6 +1407,21 @@ class TraceparentConformanceTest(unittest.TestCase):
 class RedisLayoutConformanceTest(unittest.TestCase):
     def test_redis_layout_cases(self) -> None:
         _run_cases(self, "redis_layout", _eval_redis_layout)
+
+
+class RedisDelayConformanceTest(unittest.TestCase):
+    def test_redis_delay_cases(self) -> None:
+        _run_cases(self, "redis_delay", _eval_redis_delay)
+
+
+class RetryBackoffConformanceTest(unittest.TestCase):
+    def test_retry_backoff_cases(self) -> None:
+        _run_cases(self, "retry_backoff", _eval_retry_backoff)
+
+
+class KafkaPoisonConformanceTest(unittest.TestCase):
+    def test_kafka_poison_cases(self) -> None:
+        _run_cases(self, "kafka_poison", _eval_kafka_poison)
 
 
 class DelayConformanceTest(unittest.TestCase):
@@ -1170,72 +1484,6 @@ class GapMechanismTest(unittest.TestCase):
         case = next(c for _, c in iter_cases(MANIFEST, "delay") if "queue_type" in c)
         with mock.patch.object(SqsTransport, "publish", publish), self.assertRaises(TypeError):
             _eval_sqs_delay(case)
-
-    def test_retry_republish_accepts_a_contract_conformant_redeliver(self) -> None:
-        # A Redeliverer-conformant tier release: the body it is given is already advanced, so it
-        # republishes it as-is and takes `bq-attempts` from it. The evaluator must pass this.
-        def redeliver(self: KafkaTransport, message: ReceivedMessage, body: str, delay: float) -> None:
-            delay_ms = int(delay * 1000)
-            tier = next((t for t in self._retry_tiers_ms if t >= delay_ms), None)
-            if tier is None:
-                raise BabelQueueError("no retry tier")
-            attempts = json.loads(body)["attempts"]
-            self._producer.produce(
-                f"{message.queue}.retry.{self._retry_tiers_ms.index(tier)}",
-                value=body,
-                headers=[
-                    ("bq-attempts", str(attempts).encode()),
-                    ("bq-original-topic", message.queue.encode()),
-                    ("bq-delay", str(delay_ms).encode()),
-                ],
-            )
-
-        def init(self: KafkaTransport, *, producer: Any, consumer_factory: Any, retry_tiers_ms: Any) -> None:
-            self._producer = producer
-            self._retry_tiers_ms = retry_tiers_ms
-
-        cases = [c for _, c in iter_cases(MANIFEST, "backoff") if "release_delay_ms" in c]
-        self.assertEqual(3, len(cases))
-        with (
-            mock.patch.object(KafkaTransport, "redeliver", redeliver, create=True),
-            mock.patch.object(KafkaTransport, "__init__", init),
-        ):
-            for case in cases:
-                with self.subTest(case=case["name"]):
-                    _eval_kafka_retry_republish(case)
-
-    def test_retry_republish_rejects_a_redeliver_that_advances_attempts_twice(self) -> None:
-        def redeliver(self: KafkaTransport, message: ReceivedMessage, body: str, delay: float) -> None:
-            envelope = json.loads(body)
-            envelope["attempts"] += 1
-            self._producer.produce(
-                f"{message.queue}.retry.0",
-                value=json.dumps(envelope),
-                headers=[("bq-attempts", str(envelope["attempts"]).encode()),
-                         ("bq-original-topic", message.queue.encode()),
-                         ("bq-delay", str(int(delay * 1000)).encode())],
-            )
-
-        def init(self: KafkaTransport, *, producer: Any, consumer_factory: Any, retry_tiers_ms: Any) -> None:
-            self._producer = producer
-
-        case = next(c for _, c in iter_cases(MANIFEST, "backoff") if c.get("name") == "first-retry")
-        with (
-            mock.patch.object(KafkaTransport, "redeliver", redeliver, create=True),
-            mock.patch.object(KafkaTransport, "__init__", init),
-            self.assertRaisesRegex(AssertionError, "attempts"),
-        ):
-            _eval_kafka_retry_republish(case)
-
-    def test_every_known_gap_case_really_fails_today(self) -> None:
-        # Each listed case, run straight through its section's evaluator, must still fail.
-        evaluators = {"delay": _eval_delay, "backoff": _eval_backoff}
-        for section, gaps in KNOWN_GAPS.items():
-            for case_id, case in iter_cases(MANIFEST, section):
-                if case_id not in gaps:
-                    continue
-                with self.subTest(section=section, case=case_id), self.assertRaises(AssertionError):
-                    evaluators[section](case)
 
 
 class IdempotencyConformanceTest(unittest.TestCase):

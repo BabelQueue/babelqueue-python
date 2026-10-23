@@ -32,6 +32,14 @@ byte and never double-wraps. The version gate (§6.7) still
 dead-letters its record raw. The runtime logs a poison record as a version-gated message because it
 reuses that settle path; the route in the log names it.
 
+Delayed delivery and retry back-off are SDK-owned retry topics (§6.4/§6.5, ADR-0034): with
+``retry_tiers_ms`` configured, ``publish_delayed`` parks a message on the smallest tier
+``<topic>.retry.<n>`` that covers the requested delay, and a retry / release goes to the tier picked
+by the record's attempt count (``n = min(attempts, N-1) + 1``; the runtime's delay argument is
+ignored there). A :class:`~babelqueue.kafka_retry.RetryReinjector` (the re-inject consumer) moves
+each parked record back to its work topic once the tier delay has elapsed. With no tiers
+configured both operations raise :class:`BabelQueueError` and nothing is produced.
+
 This implements §6 of the broker-bindings contract. The envelope is unchanged
 (``schema_version`` stays 1); Apache Kafka is purely additive.
 
@@ -45,7 +53,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from . import dead_letter
@@ -90,6 +98,15 @@ POISON_ROUTE = UNSUPPORTED_SCHEMA_ROUTE_PREFIX + "poison"
 #: How long (seconds) a settle-path publish waits for the broker to confirm the write.
 DEFAULT_DELIVERY_TIMEOUT = 30.0
 
+#: The RECOMMENDED retry-topic tiers (§6.4), in milliseconds: 5 s, 30 s, 5 min, 30 min. Opt-in: a
+#: transport created without ``retry_tiers_ms`` has no tiers and ``publish_delayed`` / retry raise.
+DEFAULT_RETRY_TIERS_MS = [5000, 30000, 300000, 1800000]
+
+#: Record headers the SDK adds to a record parked on a retry topic (§6.4/§6.5). The re-inject
+#: consumer removes the first two when it moves the record back to its work topic.
+DELAY_HEADER = "bq-delay"
+ORIGINAL_TOPIC_HEADER = "bq-original-topic"
+
 Headers = List[Tuple[str, bytes]]
 
 
@@ -119,6 +136,26 @@ def _reject_json_constant(name: str) -> Any:
     raise ValueError("invalid JSON constant " + name)
 
 
+def retry_topic(work_topic: str, n: int) -> str:
+    """The retry topic of tier ``n`` (1-based) for ``work_topic``: ``<work_topic>.retry.<n>`` (§6.4).
+    ``n`` is the tier index, never a delay value."""
+    return "%s.retry.%d" % (work_topic, n)
+
+
+def _validated_tiers(tiers: Optional[Sequence[int]]) -> List[int]:
+    """``retry_tiers_ms`` as a list: positive integers (milliseconds) in strictly ascending order."""
+    if tiers is None:
+        return []
+    out: List[int] = []
+    for tier in tiers:
+        if isinstance(tier, bool) or not isinstance(tier, int) or tier <= 0:
+            raise ValueError("retry_tiers_ms must hold positive integer milliseconds, got %r" % (tier,))
+        if out and tier <= out[-1]:
+            raise ValueError("retry_tiers_ms must be strictly ascending, got %r" % (list(tiers),))
+        out.append(tier)
+    return out
+
+
 def _brokers_from_url(url: str) -> str:
     rest = url.split("://", 1)[1] if "://" in url else url
     return rest.split("/", 1)[0] or "localhost:9092"
@@ -133,8 +170,12 @@ class KafkaTransport(Transport):
         consumer_factory: Optional[Callable[[str], Any]] = None,
         group_id: str = "babelqueue",
         delivery_timeout: float = DEFAULT_DELIVERY_TIMEOUT,
+        retry_tiers_ms: Optional[Sequence[int]] = None,
         **client_config: Any,
     ) -> None:
+        # ``retry_tiers_ms`` is an explicit parameter on purpose: it is a BabelQueue setting, not
+        # a librdkafka one, and must never leak into ``client_config`` (which goes to the client).
+        self._retry_tiers_ms = _validated_tiers(retry_tiers_ms)
         self._brokers = _brokers_from_url(url or "kafka://localhost:9092")
         self._group_id = group_id
         self._delivery_timeout = delivery_timeout
@@ -471,6 +512,111 @@ class KafkaTransport(Transport):
         if outcome["error"] is not None:
             raise KafkaDeliveryError(f"Kafka delivery to {queue!r} failed: {outcome['error']}")
 
+    # -- delayed delivery and retry tiers (§6.4 / §6.5, ADR-0034) --------------
+
+    @property
+    def retry_tiers_ms(self) -> List[int]:
+        """The configured retry tiers in milliseconds (empty = tiers off)."""
+        return list(self._retry_tiers_ms)
+
+    def _tier_record(
+        self, work_topic: str, body: str, n: int, delay_ms: int, bq_attempts: Optional[int] = None
+    ) -> Tuple[str, Dict[str, Any]]:
+        """The tier topic and ``produce`` arguments for parking ``body`` on tier ``n``: the usual
+        projected headers (``bq-attempts`` overridden when ``bq_attempts`` is given), plus
+        ``bq-delay`` = ``delay_ms`` and ``bq-original-topic`` = ``work_topic`` (UTF-8 decimal /
+        text, §6.3)."""
+        kwargs = self._record_kwargs(body)
+        headers: Headers = [h for h in kwargs["headers"] if h[0] not in (DELAY_HEADER, ORIGINAL_TOPIC_HEADER)]
+        if bq_attempts is not None:
+            headers = [h for h in headers if h[0] != "bq-attempts"]
+            headers.append(("bq-attempts", str(bq_attempts).encode("utf-8")))
+        headers.append((DELAY_HEADER, str(delay_ms).encode("utf-8")))
+        headers.append((ORIGINAL_TOPIC_HEADER, work_topic.encode("utf-8")))
+        kwargs["headers"] = headers
+        return retry_topic(work_topic, n), kwargs
+
+    def publish_delayed(self, queue: str, body: str, delay_ms: int) -> None:
+        """Publish ``body`` to ``queue`` so it reaches the work topic no earlier than ``delay_ms``
+        from now (the REQUESTED-DELAY rule, §6.4): it is parked on the smallest configured tier
+        ``<queue>.retry.<n>`` whose delay is at least ``delay_ms``, with ``bq-delay`` = the
+        requested delay and ``bq-original-topic`` = ``queue``. A delay above the largest tier, a
+        negative delay, or no tiers configured raises :class:`BabelQueueError` before anything is
+        produced (no clamping). The write is confirmed by the broker."""
+        if isinstance(delay_ms, bool) or not isinstance(delay_ms, int) or delay_ms < 0:
+            raise BabelQueueError("delay_ms must be a non-negative integer, got %r." % (delay_ms,))
+        if not self._retry_tiers_ms:
+            raise BabelQueueError(
+                "Kafka delayed delivery needs retry tiers: pass retry_tiers_ms (e.g. DEFAULT_RETRY_TIERS_MS)."
+            )
+        for index, tier_ms in enumerate(self._retry_tiers_ms, start=1):
+            if tier_ms >= delay_ms:
+                topic, kwargs = self._tier_record(queue, body, index, delay_ms)
+                self._produce_confirmed(self._producer_(), topic, kwargs)
+                return
+        raise BabelQueueError(
+            "Requested delay %d ms exceeds the largest retry tier (%d ms)." % (delay_ms, self._retry_tiers_ms[-1])
+        )
+
+    def redeliver(self, message: ReceivedMessage, body: str, delay: float) -> None:
+        """:class:`~babelqueue.transport.Redeliverer`: the retry / release rule (§6.5). The record
+        is parked on tier ``n = min(attempts_before, N-1) + 1`` of the ``N`` configured tiers (it
+        stays on the last tier once they run out), carrying ``bq-attempts = attempts_before + 1``,
+        ``bq-delay`` = the tier's own delay and ``bq-original-topic`` = the work topic, with the
+        body ``attempts`` kept in sync. The ``delay`` argument is ignored: Kafka does not apply
+        the runtime's ``retry_backoff`` (ADR-0034 §9). The consumed record's key is written back
+        byte for byte, the write is confirmed, and only then is the original record acknowledged.
+        With no tiers configured this raises :class:`BabelQueueError` and produces nothing."""
+        if not self._retry_tiers_ms:
+            raise BabelQueueError(
+                "Kafka retry needs retry tiers: pass retry_tiers_ms (e.g. DEFAULT_RETRY_TIERS_MS)."
+            )
+        attempts_before = self._attempts_before(message)
+        n = min(attempts_before, len(self._retry_tiers_ms) - 1) + 1
+        tier_ms = self._retry_tiers_ms[n - 1]
+        next_attempts = attempts_before + 1
+        topic, kwargs = self._tier_record(
+            message.queue, self._with_attempts(body, next_attempts), n, tier_ms, next_attempts
+        )
+        if message.key is not None:
+            kwargs["key"] = message.key
+        self._produce_confirmed(self._producer_(), topic, kwargs)
+        try:
+            self.ack(message)
+        except Exception:  # noqa: BLE001 - the copy is already on the tier topic
+            # The retry copy is confirmed; a failed commit only means the broker redelivers the
+            # original (at-least-once), exactly as a failed ack of a handled message.
+            _logger.error(
+                "Kafka commit after parking a retry copy of a record on %r failed; "
+                "the record will be redelivered.",
+                message.queue,
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _attempts_before(message: ReceivedMessage) -> int:
+        """The attempts the consumed record had before this retry (the reconciled ``attempts``)."""
+        env = EnvelopeCodec.decode_lenient(message.body)
+        try:
+            return max(_runtime_attempts(env), 0) if env else 0
+        except ValueError:
+            return 0
+
+    @staticmethod
+    def _with_attempts(body: str, attempts: int) -> str:
+        """``body`` with its ``attempts`` set to ``attempts`` (the body is passed through
+        untouched when it already says so, or is not an envelope)."""
+        env = EnvelopeCodec.decode_lenient(body)
+        if not env:
+            return body
+        try:
+            if _runtime_attempts(env) == attempts and env.get("attempts") is not None:
+                return body
+        except ValueError:
+            pass
+        env["attempts"] = attempts
+        return EnvelopeCodec.encode(env)
+
     def pop(self, queue: str, timeout: float = 1.0) -> Optional[ReceivedMessage]:
         self._rewind_abandoned(queue)
         return self._poll_one(queue, timeout)
@@ -550,6 +696,15 @@ class KafkaTransport(Transport):
                 cause = self._decode_failure(payload)
             except Exception as exc:  # noqa: BLE001 - e.g. RecursionError on a pathologically nested body
                 cause = "the body could not be scanned (%s)" % type(exc).__name__
+        if cause is None:
+            try:
+                # ADR-0032 section 6 / conformance ``kafka_poison``: a readable body that names no valid
+                # ``job`` or ``urn`` can never reach a handler, so on Kafka it shares the poison fate
+                # (DLQ ``reason: poison``, no handler call) instead of looping through the FAIL path.
+                if not EnvelopeCodec.urn(EnvelopeCodec.decode_lenient(payload)):
+                    cause = "the body carries no valid 'job' or 'urn' identity (ADR-0032 section 6)"
+            except Exception as exc:  # noqa: BLE001 - never wedge a partition on a body that cannot be classified
+                cause = "the body could not be classified (%s)" % type(exc).__name__
         body = payload
         if cause is None:
             try:

@@ -104,6 +104,8 @@ jobs:
 
       - name: Run full suite with coverage gate (>=90%)
         env:
+          # A real redis:7 is mandatory here: no silent skip or fakeredis fallback (shared runner contract).
+          BQ_REQUIRE_REDIS: "1"
           BABELQUEUE_TEST_REDIS: redis://localhost:6379/0
           BABELQUEUE_TEST_AMQP: amqp://guest:guest@localhost:5672/
           SQS_ENDPOINT: http://localhost:9324
@@ -162,9 +164,19 @@ jobs:
   conformance:
     name: Conformance suite in sync + results.json
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     env:
       # The pinned conformance release (ADR-0032). Bump together with tests/conformance/.
-      BQ_CONFORMANCE_VERSION: 1.5.0
+      BQ_CONFORMANCE_VERSION: 1.6.0
       # sha256 of that release's fetch.sh: the script runs on the runner, so it is pinned rather
       # than trusted from a mutable tag. Bump together with BQ_CONFORMANCE_VERSION.
       BQ_FETCH_SH_SHA256: 8bb6ba567b288fb0ac71a70fd17041b2503df119e01998d76fdad372570bf849
@@ -190,11 +202,13 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev,celery,django,otel]" opentelemetry-sdk jsonschema
+          pip install -e ".[dev,celery,django,otel,redis]" opentelemetry-sdk jsonschema
 
       - name: Run the conformance suite and write results.json
         env:
           BQ_CONFORMANCE_RESULTS: ${{ runner.temp }}/results.json
+          BQ_REQUIRE_REDIS: "1"
+          BABELQUEUE_TEST_REDIS: redis://localhost:6379/0
         run: pytest -q tests/test_conformance.py
 
       - name: Validate results.json (schema, bindings, sections)

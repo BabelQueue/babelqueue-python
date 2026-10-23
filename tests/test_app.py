@@ -348,6 +348,15 @@ class AppTest(unittest.TestCase):
                 self.assertEqual(self._redeliver_until_settled(app, "orders", route, body), 1)
                 self.assertEqual(app.transport.size("orders"), 0)
 
+    def test_dropping_a_version_gated_message_without_a_dead_letter_queue_is_logged(self) -> None:
+        route = "babelqueue:unsupported-schema-version:x"
+        body = EnvelopeCodec.encode(EnvelopeCodec.make("urn:babel:orders:created", {}, queue="orders"))
+        app = BabelQueue("memory://", queue="orders", max_attempts=5)
+        with self.assertLogs("babelqueue.app", level="WARNING") as logs:
+            app.dispatch(ReceivedMessage(body=body, queue="orders", route_urn=route))
+        self.assertIn("Dropping", logs.output[0])
+        self.assertIn("orders", logs.output[0])
+
     def test_unknown_urn_release_still_releases_verbatim(self) -> None:
         body = EnvelopeCodec.encode(EnvelopeCodec.make("urn:babel:orders:nope", {}, queue="orders"))
         app = BabelQueue(

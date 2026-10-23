@@ -9,6 +9,71 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+Implements ADR-0033 (Redis) and ADR-0034 (Kafka tiers, back-off, poison). The envelope stays at
+`schema_version: 1`; the vendored conformance suite moves to v1.6.0 and
+`conformance-known-gaps.json` is now empty.
+
+### Fixed
+- **Redis, Laravel-compatible layout: a poison reservation is dead-lettered in every
+  configuration.** The DLQ write no longer depends on `dead_letter_enabled` (default `False`) or
+  `on_unknown_urn`: an undecodable body or one without a numeric `attempts` is written raw to
+  `<queue>.dlq` and acked instead of being logged and dropped (broker-bindings section 1.1,
+  ADR-0033; same as the Go reference). Other version-gated routes keep their previous behaviour.
+- **Redis, Laravel-compatible layout: a job with a non-numeric `attempts` or an undecodable body no
+  longer aborts the reserve script.** It is reserved raw (`pcall` guard), dead-lettered byte for
+  byte and acked, leaving nothing in `:reserved` (ADR-0033 (c)).
+- **Redis, legacy layout: a `kill -9` no longer strands a message in `<queue>:processing`.** Every
+  reservation writes a `<token>:<raw>` member into `<queue>:processing:deadlines`; a sweep before
+  each reserve moves lapsed reservations back to the end of `<queue>`. Ack, release and dead-letter
+  are gated on their own reservation, so a late ack never touches a newer one. The legacy mode
+  remains the default and the `<queue>:processing` key name is unchanged.
+- **Kafka: a record without a valid `job` / `urn` is poison** (ADR-0034 section 10): dead-lettered
+  wrapped with `dead_letter.reason: "poison"` and never retried, instead of being routed as an
+  unknown URN.
+
+- **Redis, Laravel-compatible layout: the reserve script no longer aborts on a body that decodes
+  but cannot be re-encoded** (`cjson.encode` of `inf`/`NaN`, e.g. `1e400`, raised after the `LPOP`
+  and lost the job). The encode is now inside `pcall`; the job is reserved raw and takes the poison
+  path. Note: fakeredis' `cjson` serialises `inf` as `Infinity` and masks this; it is proven by a
+  real-Redis test (CI `redis:7`) and by a Lua test against a failing `cjson` stub.
+- **`on_unknown_urn="delete"` no longer discards a Redis poison reservation.** It is dead-lettered
+  byte for byte like the Kafka poison record already was; a genuine unknown URN is still deleted.
+- **Redis, Laravel-compatible layout: `dead_letter` is atomic and gated.** One script `ZREM`s the
+  reservation and writes the dead-letter record and its notify entry; an expired reservation writes
+  nothing (and logs a warning) instead of publishing a duplicate.
+- **A message dropped because it is undeliverable and no dead-letter queue is configured is
+  logged** (`babelqueue.app`, WARNING) instead of disappearing silently.
+- **Kafka `RetryReinjector` no longer loses records:** it kept one held record per partition, so a
+  second record on the same partition overwrote the first. It now keeps all of them in order.
+- **A worker on a tier-less Kafka transport with `max_attempts` > 1 warns at start-up** that the
+  first handler failure stops the worker and leaves the record uncommitted.
+- Internal: the legacy `:processing` settle script takes `[token, raw]` and builds the deadline
+  member itself.
+
+### Added
+- `RedisTransport(retry_after=90, migration_batch_size=-1)` (also `?retry_after=` in the URL;
+  `None` / `null` disables recovery). The Laravel-compatible `retry_after` default is now 90 s
+  (was 60 s).
+- SQS: `SqsTransport.publish(..., delay_seconds=)` (`DelaySeconds` 0..900; out of range or FIFO
+  raises `BabelQueueError`).
+- Kafka: `KafkaTransport(retry_tiers_ms=...)` with `DEFAULT_RETRY_TIERS_MS`, `retry_topic()` and
+  the `babelqueue.kafka_retry.RetryReinjector` consumer that moves parked records from
+  `<topic>.retry.<n>` back to the work topic (broker-bindings section 6.4). Opt-in: without tiers a
+  retry / `publish_delayed` raises `BabelQueueError`.
+- Worker-side retry back-off: `BabelQueue(retry_backoff=, retry_backoff_multiplier=,
+  retry_backoff_max=, retry_jitter=)` (ADR-0034 section 9); the defaults keep an immediate release.
+- Conformance runner covers the v1.6.0 sections (`redis_layout`, `redis_delay`, `retry_backoff`,
+  `kafka_poison`, ...). CI runs the Redis cases against a real `redis:7` with `BQ_REQUIRE_REDIS=1`.
+
+### Changed
+- **Kafka retries go to the retry tiers.** With `retry_tiers_ms` set a failed message is parked on
+  `<queue>.retry.<n>` and needs a running `RetryReinjector`; the retry topics must exist. Without
+  tiers a retry now raises instead of republishing onto the work topic.
+
+### Documentation
+- README: Redis layouts, the A3 limit (no out-of-band headers in the Laravel-compatible layout),
+  Kafka retry tiers, `LogAppendTime` on the tier topics, retry back-off, SQS `delay_seconds`.
+
 ## [1.21.1] - 2026-10-20
 
 ### Fixed

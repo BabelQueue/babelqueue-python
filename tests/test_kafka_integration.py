@@ -25,13 +25,16 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from babelqueue import BabelQueue, EnvelopeCodec, dead_letter
-from babelqueue.kafka_transport import KafkaTransport
+from babelqueue.kafka_retry import RetryReinjector
+from babelqueue.kafka_transport import KafkaTransport, retry_topic
 from babelqueue.redrive import redrive
 
 URN = "urn:babel:orders:created"
 ENABLED = os.environ.get("BQ_INTEGRATION") == "1"
 BROKERS = os.environ.get("BQ_KAFKA_BROKERS", "localhost:9092")
 DEADLINE_SECONDS = 90.0
+#: One short tier: a retry waits on ``<queue>.retry.1`` for one second (ADR-0034 section 4).
+RETRY_TIERS_MS = [1000]
 
 
 def _create_topics(*topics: str) -> None:
@@ -101,7 +104,7 @@ class KafkaLiveIntegrationTest(unittest.TestCase):
         self.queue = f"bq-it-orders-{suffix}"
         self.dlq = f"{self.queue}.dlq"
         self.group = f"bq-it-group-{suffix}"
-        _create_topics(self.queue, self.dlq)
+        _create_topics(self.queue, self.dlq, retry_topic(self.queue, 1))
         self.transports: List[KafkaTransport] = []
 
     def tearDown(self) -> None:
@@ -109,9 +112,23 @@ class KafkaLiveIntegrationTest(unittest.TestCase):
             transport.close()
 
     def _transport(self, group: Optional[str] = None) -> KafkaTransport:
-        transport = KafkaTransport(f"kafka://{BROKERS}", group_id=group or self.group)
+        transport = KafkaTransport(
+            f"kafka://{BROKERS}", group_id=group or self.group, retry_tiers_ms=RETRY_TIERS_MS
+        )
         self.transports.append(transport)
         return transport
+
+    def _reinjector(self) -> RetryReinjector:
+        """The retry-tier consumer that moves a due record back onto the work topic."""
+        reinjector = RetryReinjector(
+            f"kafka://{BROKERS}",
+            work_topics=[self.queue],
+            retry_tiers_ms=RETRY_TIERS_MS,
+            group_id=f"{self.group}-reinject",
+            poll_interval=1.0,
+        )
+        self.transports.append(reinjector)  # type: ignore[arg-type]  # only ``close`` is used
+        return reinjector
 
     def test_handler_error_retries_then_dead_letters_after_max_attempts(self) -> None:
         calls: List[int] = []
@@ -126,9 +143,11 @@ class KafkaLiveIntegrationTest(unittest.TestCase):
 
         app.publish(URN, {"order_id": 7}, trace_id="trace-it-1")
 
+        reinjector = self._reinjector()
         stop = time.monotonic() + DEADLINE_SECONDS
         while len(calls) < 3 and time.monotonic() < stop:
             app.consume(self.queue, max_messages=1, timeout=2.0, handle_signals=False)
+            reinjector.run_once(1.0)
         self.assertEqual(len(calls), 3)
 
         envelope = _pop_until(self._transport(f"{self.group}-dlq"), self.dlq)
@@ -221,15 +240,19 @@ class KafkaLiveIntegrationTest(unittest.TestCase):
         seeded = _read_records(self.queue, 1)
         self._assert_same_key("seeded record", key, seeded[0][1])
 
-        # max_attempts=2: the first failure is republished once onto the work topic (retry), the
-        # second one is dead-lettered.
+        # max_attempts=2: the first failure is parked on ``<queue>.retry.1`` (retry), the
+        # re-injector moves it back onto the work topic, the second failure is dead-lettered.
+        reinjector = self._reinjector()
         stop = time.monotonic() + DEADLINE_SECONDS
         while len(calls) < 2 and time.monotonic() < stop:
             app.consume(self.queue, max_messages=1, timeout=2.0, handle_signals=False)
+            reinjector.run_once(1.0)
         self.assertEqual(len(calls), 2)
 
+        parked = _read_records(retry_topic(self.queue, 1), 1)
+        self._assert_same_key("retry tier write", key, parked[0][1])
         work = _read_records(self.queue, 2)
-        self._assert_same_key("retry republish", key, work[1][1])
+        self._assert_same_key("re-injection", key, work[1][1])
         dead = _read_records(self.dlq, 1)
         self._assert_same_key("DLQ write", key, dead[0][1])
 
