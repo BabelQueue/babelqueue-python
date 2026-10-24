@@ -53,6 +53,10 @@ TOKEN = re.compile(r"^[0-9a-f]{32}$")
 SOURCE = Path(__file__).resolve().parent.parent / "src" / "babelqueue" / "redis_transport.py"
 
 
+def _reject_constant(name: str) -> None:
+    raise ValueError(f"{name} is not JSON (RFC 8259)")
+
+
 def assert_poison_record(case: unittest.TestCase, record: str, body: str, queue: str) -> None:
     """``record`` is the ADR-0035 poison DLQ record for ``body`` read from ``queue``."""
     parsed = json.loads(record)
@@ -66,7 +70,9 @@ def assert_poison_record(case: unittest.TestCase, record: str, body: str, queue:
     members = None
     if decoded is not None:
         try:
-            members = json.loads(decoded)
+            # ADR-0035 section 1: a strict RFC 8259 object is spliced; NaN / Infinity / -Infinity
+            # (which Python's json.loads accepts by default) make the body a wrapper case.
+            members = json.loads(decoded, parse_constant=_reject_constant)
         except ValueError:
             members = None
     if decoded is None:
@@ -255,7 +261,7 @@ class PopScriptWithoutRedisTest(unittest.TestCase):
     def _lua(self):
         try:
             from lupa import LuaRuntime
-        except ImportError:  # pragma: no cover - lupa ships with the test extras
+        except ImportError:  # pragma: no cover - lupa is optional (it comes with fakeredis[lua])
             self.skipTest("lupa is not installed")
         return LuaRuntime(unpack_returned_tuples=True)
 
@@ -294,6 +300,7 @@ class PopScriptWithoutRedisTest(unittest.TestCase):
             "reserved = cjson.encode(decoded)",
         )
         self.assertNotEqual(unguarded, _POP)
+        self._lua()  # skips when lupa is not installed (the matrix jobs install no Redis extras)
         from lupa import LuaError
 
         with self.assertRaises(LuaError):
@@ -1101,7 +1108,8 @@ class LegacyLayoutTest(_BrokerTest):
         app = self.app(max_attempts=3, dead_letter=True)
         app.register(URN, lambda data, meta: None)
         self.assertEqual(app.consume(self.queue, max_messages=1, timeout=0), 1)
-        self.assertEqual(self.client.lrange(f"{self.queue}.dlq", 0, -1), [garbage])
+        (record,) = self.client.lrange(f"{self.queue}.dlq", 0, -1)
+        assert_poison_record(self, record, garbage, self.queue)  # ADR-0035 wrapper, not the raw body
         self.assertEqual(self.client.llen(self.processing), 0)
         self.assertEqual(self.client.zcard(self.deadlines), 0)
         self.assertEqual(self.client.llen(self.queue), 0)  # never re-queued for a retry
@@ -1111,7 +1119,8 @@ class LegacyLayoutTest(_BrokerTest):
         app = self.app(max_attempts=3, dead_letter=False)
         app.register(URN, lambda data, meta: None)
         self.assertEqual(app.consume(self.queue, max_messages=1, timeout=0), 1)
-        self.assertEqual(self.client.lrange(f"{self.queue}.dlq", 0, -1), ["[1]"])
+        (record,) = self.client.lrange(f"{self.queue}.dlq", 0, -1)
+        assert_poison_record(self, record, "[1]", self.queue)
         self.assertEqual(self.client.llen(self.processing), 0)
 
     def test_publish_with_headers_stores_a_frame_and_pop_unframes(self):

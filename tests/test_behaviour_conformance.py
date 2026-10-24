@@ -1030,6 +1030,11 @@ class _LayoutScenario:
 def _eval_redis_layout(case: Mapping[str, Any]) -> None:
     """``redis_layout``: the three key-name cases (no broker) and the behavioural scenarios (Redis)."""
     if "layout" in case:
+        if case.get("name", "").startswith("encode-fails-") and redis_backend.connect()[1] == "emulated":
+            # fakeredis + lupa serialises inf/NaN without error where real lua-cjson raises, so the
+            # cjson.encode guard cannot be exercised on the emulator (see PopScriptWithoutRedisTest
+            # for the broker-free proof). CI runs these against a real redis:7 (BQ_REQUIRE_REDIS).
+            raise unittest.SkipTest("encode-fails-* needs a real Redis: the emulator's cjson masks the bug")
         _LayoutScenario(case).run()
     else:
         _eval_redis_key_names(case)
