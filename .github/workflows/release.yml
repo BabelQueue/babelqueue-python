@@ -16,7 +16,7 @@ jobs:
     environment: pypi
     env:
       # The pinned conformance release (ADR-0032). Keep identical to ci.yml.
-      BQ_CONFORMANCE_VERSION: 1.5.0
+      BQ_CONFORMANCE_VERSION: 1.6.0
       BQ_FETCH_SH_SHA256: 8bb6ba567b288fb0ac71a70fd17041b2503df119e01998d76fdad372570bf849
     permissions:
       id-token: write   # PyPI Trusted Publishing (OIDC) — no API token needed
