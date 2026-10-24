@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.22.0] - 2026-10-24
+
 Implements ADR-0033 (Redis) and ADR-0034 (Kafka tiers, backoff, poison). The envelope stays at
 `schema_version: 1`; the vendored conformance suite moves to v1.6.0 and
 `conformance-known-gaps.json` is now empty.
