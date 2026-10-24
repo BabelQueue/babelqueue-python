@@ -13,6 +13,7 @@ the run instead of skipping it. Pointers are RFC 6901 and equality is type-stric
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import inspect
 import json
@@ -36,6 +37,7 @@ from babelqueue.dead_letter import annotate
 from babelqueue.exceptions import EnvelopeKeyError
 from babelqueue.idempotency import InMemoryStore
 from babelqueue.idempotency import wrap as idempotency_wrap
+from babelqueue._poison_record import build_poison_record
 from babelqueue.kafka_transport import DEFAULT_RETRY_TIERS_MS, POISON_ROUTE, KafkaTransport, retry_topic
 from babelqueue.pika_transport import PikaTransport
 from babelqueue.redis_transport import RedisTransport, _LegacyHandle
@@ -1289,6 +1291,57 @@ def _eval_kafka_poison(case: Mapping[str, Any]) -> None:
         _ensure(message.body == body, "a poison record is handed over raw")
 
 
+def _top_level_names(text: str) -> List[str]:
+    """Every top-level member name of the JSON object ``text`` (duplicates kept, last-wins not applied)."""
+    names: List[List[str]] = []
+
+    def hook(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+        names.append([key for key, _ in pairs])
+        return {}
+
+    json.loads(text, object_pairs_hook=hook)
+    return names[-1]  # the outermost object completes last
+
+
+def _without_dead_letter(record: Mapping[str, Any]) -> Dict[str, Any]:
+    return {key: value for key, value in record.items() if key != "dead_letter"}
+
+
+def _eval_poison_dlq(case: Mapping[str, Any]) -> None:
+    """``poison_dlq``: the DLQ record shape of a poison body (ADR-0035)."""
+    if "body_base64" in case:
+        raw_bytes = base64.b64decode(case["body_base64"])
+    else:
+        raw_bytes = case["body"].encode("utf-8")
+    expect = case["expect"]
+    text = raw_bytes.decode("utf-8", "surrogateescape")
+    block = annotate({}, "poison", "orders", 0, error="Undecodable BabelQueue body: x", exception="BabelQueueError")[
+        "dead_letter"
+    ]
+    record_text = build_poison_record(text, block)
+
+    def parse(value: str) -> Any:
+        return json.loads(value, parse_float=lambda lit: ("float", lit), parse_int=lambda lit: ("int", lit))
+
+    record = parse(record_text)
+    _ensure(isinstance(record, dict) and record.get("dead_letter") == parse(json.dumps(block)), "dead_letter member")
+    stripped = _without_dead_letter(record)
+    wrapper = parse(json.dumps(expect["record"], ensure_ascii=False)) if "record" in expect else None
+    shape = expect["shape"]
+    if shape in ("splice", "wrapper"):
+        _ensure(stripped == wrapper, f"record {stripped!r} differs from the expected {wrapper!r}")
+        if shape == "splice":
+            _ensure(record_text.startswith(text.strip(" \t\r\n")[:-1].rstrip(" \t\r\n")), "a splice keeps the original bytes")
+        return
+    if stripped == wrapper:  # splice_or_wrapper: the lossless wrapper
+        return
+    _ensure("raw" not in stripped and "raw_encoding" not in stripped, "a splice carries no raw/raw_encoding")
+    for literal in expect.get("splice_literals", []):
+        _ensure(literal in record_text, f"splice must keep {literal!r} verbatim")
+    names = {name for name in _top_level_names(record_text) if name != "dead_letter"}
+    _ensure(names == set(expect.get("splice_keys", [])), f"splice keys {sorted(names)!r}")
+
+
 def _eval_delay(case: Mapping[str, Any]) -> None:
     # Cases carrying `queue_type` are the section 3.4 publish-delay cases; the rest are releases.
     (_eval_sqs_delay if "queue_type" in case else _eval_release_visibility)(case)
@@ -1364,7 +1417,7 @@ class JobTypeConformanceTest(unittest.TestCase):
 
 class RunnerCaseIdTest(unittest.TestCase):
     #: ``section -> number of case ids`` of the vendored conformance 1.6.0 manifest.
-    EXPECTED_COUNTS = {"trim": 35, "job_type": 11, "traceparent": 14, "delay": 9, "backoff": 29, "redis_layout": 55, "redis_delay": 8, "retry_backoff": 18, "kafka_poison": 92, "idempotency": 7, "redis": 1, "rabbitmq": 1}
+    EXPECTED_COUNTS = {"trim": 35, "job_type": 11, "traceparent": 14, "delay": 9, "backoff": 29, "redis_layout": 59, "redis_delay": 8, "retry_backoff": 18, "kafka_poison": 92, "poison_dlq": 43, "idempotency": 7, "redis": 1, "rabbitmq": 1}
 
     def test_case_id_counts_match_the_manifest(self) -> None:
         for section, count in self.EXPECTED_COUNTS.items():
@@ -1422,6 +1475,17 @@ class RetryBackoffConformanceTest(unittest.TestCase):
 class KafkaPoisonConformanceTest(unittest.TestCase):
     def test_kafka_poison_cases(self) -> None:
         _run_cases(self, "kafka_poison", _eval_kafka_poison)
+
+
+class PoisonDlqConformanceTest(unittest.TestCase):
+    def test_poison_dlq_cases(self) -> None:
+        _run_cases(self, "poison_dlq", _eval_poison_dlq)
+
+    def test_an_invalid_utf8_body_is_base64_never_replaced(self) -> None:
+        cases = [case for _, case in iter_cases(MANIFEST, "poison_dlq") if "body_base64" in case]
+        self.assertTrue(cases, "the manifest must carry invalid-UTF-8 cases")
+        for case in cases:
+            self.assertEqual("base64", case["expect"]["record"]["raw_encoding"])
 
 
 class DelayConformanceTest(unittest.TestCase):

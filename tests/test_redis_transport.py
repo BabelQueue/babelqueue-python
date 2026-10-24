@@ -12,6 +12,7 @@ drive time with a fake clock and stay deterministic on a real broker too.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
@@ -32,7 +33,9 @@ from babelqueue.redis_transport import (
     _pop_result,
     _qretry_after,
     _released_body,
+    _as_text,
     _unframe,
+    _wire,
 )
 from babelqueue.routing import UnknownUrnStrategy
 from babelqueue.transport import (
@@ -48,6 +51,35 @@ import redis_backend
 URN = "urn:babel:orders:created"
 TOKEN = re.compile(r"^[0-9a-f]{32}$")
 SOURCE = Path(__file__).resolve().parent.parent / "src" / "babelqueue" / "redis_transport.py"
+
+
+def assert_poison_record(case: unittest.TestCase, record: str, body: str, queue: str) -> None:
+    """``record`` is the ADR-0035 poison DLQ record for ``body`` read from ``queue``."""
+    parsed = json.loads(record)
+    block = parsed["dead_letter"]
+    case.assertEqual(block["reason"], "poison")
+    case.assertEqual(block["original_queue"], queue)
+    try:
+        decoded = body.encode("utf-8", "surrogateescape").decode("utf-8")
+    except UnicodeDecodeError:
+        decoded = None
+    members = None
+    if decoded is not None:
+        try:
+            members = json.loads(decoded)
+        except ValueError:
+            members = None
+    if decoded is None:
+        case.assertEqual(parsed["raw_encoding"], "base64")
+        case.assertEqual(
+            base64.b64decode(parsed["raw"]), body.encode("utf-8", "surrogateescape")
+        )
+    elif isinstance(members, dict) and "dead_letter" not in members:
+        case.assertNotIn("raw", parsed)
+        case.assertTrue(record.startswith(decoded.strip()[:-1]), record)  # spliced byte for byte
+    else:
+        case.assertEqual(parsed["raw"], decoded)
+        case.assertNotIn("raw_encoding", parsed)
 
 
 class Clock:
@@ -273,11 +305,11 @@ class PopScriptWithoutRedisTest(unittest.TestCase):
 
 
 class LegacyPoisonWithoutRedisTest(unittest.TestCase):
-    """Legacy layout: an undecodable body is dead-lettered raw on its FIRST delivery (broker-free).
+    """Legacy layout: an undecodable body is dead-lettered as an ADR-0035 poison record on its FIRST delivery (broker-free).
 
     The client double answers the reserve/sweep scripts and records the gated settle call, so the
     test proves the transport hands the body over as poison and the runtime settles it through the
-    one gated script (write to the DLQ + remove from ``:processing``) without touching the body.
+    one gated script (write the poison record to the DLQ + remove from ``:processing``).
     """
 
     class Client:
@@ -308,20 +340,84 @@ class LegacyPoisonWithoutRedisTest(unittest.TestCase):
         self.assertEqual(app.consume("orders", max_messages=1, timeout=0), 1)
         return client
 
-    def test_non_json_body_goes_to_the_raw_dlq_on_first_delivery(self):
-        for garbage in ("not-json at all", "[1, 2]", '"a string"', "", "{truncated"):
+    def test_non_json_body_goes_to_the_poison_dlq_on_first_delivery(self):
+        for garbage in (
+            "not-json at all", "[1, 2]", '"a string"', "", "{truncated",
+            "\udcff\udcfe not-json",  # invalid UTF-8 (surrogateescape): base64 + raw_encoding
+            '{"job":"urn:a","attempts":"x"}',  # a strict object: spliced byte for byte
+        ):
             with self.subTest(body=garbage):
                 client = self.consume(garbage, max_attempts=3, dead_letter=True)
                 ((numkeys, args),) = client.settles
                 self.assertEqual(numkeys, 3)
                 self.assertEqual(args[:3], ("orders:processing", "orders:processing:deadlines", "orders.dlq"))
-                self.assertEqual(args[4], garbage)  # handle.raw: LREM matches the stored value
-                self.assertEqual(args[5], garbage)  # written byte for byte, no wrapper
+                # handle.raw: LREM matches the stored value (the exact bytes when not valid UTF-8)
+                invalid = any("\udc80" <= c <= "\udcff" for c in garbage)
+                self.assertEqual(
+                    args[4], garbage.encode("utf-8", "surrogateescape") if invalid else garbage,
+                )
+                assert_poison_record(self, args[5], garbage, "orders")  # ADR-0035 record
+
+    def test_invalid_utf8_reply_bytes_are_read_losslessly_and_settled_byte_exact(self):
+        # ``decode_responses`` off (or ``encoding_errors=surrogateescape``): the reply holds bytes
+        # that are not UTF-8. The poison record is the base64 wrapper, never U+FFFD, and the
+        # settle script gets the stored bytes back untouched so the LREM actually matches.
+        stored = b'{"job":"urn:a"}\xff\xfe'
+        client = self.Client(stored)
+        app = BabelQueue(
+            transport=RedisTransport("redis://", client=client, retry_after=90),
+            queue="orders",
+        )
+        app.register(URN, lambda data, meta: None)
+        self.assertEqual(app.consume("orders", max_messages=1, timeout=0), 1)
+        ((numkeys, args),) = client.settles
+        self.assertEqual(args[4], stored)
+        record = json.loads(args[5])
+        self.assertEqual(record["raw_encoding"], "base64")
+        self.assertEqual(base64.b64decode(record["raw"]), stored)
+        self.assertNotIn("\ufffd", args[5])
+        self.assertEqual(record["dead_letter"]["reason"], "poison")
+
+    def test_a_decodable_envelope_with_invalid_utf8_is_poison_never_delivered(self):
+        # A well-formed envelope whose ``data`` carries a raw 0xFF byte: cjson (and json with
+        # surrogateescape) can decode it, but broker-bindings section 1.1 makes it poison. The
+        # handler must not see it and nothing may be retried or re-published.
+        stored = (
+            b'{"job":"urn:a","attempts":0,"data":{"n":"\xff"},'
+            b'"meta":{"id":"1","queue":"orders"}}'
+        )
+        for retries in (0, 5):
+            with self.subTest(max_attempts=retries):
+                client = self.Client(stored)
+                handled = []
+                app = BabelQueue(
+                    transport=RedisTransport("redis://", client=client, retry_after=90),
+                    queue="orders", max_attempts=retries or 3, dead_letter=bool(retries),
+                )
+                app.register("urn:a", lambda data, meta: handled.append(data))
+                self.assertEqual(app.consume("orders", max_messages=1, timeout=0), 1)
+                self.assertEqual(handled, [])
+                ((numkeys, args),) = client.settles
+                self.assertEqual((numkeys, args[2]), (3, "orders.dlq"))
+                self.assertEqual(args[4], stored)  # settled by the exact stored bytes
+                record = json.loads(args[5])
+                self.assertEqual(record["raw_encoding"], "base64")
+                self.assertEqual(base64.b64decode(record["raw"]), stored)
+                self.assertNotIn("\ufffd", args[5])
+                self.assertEqual(record["dead_letter"]["reason"], "poison")
+                self.assertEqual(client.stored, [])  # nothing re-queued
+
+    def test_wire_returns_valid_text_unchanged_and_escaped_bytes_exactly(self):
+        self.assertEqual(_wire("plain \u00e9"), "plain \u00e9")
+        self.assertEqual(_wire("a\udcffb"), b"a\xffb")
+        self.assertEqual(_as_text(b"a\xffb"), "a\udcffb")
+        self.assertEqual(_wire(_as_text(b"a\xffb\xc3\xa9")), b"a\xffb\xc3\xa9")
 
     def test_it_is_dead_lettered_even_with_the_dlq_off_and_never_retried(self):
         client = self.consume("garbage", max_attempts=5, dead_letter=False)
         ((numkeys, args),) = client.settles
-        self.assertEqual((numkeys, args[2], args[5]), (3, "orders.dlq", "garbage"))
+        self.assertEqual((numkeys, args[2]), (3, "orders.dlq"))
+        assert_poison_record(self, args[5], "garbage", "orders")
         self.assertEqual(client.stored, [])  # nothing re-queued
 
     def test_a_framed_garbage_body_keeps_its_headers_in_the_dead_letter(self):
@@ -330,7 +426,7 @@ class LegacyPoisonWithoutRedisTest(unittest.TestCase):
         ((_, args),) = client.settles
         self.assertEqual(args[4], frame)  # the ack handle keeps the stored frame
         dead = json.loads(args[5])  # re-framed so the out-of-band headers survive the DLQ hop
-        self.assertEqual(dead["body"], "garbage")
+        assert_poison_record(self, dead["body"], "garbage", "orders")
         self.assertEqual(dead["headers"], {"traceparent": "00-ab"})
 
     def test_a_body_go_typed_decode_rejects_is_poison_on_the_first_delivery(self):
@@ -346,7 +442,7 @@ class LegacyPoisonWithoutRedisTest(unittest.TestCase):
                 self.assertEqual(message.route_urn, NON_NUMERIC_ATTEMPTS_ROUTE)
                 client = self.consume(garbage, max_attempts=3, dead_letter=True)
                 ((_, args),) = client.settles
-                self.assertEqual(args[5], garbage)  # dead-lettered raw, never handled or retried
+                assert_poison_record(self, args[5], garbage, "orders")  # never handled or retried
 
     def test_a_bare_null_is_not_poison(self):
         client = self.Client("null")
@@ -354,7 +450,7 @@ class LegacyPoisonWithoutRedisTest(unittest.TestCase):
         self.assertEqual(message.route_urn, "")
 
     def test_an_identity_less_object_is_not_poison(self):
-        # {} / an object without job or urn still takes the bounded FAIL path, not the raw DLQ.
+        # {} / an object without job or urn still takes the bounded FAIL path, not the poison DLQ.
         client = self.Client('{"attempts":0}')
         message = RedisTransport("redis://", client=client).pop("orders", timeout=0)
         self.assertEqual(message.route_urn, "")
@@ -369,6 +465,59 @@ class LegacyPoisonWithoutRedisTest(unittest.TestCase):
         message = RedisTransport("redis://", client=client).pop("orders", timeout=0)
         self.assertEqual(message.route_urn, NON_NUMERIC_ATTEMPTS_ROUTE)
         self.assertEqual(message.body, "garbage")
+
+
+class ZsetInvalidUtf8WithoutRedisTest(unittest.TestCase):
+    """Laravel layout: a decodable envelope carrying invalid UTF-8 is poison (broker-free).
+
+    The reserve script can decode and re-encode such a job (the member differs from the job, so it
+    would look like a normal delivery); the transport must still hand it over as poison, and the
+    dead-letter script gets the exact stored member back.
+    """
+
+    stored = (
+        b'{"job":"urn:a","attempts":0,"data":{"n":"\xff"},'
+        b'"meta":{"id":"1","queue":"orders"}}'
+    )
+    reserved = stored.replace(b'"attempts":0', b'"attempts":1')
+
+    class Client:
+        def __init__(self, job, reserved):
+            self.pops = [[job, reserved]]
+            self.dead = []
+
+        def eval(self, script, numkeys, *args):
+            if script == _POP:
+                return self.pops.pop(0) if self.pops else None
+            if script == _DEAD_LETTER:
+                self.dead.append((numkeys, args))
+                return 1
+            return 0  # migrate
+
+        def zrem(self, *args):  # pragma: no cover - poison goes through the dead-letter script
+            raise AssertionError("poison must be settled through the dead-letter script")
+
+        def blpop(self, *args):
+            return None
+
+    def test_it_is_dead_lettered_as_a_base64_wrapper_and_never_handled(self):
+        client = self.Client(self.stored, self.reserved)
+        handled = []
+        app = BabelQueue(
+            transport=RedisTransport("redis://", client=client, laravel_compat=True, retry_after=90),
+            queue="orders",
+        )
+        app.register("urn:a", lambda data, meta: handled.append(data))
+        self.assertEqual(app.consume("orders", max_messages=1, timeout=0), 1)
+        self.assertEqual(handled, [])
+        ((numkeys, args),) = client.dead
+        self.assertEqual(numkeys, 3)
+        self.assertEqual(args[3], self.reserved)  # ZREM by the exact reserved bytes
+        record = json.loads(args[4])
+        self.assertEqual(record["raw_encoding"], "base64")
+        self.assertEqual(base64.b64decode(record["raw"]), self.stored)
+        self.assertNotIn("\ufffd", args[4])
+        self.assertEqual(record["dead_letter"]["reason"], "poison")
 
 
 class _BrokerTest(unittest.TestCase):
@@ -543,7 +692,13 @@ class LaravelLayoutTest(_BrokerTest):
         self.assertIsNone(tr.pop(self.queue, timeout=0))
         self.assertEqual(self.client.zcard(self.reserved), 1)
 
-    def test_poison_bodies_reserve_raw_and_dead_letter_byte_identical_without_residue(self):
+    def assert_dlq_poison_records(self, poison):
+        dlq = self.client.lrange(f"{self.ready}.dlq", 0, -1)
+        self.assertEqual(len(dlq), len(poison))
+        for record, body in zip(dlq, poison):
+            assert_poison_record(self, record, body, self.queue)
+
+    def test_poison_bodies_reserve_raw_and_dead_letter_as_poison_records_without_residue(self):
         poison = ["not json at all", '{"job":"%s","attempts":"x"}' % URN, "[1,2,3]", '{"job":"%s"}' % URN]
         for raw in poison[:2]:
             self.tr.publish(self.queue, raw)
@@ -555,8 +710,8 @@ class LaravelLayoutTest(_BrokerTest):
             self.assertEqual(msg.route_urn, NON_NUMERIC_ATTEMPTS_ROUTE)
             self.assertEqual(msg.handle, raw)  # reserved member == the job
             app.dispatch(msg)
-        dlq = self.client.lrange(f"queues:{self.queue}.dlq", 0, -1)
-        self.assertEqual(dlq, poison[:2])  # byte-identical, no dead_letter block
+        self.assertEqual(self.client.exists(f"queues:{self.queue}.dlq"), 1)
+        self.assert_dlq_poison_records(poison[:2])  # ADR-0035 records
         for key in (self.ready, self.reserved, self.delayed):
             self.assertEqual(self.client.exists(key), 0, key)
 
@@ -570,7 +725,7 @@ class LaravelLayoutTest(_BrokerTest):
         self.assertFalse(app.dead_letter_enabled)
         for _ in poison:
             app.dispatch(self.tr.pop(self.queue, timeout=0))
-        self.assertEqual(self.client.lrange(f"{self.ready}.dlq", 0, -1), poison)  # byte-identical
+        self.assert_dlq_poison_records(poison)
         self.assertEqual(self.client.llen(f"{self.ready}.dlq:notify"), len(poison))
         for key in (self.ready, self.reserved, self.delayed):
             self.assertEqual(self.client.exists(key), 0, key)
@@ -615,7 +770,7 @@ class LaravelLayoutTest(_BrokerTest):
             self.assertEqual(msg.route_urn, NON_NUMERIC_ATTEMPTS_ROUTE)
             self.assertEqual(msg.handle, raw)
             app.dispatch(msg)
-        self.assertEqual(self.client.lrange(f"{self.ready}.dlq", 0, -1), poison)
+        self.assert_dlq_poison_records(poison)
         for key in (self.ready, self.reserved, self.delayed):
             self.assertEqual(self.client.exists(key), 0, key)
 
@@ -627,7 +782,7 @@ class LaravelLayoutTest(_BrokerTest):
         app.register(URN, lambda data, meta: None)
         for _ in poison:
             app.dispatch(self.tr.pop(self.queue, timeout=0))
-        self.assertEqual(self.client.lrange(f"{self.ready}.dlq", 0, -1), poison)
+        self.assert_dlq_poison_records(poison)
         self.assertEqual(self.client.zcard(self.reserved), 0)
 
     def test_a_genuine_unknown_urn_is_still_deleted_with_the_delete_strategy(self):

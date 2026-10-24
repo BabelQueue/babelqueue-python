@@ -36,7 +36,8 @@ from typing import Any, Callable, Dict, Mapping, Optional
 
 from . import dead_letter
 from .codec import EnvelopeCodec, has_forbidden_keys, parse_envelope
-from .exceptions import UnknownUrnError
+from ._poison_record import build_poison_record
+from .exceptions import BabelQueueError, UnknownUrnError
 from .headers import _headers_scope
 from .replay import HEADER_REPLAY_BYPASS, _replay_scope
 from .routing import UnknownUrnStrategy
@@ -598,7 +599,8 @@ class BabelQueue:
         # bounded FAIL path (retry through the tiers up to ``max_attempts``, then drop), never an
         # unconditional DLQ write. Other transports' version-gated deliveries keep their order below.
         # The Redis (Laravel layout) poison reservation (ADR-0033 A1: a body that does not decode as
-        # an envelope) is a different, unconditional case: it is dead-lettered raw, and
+        # an envelope) is a different, unconditional case: it is dead-lettered as an ADR-0035 poison
+        # record (broker-bindings §1.1 / §1.3), and
         # ``on_unknown_urn=DELETE`` must not silently discard it. Only that one route is lifted
         # ahead of DELETE; the generic version-gated prefix below keeps its order.
         if isinstance(received.route_urn, PoisonRoute):
@@ -607,7 +609,7 @@ class BabelQueue:
         if received.route_urn == NON_NUMERIC_ATTEMPTS_ROUTE:
             # broker-bindings §1.1 / ADR-0033: the DLQ write is an unconditional MUST, so it does
             # not depend on ``dead_letter_enabled`` (Go ``settleTransportPoison`` does the same).
-            self._settle_version_gated(received, always=True)
+            self._settle_transport_poison(received)
             return
         if strategy == UnknownUrnStrategy.DELETE:
             self._ack_settled(received)
@@ -662,6 +664,26 @@ class BabelQueue:
             UnknownUrnError("The record is poison: it carries no decodable envelope."),
         )
 
+    def _settle_transport_poison(self, received: ReceivedMessage) -> None:
+        """Dead-letter a Redis poison reservation (broker-bindings §1.1 / §1.3, ADR-0033, ADR-0035).
+
+        The DLQ write is an unconditional MUST, so it ignores ``dead_letter_enabled``. The record
+        follows ADR-0035 like every other poison record: a strict JSON object body is spliced byte
+        for byte with a ``dead_letter`` member (``reason: "poison"``), anything else is carried as
+        ``raw`` (base64 plus ``raw_encoding`` when it is not valid UTF-8, never U+FFFD). A failed
+        DLQ write propagates: the delivery stays reserved (see :meth:`dispatch`), never dropped."""
+        block = dead_letter.annotate(
+            {},
+            "poison",
+            received.queue,
+            0,
+            error="Undecodable BabelQueue body",
+            exception=BabelQueueError.__name__,
+        )["dead_letter"]
+        self._write_dead_letter(
+            received, self._dead_letter_target(received), build_poison_record(received.body, block)
+        )
+
     def _dead_letter_target(self, received: ReceivedMessage) -> str:
         """The queue a dead-lettered delivery is written to (configured DLQ or ``<queue><suffix>``)."""
         return self.dead_letter_queue or (received.queue + self.dead_letter_suffix)
@@ -669,10 +691,10 @@ class BabelQueue:
     def _settle_version_gated(self, received: ReceivedMessage, always: bool = False) -> None:
         """Dead-letter a version-gated delivery directly (no retry); drop it when no DLQ is set.
 
-        ``always`` (the Redis poison reservation, §1.1 / ADR-0033, whose DLQ write is an
-        unconditional MUST) writes the DLQ record in every configuration, ignoring
-        ``dead_letter_enabled``. A Kafka poison record reaches it with the DLQ already on
-        (:meth:`_route_poison`).
+        ``always`` writes the DLQ record in every configuration, ignoring ``dead_letter_enabled``.
+        A Kafka poison record reaches it with the DLQ already on (:meth:`_route_poison`). The Redis
+        poison reservation does not come through here: it has its own ADR-0035 record
+        (:meth:`_settle_transport_poison`).
 
         The gate rejects the message *without decoding it*, so the DLQ record is the incoming raw
         body, byte-identical, with no ``dead_letter`` block (matching the Java, .NET and Node

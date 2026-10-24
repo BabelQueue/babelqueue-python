@@ -23,9 +23,10 @@ synthesised). A poison record (§6.5: a value that is not valid UTF-8, not valid
 object other than ``null``, or a member of the wrong type, member names matched exactly as spelled: what the Go
 reference's typed ``Decode`` rejects, see :mod:`babelqueue._envelope_shape`) is handed to the runtime under a
 reserved route. With the DLQ on (``dead_letter`` or ``on_unknown_urn=DEAD_LETTER``) it is dead-lettered
-directly, never retried, *wrapped* like the Go reference: a body that is one JSON object keeps its keys,
-anything else is carried as ``{"raw": "<body>"}``, and a ``dead_letter`` block with ``reason: "poison"`` is
-added (the key is preserved; the DLQ is the configured one or ``<queue>.dlq``, which must exist). With
+directly, never retried, and written in the ADR-0035 shape: a body that is one strict JSON object is
+spliced byte for byte, anything else is carried as ``{"raw": "<body>"}`` (base64 plus
+``raw_encoding: "base64"`` when it is not valid UTF-8), and a ``dead_letter`` block with
+``reason: "poison"`` is added (the key is preserved; the DLQ is the configured one or ``<queue>.dlq``, which must exist). With
 the DLQ off it is NOT written to a DLQ (Go ``routePoison``): ``on_unknown_urn=DELETE`` drops it, any other
 strategy takes the bounded FAIL path (retried through the tiers up to ``max_attempts``, then dropped).
 The record is handed over raw under a
@@ -62,6 +63,7 @@ from urllib.parse import quote
 from . import dead_letter
 from .codec import ASCII_WHITESPACE, SCHEMA_VERSION, EnvelopeCodec, parse_envelope
 from ._envelope_shape import envelope_violation
+from ._poison_record import build_poison_record
 from .exceptions import BabelQueueError
 from .transport import (
     PoisonRoute,
@@ -131,11 +133,6 @@ def _runtime_attempts(env: Any) -> int:
         return int(value)
     except (TypeError, OverflowError) as exc:
         raise ValueError("attempts is not an integer") from exc
-
-
-def _reject_json_constant(name: str) -> Any:
-    """``json.loads`` hook: ``NaN`` / ``Infinity`` are not JSON, so a body carrying them is undecodable."""
-    raise ValueError("invalid JSON constant " + name)
 
 
 def retry_topic(work_topic: str, n: int) -> str:
@@ -386,43 +383,19 @@ class KafkaTransport(Transport):
 
     @classmethod
     def _poison_body(cls, text: str, cause: str, original_queue: str, attempts: int) -> str:
-        """The DLQ body of a poison record, in the form of the Go reference (§6.5, ADR-0009): a body
-        that is exactly one JSON object keeps its keys, anything else is carried as the string value
-        of ``raw`` (bytes that are not UTF-8 are stored with U+FFFD substitutions); a ``dead_letter``
-        block with ``reason: "poison"`` replaces any existing one. A body whose keys cannot be written
-        back as valid JSON (a number past the double range such as ``1e400``) falls back to ``raw``."""
-        # Bytes that are not UTF-8 are carried as surrogateescape code points; the DLQ body must be
-        # encodable, so they become U+FFFD (the Go reference stores the lossy conversion too).
-        text = text.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
-        try:
-            parsed = json.loads(text, parse_constant=_reject_json_constant)
-        except (ValueError, RecursionError):
-            parsed = None
-        candidates: List[Dict[str, Any]] = []
-        if isinstance(parsed, dict):
-            parsed.pop("dead_letter", None)
-            candidates.append(parsed)
-        candidates.append({"raw": text})
-        for record in candidates:
-            annotated = dead_letter.annotate(
-                record,
-                "poison",
-                original_queue,
-                attempts,
-                error="Undecodable BabelQueue body: " + cause,
-                exception=BabelQueueError.__name__,
-            )
-            try:
-                serialised = json.dumps(
-                    annotated, ensure_ascii=False, separators=(",", ":"), allow_nan=False
-                )
-                # A lone surrogate (a ``\ud800`` escape in a key or value) serialises but cannot be
-                # written to the wire as UTF-8: fall back to the next candidate.
-                serialised.encode("utf-8")
-                return serialised
-            except (ValueError, RecursionError):
-                continue
-        raise AssertionError("unreachable: the raw fallback is always serialisable")  # pragma: no cover
+        """The DLQ body of a poison record (§6.5, ADR-0035): a strict JSON object body is spliced
+        byte for byte with a ``dead_letter`` member, anything else is wrapped as ``raw`` (plain text
+        when valid UTF-8, standard base64 plus ``raw_encoding: "base64"`` when not; never U+FFFD).
+        The ``dead_letter`` block carries ``reason: "poison"``. See :mod:`babelqueue._poison_record`."""
+        block = dead_letter.annotate(
+            {},
+            "poison",
+            original_queue,
+            attempts,
+            error="Undecodable BabelQueue body: " + cause,
+            exception=BabelQueueError.__name__,
+        )["dead_letter"]
+        return build_poison_record(text, block)
 
     @staticmethod
     def _is_non_utf8(message: Any) -> bool:

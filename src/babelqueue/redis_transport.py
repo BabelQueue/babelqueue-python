@@ -27,7 +27,9 @@ therefore the count *before* this delivery); the ack handle is the reserved memb
 (``attempts + 1``), so either side can ``ZREM`` the other's reservation. A poison job is delivered
 under :data:`~babelqueue.transport.NON_NUMERIC_ATTEMPTS_ROUTE`: the runtime dead-letters the raw
 body byte for byte and acks it, leaving nothing in ``:reserved``. The legacy layout does the same
-for a body that is not a JSON object: on its first delivery the raw body goes to ``<queue>.dlq``
+for a body that is not a JSON object, and both layouts for a stored value that is not valid UTF-8
+(even one the reserve script can decode): never handed to a handler, never retried or re-published, it
+is dead-lettered as the ADR-0035 base64 wrapper by its exact bytes: on its first delivery the raw body goes to ``<queue>.dlq``
 through the gated settle script and leaves ``:processing`` (it is never retried or rebuilt). A failed job is returned by one
 atomic script (``ZREM :reserved`` + ``ZADD :delayed floor(now)+ceil(delay)``) with ``attempts``
 advanced by the runtime; the transport is a :class:`~babelqueue.transport.Redeliverer`. Before
@@ -62,7 +64,7 @@ import logging
 import math
 import secrets
 import time
-from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple, Union
 from urllib.parse import parse_qs, urlsplit
 
 from ._envelope_shape import envelope_violation
@@ -280,7 +282,12 @@ class RedisTransport(Transport):
                 "RedisTransport requires the 'redis' package. Install with "
                 'pip install "babelqueue[redis]".'
             ) from exc
-        self._redis = redis.Redis.from_url(url, decode_responses=True)
+        # ``surrogateescape``: a stored value that is not valid UTF-8 (a poison body) must not make
+        # the client raise on read; each invalid byte surfaces as one lone surrogate that
+        # ``_wire`` turns back into the exact original byte (ADR-0035 base64 record, no U+FFFD).
+        self._redis = redis.Redis.from_url(
+            url, decode_responses=True, encoding_errors="surrogateescape",
+        )
 
     # -- key / time helpers ---------------------------------------------------
 
@@ -358,7 +365,7 @@ class RedisTransport(Transport):
             return
         if message.handle is None:
             return
-        self._redis.zrem(f"{self._ready(message.queue)}:reserved", message.handle)
+        self._redis.zrem(f"{self._ready(message.queue)}:reserved", _wire(message.handle))
 
     def release(self, message: ReceivedMessage, delay: float = 0) -> None:
         """Hand a reserved message back for another attempt after ``delay`` seconds.
@@ -383,7 +390,7 @@ class RedisTransport(Transport):
             ready = self._ready(message.queue)
             self._redis.eval(
                 _RELEASE, 2, f"{ready}:delayed", f"{ready}:reserved",
-                message.handle, body, self._available_at(delay),
+                _wire(message.handle), _wire(body), self._available_at(delay),
             )
             return
         self._settle(message, message.queue, _frame_value(body, message.headers))
@@ -403,7 +410,7 @@ class RedisTransport(Transport):
             target = self._ready(queue)
             written = self._redis.eval(
                 _DEAD_LETTER, 3, f"{self._ready(message.queue)}:reserved", target,
-                f"{target}:notify", message.handle, body,
+                f"{target}:notify", _wire(message.handle), _wire(body),
             )
             if not written:
                 logger.warning(
@@ -441,7 +448,13 @@ class RedisTransport(Transport):
                 # without an identity is NOT poison (it keeps the bounded FAIL path), and neither is
                 # a bare ``null``. (``envelope_violation`` parses the body once; ``dispatch`` parses
                 # it again for the handler -- one extra parse of an already small body.)
-                route = "" if envelope_violation(unframed) is None else NON_NUMERIC_ATTEMPTS_ROUTE
+                # A stored value carrying invalid UTF-8 is poison even when it decodes (broker-bindings
+                # section 1.1): never delivered, retried or re-published, only dead-lettered.
+                route = (
+                    ""
+                    if not _has_invalid_utf8(text) and envelope_violation(unframed) is None
+                    else NON_NUMERIC_ATTEMPTS_ROUTE
+                )
                 return ReceivedMessage(
                     body=unframed, queue=queue, handle=_LegacyHandle(text, token),
                     headers=headers, route_urn=route,
@@ -466,10 +479,10 @@ class RedisTransport(Transport):
         if not isinstance(handle, _LegacyHandle):
             return
         keys = [self._processing(message.queue), self._deadlines(message.queue)]
-        args = [handle.token, handle.raw]
+        args = [handle.token, _wire(handle.raw)]
         if target is not None:
             keys.append(target)
-            args.append(target_body)
+            args.append(_wire(target_body))
         settled = self._redis.eval(_SETTLE, len(keys), *keys, *args)
         if not settled:
             logger.warning(
@@ -501,7 +514,8 @@ class RedisTransport(Transport):
     def _zset_message(queue: str, job: str, reserved: str) -> ReceivedMessage:
         # The handler gets the RAW job; the reserved member (attempts + 1, or the raw job for a
         # poison body) is only the ack handle, so a failure counts the attempt exactly once.
-        route = NON_NUMERIC_ATTEMPTS_ROUTE if job == reserved else ""
+        # Invalid UTF-8 is poison even when the reserve script could decode and re-encode it.
+        route = NON_NUMERIC_ATTEMPTS_ROUTE if job == reserved or _has_invalid_utf8(job) else ""
         return ReceivedMessage(body=job, queue=queue, handle=reserved, route_urn=route)
 
     def _migrate(self, ready: str) -> None:
@@ -582,8 +596,35 @@ def _unframe(value: str) -> Tuple[str, Dict[str, str]]:
 
 
 def _as_text(value: Any) -> str:
-    """Normalise a Redis reply to ``str`` (bytes when ``decode_responses`` is off)."""
-    return value if isinstance(value, str) else value.decode()
+    """Normalise a Redis reply to ``str`` (bytes when ``decode_responses`` is off).
+
+    Invalid UTF-8 is kept losslessly as lone surrogates (``surrogateescape``), the form the poison
+    record builder and :func:`_wire` understand; it is never replaced with U+FFFD.
+    """
+    return value if isinstance(value, str) else value.decode("utf-8", "surrogateescape")
+
+
+def _has_invalid_utf8(text: str) -> bool:
+    """Whether ``text`` (read through :func:`_as_text`) carries a surrogate-escaped invalid byte."""
+    return any("\udc80" <= ch <= "\udcff" for ch in text)
+
+
+def _wire(value: str) -> Union[str, bytes]:
+    """The exact value to send back to Redis for a stored ``value`` read through :func:`_as_text`.
+
+    Valid text is returned unchanged. A value carrying surrogate-escaped bytes (a non-UTF-8 poison
+    body) is returned as the original ``bytes``, so the member/element the settle script matches
+    is byte-identical to what Redis holds, whatever the client's encoding settings are.
+    """
+    try:
+        value.encode("utf-8")
+        return value
+    except UnicodeEncodeError:
+        pass
+    try:
+        return value.encode("utf-8", "surrogateescape")
+    except UnicodeEncodeError:
+        return value  # a genuine lone surrogate (not from a read): leave it to the client
 
 
 def _pop_result(result: Any) -> Tuple[Optional[Any], Optional[Any]]:

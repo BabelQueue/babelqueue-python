@@ -8,6 +8,7 @@ producer/consumer fakes). Only ``_build_producer``/``_build_consumer`` need the 
 
 from __future__ import annotations
 
+import base64
 import json
 import unittest
 from unittest import mock
@@ -840,7 +841,9 @@ class KafkaDeliveryConfirmationTest(unittest.TestCase):
 
         self.assertEqual(producer.produced[0]["topic"], "orders.dlq")
         dead = poison_dlq(self, producer.produced[0]["value"])
-        self.assertEqual(dead["raw"], "\ufffd\ufffd not utf-8 \ufffd")  # lossy, as the Go reference
+        # ADR-0035: lossless, never U+FFFD
+        self.assertEqual(base64.b64decode(dead["raw"]), self.BAD)
+        self.assertEqual(dead["raw_encoding"], "base64")
         self.assertEqual(producer.confirmed[0], "orders.dlq")
         self.assertEqual(consumer.commits, [0, 1])
         self.assertEqual(len(seen), 1)  # the poison record never reached a handler
@@ -871,9 +874,10 @@ class KafkaDeliveryConfirmationTest(unittest.TestCase):
 
         self.assertEqual(producer.produced[0]["topic"], "orders.dlq")
         dead = poison_dlq(self, producer.produced[0]["value"])
-        self.assertEqual(dead["job"], URN)  # an object keeps its keys
-        self.assertEqual(dead["trace_id"], "tr\ufffd-1")
-        self.assertNotIn("raw", dead)
+        # ADR-0035: invalid UTF-8 is never spliced; the exact bytes are kept under raw
+        self.assertEqual(base64.b64decode(dead["raw"]), latin1)
+        self.assertEqual(dead["raw_encoding"], "base64")
+        self.assertNotIn("job", dead)
         self.assertEqual(consumer.commits, [0, 1])
 
     def test_non_utf8_dead_letter_delivery_error_does_not_commit(self):
@@ -1520,16 +1524,26 @@ class KafkaPoisonWrapTest(unittest.TestCase):
         text = produced[0]["value"].decode("utf-8")
         self.assertEqual(text, json.dumps(json.loads(text), ensure_ascii=False, separators=(",", ":")))
 
-    def test_a_json_object_keeps_its_keys_and_replaces_an_existing_dead_letter_block(self):
-        value = (
+    def test_a_json_object_is_spliced_byte_for_byte(self):
+        value = ('{"job":"%s","attempts":"three","data":{"order_id":1,"n":1e400}}' % URN).encode("utf-8")
+        produced = self._poison(value, key=b"k")
+        record = produced[0]["value"].decode("utf-8")
+        self.assertTrue(record.startswith(value[:-1].decode("utf-8") + ',"dead_letter":{'))
+        dead = poison_dlq(self, produced[0]["value"].replace(b"1e400", b"0"))
+        self.assertEqual(dead["job"], URN)
+        self.assertNotIn("raw", dead)
+        self.assertEqual(produced[0]["key"], b"k")
+
+    def test_an_object_that_already_has_a_dead_letter_member_is_wrapped(self):
+        text = (
             '{"job":"%s","attempts":"three","data":{"order_id":1},'
             '"dead_letter":{"reason":"failed","original_queue":"elsewhere"}}' % URN
-        ).encode("utf-8")
-        produced = self._poison(value, key=b"k")
+        )
+        produced = self._poison(text.encode("utf-8"), key=b"k")
         dead = poison_dlq(self, produced[0]["value"])
-        self.assertEqual(dead["job"], URN)
-        self.assertEqual(dead["data"], {"order_id": 1})
-        self.assertNotIn("raw", dead)
+        self.assertEqual(dead["raw"], text)
+        self.assertNotIn("raw_encoding", dead)
+        self.assertEqual(set(dead), {"raw", "dead_letter"})
         self.assertEqual(produced[0]["key"], b"k")
 
     def test_non_object_roots_and_trailing_tokens_are_wrapped_under_raw(self):
@@ -1735,11 +1749,17 @@ class KafkaPoisonWrapTest(unittest.TestCase):
         produced = self._poison(b"nope", headers=[("bq-attempts", b"4")])
         poison_dlq(self, produced[0]["value"], attempts=4)
 
-    def test_non_utf8_bytes_are_stored_lossily_under_raw(self):
+    def test_non_utf8_bytes_are_stored_losslessly_as_base64_under_raw(self):
         produced = self._poison(b"\xff\xfe bad \x80", key=b"k")
         dead = poison_dlq(self, produced[0]["value"])
-        self.assertEqual(dead["raw"], "�� bad �")
+        self.assertEqual(dead["raw"], base64.b64encode(b"\xff\xfe bad \x80").decode("ascii"))
+        self.assertEqual(dead["raw_encoding"], "base64")
         self.assertEqual(produced[0]["key"], b"k")
+
+    def test_valid_utf8_raw_omits_raw_encoding(self):
+        dead = poison_dlq(self, self._poison("caf\u00e9 \u20ac".encode("utf-8"))[0]["value"])
+        self.assertEqual(dead["raw"], "caf\u00e9 \u20ac")
+        self.assertNotIn("raw_encoding", dead)
 
     def test_poison_without_a_dlq_is_committed_and_writes_no_dlq_record(self):
         produced = self._poison(b"nope", dead_letter=False)
@@ -1812,16 +1832,16 @@ class KafkaPoisonWrapTest(unittest.TestCase):
         produced = self._poison(b"nope", headers=[("bq-original-topic", b"billing")])
         poison_dlq(self, produced[0]["value"], original_queue="billing")
 
-    def test_a_number_json_cannot_carry_falls_back_to_raw(self):
-        # ``1e400`` parses to infinity, which has no JSON form: the DLQ body must stay valid JSON.
+    def test_a_number_json_cannot_carry_stays_verbatim_or_falls_back_to_raw(self):
+        # ``1e400`` parses to infinity, which has no JSON form: the literal is never re-encoded.
         text = '{"job":"%s","data":{"n":1e400}}' % URN
         produced = self._poison(text.encode("utf-8") + b" trailing")
         self.assertNotIn(b"Infinity", produced[0]["value"])
         dead = poison_dlq(self, produced[0]["value"])
         self.assertEqual(dead["raw"], text + " trailing")
         text = '{"job":7,"data":{"n":1e400}}'
-        dead = poison_dlq(self, self._poison(text.encode("utf-8"))[0]["value"])
-        self.assertEqual(dead["raw"], text)
+        value = self._poison(text.encode("utf-8"))[0]["value"]
+        self.assertTrue(value.decode("utf-8").startswith(text[:-1] + ',"dead_letter":{'))  # spliced, 1e400 verbatim
 
 
 class KafkaSchemeTest(unittest.TestCase):

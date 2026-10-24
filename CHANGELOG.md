@@ -13,7 +13,13 @@ Implements ADR-0033 (Redis) and ADR-0034 (Kafka tiers, backoff, poison). The env
 `schema_version: 1`; the vendored conformance suite moves to v1.6.0 and
 `conformance-known-gaps.json` is now empty.
 
+### Changed
+- The Redis poison dead-letter element is now the ADR-0035 record (raw splice, or the `raw`/`raw_encoding` wrapper) carrying a `dead_letter` block, instead of the bare element (broker-bindings section 1). A legacy `__bq_frame` header is unwrapped, not re-applied. Dropped the dead `_reject_json_constant` helper in the Kafka transport.
+- **Redis: a stored value that is not valid UTF-8 no longer crashes the reserve.** The client built from a URL now uses `encoding_errors="surrogateescape"`, replies are decoded losslessly, and the settle / release / dead-letter calls send the exact stored bytes back, so such a poison body becomes the ADR-0035 base64 wrapper (no U+FFFD) and its reservation is actually removed. A client you pass in with `decode_responses=True` should set `encoding_errors="surrogateescape"` as well (redis-py's default strict decoding raises on such a reply).
+- **Poison DLQ record shape follows ADR-0035** (Kafka): a strict JSON object body is spliced byte for byte with a `dead_letter` member, anything else is wrapped as `{"raw": ..., "raw_encoding"?: "base64", "dead_letter": ...}`; a body that is not valid UTF-8 is stored losslessly as base64 instead of with U+FFFD, and the conformance `poison_dlq` section runs.
+
 ### Fixed
+- **Invalid UTF-8 is poison in both Redis layouts (broker-bindings section 1.1).** A stored value (or zset `:reserved` member) that is not valid UTF-8 is dead-lettered on first delivery as the ADR-0035 `raw`/`raw_encoding: "base64"` wrapper, even when the codec or `cjson` could decode it: it is never handed to a handler and never retried, released or re-published, and the exact stored bytes are used for the settle script, so no byte is rewritten.
 - **Redis, Laravel-compatible layout: a poison reservation is dead-lettered in every
   configuration.** The DLQ write no longer depends on `dead_letter_enabled` (default `False`) or
   `on_unknown_urn`: an undecodable body or one without a numeric `attempts` is written raw to

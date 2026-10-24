@@ -76,6 +76,9 @@
     },
     "kafka_poison": {
       "scope": "kafka"
+    },
+    "poison_dlq": {
+      "scope": "core"
     }
   },
   "exceptions": [
@@ -3101,7 +3104,7 @@
       ]
     },
     "pcall_poison": {
-      "description": "A1 (\u00a71.1): a body the reserve Lua cannot decode (or whose `attempts` is not a number) MUST be written raw to `:reserved` and returned as `{job, job}`, i.e. delivered to the SDK as poison; the SDK then handles it as a poison message.",
+      "description": "A1 (\u00a71.1): a body the reserve Lua cannot decode (or whose `attempts` is not a number) MUST be written raw to `:reserved` and returned as `{job, job}`, i.e. delivered to the SDK as poison; the SDK then handles it as a poison message (DLQ record shape: ADR-0035, section `poison_dlq`). The `encode-fails-*` cases cover the SECOND `pcall`, around `cjson.encode` (ADR-0033 A1: nothing may fail after the `LPOP`): their body decodes (`attempts` is a number) so the decode `pcall` succeeds and the attempts increment runs, and only the re-encode fails. The input is a non-finite number literal inside `data`: Redis' bundled `cjson.decode` accepts `1e400` / `-1e400` (overflow to +/-inf), `NaN` and `Infinity`, while `cjson.encode` refuses to serialise a non-finite number, and this is the one generic way to make a decodable, well-formed envelope fail to re-encode. Without the `pcall` around the encode the script would abort after the `LPOP` and the message would be lost (Redis Lua has no rollback).",
       "cases": [
         {
           "name": "not-json",
@@ -3395,6 +3398,126 @@
                 "reserved": [
                   {
                     "member": "null",
+                    "score": 1090
+                  }
+                ],
+                "ready": []
+              }
+            }
+          ]
+        },
+        {
+          "name": "encode-fails-positive-overflow",
+          "source": "broker-bindings.md \u00a71.1 (reserve Lua MUST decode with pcall, A1; the re-encode is also inside pcall)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "ready": [
+              "{\"job\":\"urn:bq:orders:created\",\"attempts\":0,\"data\":{\"n\":1e400}}"
+            ],
+            "notify": 1
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000,
+              "expect": {
+                "outcome": "poison",
+                "handler_body": "{\"job\":\"urn:bq:orders:created\",\"attempts\":0,\"data\":{\"n\":1e400}}",
+                "reserved": [
+                  {
+                    "member": "{\"job\":\"urn:bq:orders:created\",\"attempts\":0,\"data\":{\"n\":1e400}}",
+                    "score": 1090
+                  }
+                ],
+                "ready": []
+              }
+            }
+          ]
+        },
+        {
+          "name": "encode-fails-negative-overflow",
+          "source": "broker-bindings.md \u00a71.1 (reserve Lua MUST decode with pcall, A1; the re-encode is also inside pcall)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "ready": [
+              "{\"job\":\"urn:bq:orders:created\",\"attempts\":0,\"data\":{\"n\":-1e400}}"
+            ],
+            "notify": 1
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000,
+              "expect": {
+                "outcome": "poison",
+                "handler_body": "{\"job\":\"urn:bq:orders:created\",\"attempts\":0,\"data\":{\"n\":-1e400}}",
+                "reserved": [
+                  {
+                    "member": "{\"job\":\"urn:bq:orders:created\",\"attempts\":0,\"data\":{\"n\":-1e400}}",
+                    "score": 1090
+                  }
+                ],
+                "ready": []
+              }
+            }
+          ]
+        },
+        {
+          "name": "encode-fails-nan",
+          "source": "broker-bindings.md \u00a71.1 (reserve Lua MUST decode with pcall, A1; the re-encode is also inside pcall)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "ready": [
+              "{\"job\":\"urn:bq:orders:created\",\"attempts\":0,\"data\":{\"n\":NaN}}"
+            ],
+            "notify": 1
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000,
+              "expect": {
+                "outcome": "poison",
+                "handler_body": "{\"job\":\"urn:bq:orders:created\",\"attempts\":0,\"data\":{\"n\":NaN}}",
+                "reserved": [
+                  {
+                    "member": "{\"job\":\"urn:bq:orders:created\",\"attempts\":0,\"data\":{\"n\":NaN}}",
+                    "score": 1090
+                  }
+                ],
+                "ready": []
+              }
+            }
+          ]
+        },
+        {
+          "name": "encode-fails-infinity",
+          "source": "broker-bindings.md \u00a71.1 (reserve Lua MUST decode with pcall, A1; the re-encode is also inside pcall)",
+          "layout": "zset",
+          "queue": "orders",
+          "retry_after": 90,
+          "state": {
+            "ready": [
+              "{\"job\":\"urn:bq:orders:created\",\"attempts\":0,\"data\":{\"n\":Infinity}}"
+            ],
+            "notify": 1
+          },
+          "steps": [
+            {
+              "op": "reserve",
+              "now": 1000,
+              "expect": {
+                "outcome": "poison",
+                "handler_body": "{\"job\":\"urn:bq:orders:created\",\"attempts\":0,\"data\":{\"n\":Infinity}}",
+                "reserved": [
+                  {
+                    "member": "{\"job\":\"urn:bq:orders:created\",\"attempts\":0,\"data\":{\"n\":Infinity}}",
                     "score": 1090
                   }
                 ],
@@ -5130,6 +5253,549 @@
         "source": "broker-bindings.md \u00a76.5 (terminal failure -> DLQ with reason poison); body is not a decodable envelope",
         "body": "{\"job\":\"urn:x\",\"data\":[]}",
         "expect": "poison"
+      }
+    ]
+  },
+  "poison_dlq": {
+    "description": "Poison DLQ record shape (ADR-0035; error-handling.md section 6 \"Poison record shape\"; Scope: `core`, because the shape is the same for every binding). For each case, take the raw record body (`body`, a JSON string holding the text, or `body_base64`, the standard base64 of the exact bytes where the body is not valid UTF-8, since a JSON string cannot carry such bytes), dead-letter it as poison with `original_queue` `orders`, and parse the DLQ record the SDK would write. Assert: (1) the record is a JSON object with a top-level `dead_letter` object whose `reason` is `poison` and `original_queue` is `orders` (the other `dead_letter` members are SDK-specific and not compared); (2) REMOVING `dead_letter`, the rest of the record equals `expect.record` as parsed JSON (never as bytes) - an exact equality, so `raw_encoding` MUST be absent when `expect.record` has no such key; for a `splice_or_wrapper` case the record is EITHER the wrapper `expect.record` OR a byte-level splice that passes three structural checks: (a) the record text contains each `expect.splice_literals` entry verbatim, (b) the record has no top-level `raw` or `raw_encoding` member, and (c) its distinct top-level member names, other than the single `dead_letter`, compared as a set, equal the set `expect.splice_keys` (the body's own distinct top-level member names: order and repeats do not matter, so a body that repeats a top-level name lists it once and a scanner that reports it twice still matches; a runner whose parser cannot represent a value reads them with a tolerant scanner). The rest of the parsed form is not compared, because a conforming splice holds a value the runner's own parser may not represent, or a repeated member that a parser collapses. `expect.shape`: `splice` - the body is valid UTF-8, a single strict RFC 8259 JSON object (no `NaN` / `Infinity` / `-Infinity` literal, no unpaired surrogate escape) and has no top-level `dead_letter` key, so the record is that object plus `dead_letter` (`{}` gives only `dead_letter`); `splice_or_wrapper` - the body is such an object but carries a value a re-encoding writer cannot carry losslessly in its own number type or parser limits (`1e400`, `-1e400`, `1e-400`, an integer or decimal beyond double precision, nesting beyond a parser's depth limit, a member name repeated at any depth): a writer MAY splice it ONLY at byte level, so the record text MUST contain every `expect.splice_literals` entry verbatim (a re-encoding writer that turns `1e400` into `null` or `Infinity`, or that keeps only the last of two `\"job\"` members, fails here) and must pass the structural checks of (2), and otherwise it MUST write the wrapper `expect.record` (ADR-0035 section 1); `wrapper` - anything else (empty body, not JSON, JSON that is not an object, trailing data, a leading BOM, `NaN` / `Infinity` / `-Infinity` literals, an unpaired surrogate escape such as `\\ud800` anywhere in the body, an object that already carries a top-level `dead_letter` key, invalid UTF-8): `raw` is the body as a plain string when it is valid UTF-8 (and `raw_encoding` is omitted, never written as `utf8`), otherwise the standard base64 (RFC 4648 section 4, padded) of the exact bytes with `raw_encoding` `base64`; U+FFFD substitution is forbidden. A body that is not valid UTF-8 is never an object (RFC 8259 section 8.1), so it is always wrapped, even if it looks like one. The padding cases cover one, two and three trailing input bytes.",
+    "original_queue": "orders",
+    "cases": [
+      {
+        "name": "object-empty",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "{}",
+        "expect": {
+          "shape": "splice",
+          "record": {}
+        }
+      },
+      {
+        "name": "object-minimal-envelope",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "{\"job\":\"urn:x\",\"data\":{}}",
+        "expect": {
+          "shape": "splice",
+          "record": {
+            "job": "urn:x",
+            "data": {}
+          }
+        }
+      },
+      {
+        "name": "object-wrong-typed-job",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "{\"job\":5}",
+        "expect": {
+          "shape": "splice",
+          "record": {
+            "job": 5
+          }
+        }
+      },
+      {
+        "name": "object-surrounding-whitespace",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": " \n{\"a\":1}\n ",
+        "expect": {
+          "shape": "splice",
+          "record": {
+            "a": 1
+          }
+        }
+      },
+      {
+        "name": "object-non-ascii-member",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "{\"city\":\"Istanbul \u2615\",\"q\":\"caf\u00e9\"}",
+        "expect": {
+          "shape": "splice",
+          "record": {
+            "city": "Istanbul \u2615",
+            "q": "caf\u00e9"
+          }
+        }
+      },
+      {
+        "name": "empty-body",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "",
+        "expect": {
+          "shape": "wrapper",
+          "record": {
+            "raw": ""
+          }
+        }
+      },
+      {
+        "name": "plain-text",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "not json",
+        "expect": {
+          "shape": "wrapper",
+          "record": {
+            "raw": "not json"
+          }
+        }
+      },
+      {
+        "name": "unicode-text",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "caf\u00e9 \u2615 \u2014 \u00fcn\u00ef",
+        "expect": {
+          "shape": "wrapper",
+          "record": {
+            "raw": "caf\u00e9 \u2615 \u2014 \u00fcn\u00ef"
+          }
+        }
+      },
+      {
+        "name": "text-with-control-and-quote-characters",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "line1\nline2\ttab \"quoted\" \\ back",
+        "expect": {
+          "shape": "wrapper",
+          "record": {
+            "raw": "line1\nline2\ttab \"quoted\" \\ back"
+          }
+        }
+      },
+      {
+        "name": "json-null",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "null",
+        "expect": {
+          "shape": "wrapper",
+          "record": {
+            "raw": "null"
+          }
+        }
+      },
+      {
+        "name": "json-number",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "42",
+        "expect": {
+          "shape": "wrapper",
+          "record": {
+            "raw": "42"
+          }
+        }
+      },
+      {
+        "name": "json-string",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "\"text\"",
+        "expect": {
+          "shape": "wrapper",
+          "record": {
+            "raw": "\"text\""
+          }
+        }
+      },
+      {
+        "name": "json-true",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "true",
+        "expect": {
+          "shape": "wrapper",
+          "record": {
+            "raw": "true"
+          }
+        }
+      },
+      {
+        "name": "json-empty-array",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "[]",
+        "expect": {
+          "shape": "wrapper",
+          "record": {
+            "raw": "[]"
+          }
+        }
+      },
+      {
+        "name": "json-array-of-objects",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "[{\"job\":\"urn:x\"}]",
+        "expect": {
+          "shape": "wrapper",
+          "record": {
+            "raw": "[{\"job\":\"urn:x\"}]"
+          }
+        }
+      },
+      {
+        "name": "truncated-object",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "{\"job\":\"urn:x\"",
+        "expect": {
+          "shape": "wrapper",
+          "record": {
+            "raw": "{\"job\":\"urn:x\""
+          }
+        }
+      },
+      {
+        "name": "two-objects-trailing-data",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "{\"a\":1} {\"b\":2}",
+        "expect": {
+          "shape": "wrapper",
+          "record": {
+            "raw": "{\"a\":1} {\"b\":2}"
+          }
+        }
+      },
+      {
+        "name": "object-with-leading-bom",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "\ufeff{\"job\":\"urn:x\"}",
+        "expect": {
+          "shape": "wrapper",
+          "record": {
+            "raw": "\ufeff{\"job\":\"urn:x\"}"
+          }
+        }
+      },
+      {
+        "name": "object-already-has-dead-letter",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "{\"job\":\"urn:x\",\"dead_letter\":{\"reason\":\"failed\"}}",
+        "expect": {
+          "shape": "wrapper",
+          "record": {
+            "raw": "{\"job\":\"urn:x\",\"dead_letter\":{\"reason\":\"failed\"}}"
+          }
+        }
+      },
+      {
+        "name": "invalid-utf8-one-byte-two-pad",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body_base64": "/w==",
+        "expect": {
+          "shape": "wrapper",
+          "record": {
+            "raw": "/w==",
+            "raw_encoding": "base64"
+          }
+        }
+      },
+      {
+        "name": "invalid-utf8-truncated-sequence-one-pad",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body_base64": "4oI=",
+        "expect": {
+          "shape": "wrapper",
+          "record": {
+            "raw": "4oI=",
+            "raw_encoding": "base64"
+          }
+        }
+      },
+      {
+        "name": "invalid-utf8-three-bytes-no-pad",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body_base64": "//79",
+        "expect": {
+          "shape": "wrapper",
+          "record": {
+            "raw": "//79",
+            "raw_encoding": "base64"
+          }
+        }
+      },
+      {
+        "name": "invalid-utf8-surrogate-encoded",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body_base64": "7aCA",
+        "expect": {
+          "shape": "wrapper",
+          "record": {
+            "raw": "7aCA",
+            "raw_encoding": "base64"
+          }
+        }
+      },
+      {
+        "name": "invalid-utf8-overlong",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body_base64": "wK8=",
+        "expect": {
+          "shape": "wrapper",
+          "record": {
+            "raw": "wK8=",
+            "raw_encoding": "base64"
+          }
+        }
+      },
+      {
+        "name": "invalid-utf8-above-u10ffff",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body_base64": "9JCAgA==",
+        "expect": {
+          "shape": "wrapper",
+          "record": {
+            "raw": "9JCAgA==",
+            "raw_encoding": "base64"
+          }
+        }
+      },
+      {
+        "name": "invalid-utf8-after-valid-text",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body_base64": "dmFsaWQgdGV4dCD/IHRoZW4gbW9yZQ==",
+        "expect": {
+          "shape": "wrapper",
+          "record": {
+            "raw": "dmFsaWQgdGV4dCD/IHRoZW4gbW9yZQ==",
+            "raw_encoding": "base64"
+          }
+        }
+      },
+      {
+        "name": "invalid-utf8-inside-object-text",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body_base64": "eyJqb2IiOiJ1cm46eCIsImRhdGEiOiL/In0=",
+        "expect": {
+          "shape": "wrapper",
+          "record": {
+            "raw": "eyJqb2IiOiJ1cm46eCIsImRhdGEiOiL/In0=",
+            "raw_encoding": "base64"
+          }
+        }
+      },
+      {
+        "name": "object-surrogate-pair-escape",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "{\"a\":\"\\ud83d\\ude00\"}",
+        "expect": {
+          "shape": "splice",
+          "record": {
+            "a": "\ud83d\ude00"
+          }
+        }
+      },
+      {
+        "name": "object-number-overflow-positive",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "{\"job\":\"urn:bq:orders:created\",\"attempts\":0,\"data\":{\"n\":1e400}}",
+        "expect": {
+          "shape": "splice_or_wrapper",
+          "record": {
+            "raw": "{\"job\":\"urn:bq:orders:created\",\"attempts\":0,\"data\":{\"n\":1e400}}"
+          },
+          "splice_literals": [
+            "1e400"
+          ],
+          "splice_keys": [
+            "job",
+            "attempts",
+            "data"
+          ]
+        }
+      },
+      {
+        "name": "object-number-overflow-negative",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "{\"job\":\"urn:bq:orders:created\",\"attempts\":0,\"data\":{\"n\":-1e400}}",
+        "expect": {
+          "shape": "splice_or_wrapper",
+          "record": {
+            "raw": "{\"job\":\"urn:bq:orders:created\",\"attempts\":0,\"data\":{\"n\":-1e400}}"
+          },
+          "splice_literals": [
+            "-1e400"
+          ],
+          "splice_keys": [
+            "job",
+            "attempts",
+            "data"
+          ]
+        }
+      },
+      {
+        "name": "object-integer-beyond-int64",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "{\"n\":12345678901234567890}",
+        "expect": {
+          "shape": "splice_or_wrapper",
+          "record": {
+            "raw": "{\"n\":12345678901234567890}"
+          },
+          "splice_literals": [
+            "12345678901234567890"
+          ],
+          "splice_keys": [
+            "n"
+          ]
+        }
+      },
+      {
+        "name": "object-number-underflow",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "{\"n\":1e-400}",
+        "expect": {
+          "shape": "splice_or_wrapper",
+          "record": {
+            "raw": "{\"n\":1e-400}"
+          },
+          "splice_literals": [
+            "1e-400"
+          ],
+          "splice_keys": [
+            "n"
+          ]
+        }
+      },
+      {
+        "name": "object-decimal-beyond-double-precision",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "{\"n\":0.1234567890123456789012345}",
+        "expect": {
+          "shape": "splice_or_wrapper",
+          "record": {
+            "raw": "{\"n\":0.1234567890123456789012345}"
+          },
+          "splice_literals": [
+            "0.1234567890123456789012345"
+          ],
+          "splice_keys": [
+            "n"
+          ]
+        }
+      },
+      {
+        "name": "object-nesting-depth-600",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "{\"a\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}",
+        "expect": {
+          "shape": "splice_or_wrapper",
+          "record": {
+            "raw": "{\"a\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}"
+          },
+          "splice_literals": [
+            "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]"
+          ],
+          "splice_keys": [
+            "a"
+          ]
+        }
+      },
+      {
+        "name": "object-duplicate-member-top-level",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "{\"job\":\"urn:bq:orders:created\",\"job\":5}",
+        "expect": {
+          "shape": "splice_or_wrapper",
+          "record": {
+            "raw": "{\"job\":\"urn:bq:orders:created\",\"job\":5}"
+          },
+          "splice_literals": [
+            "\"job\":\"urn:bq:orders:created\"",
+            "\"job\":5"
+          ],
+          "splice_keys": [
+            "job"
+          ]
+        }
+      },
+      {
+        "name": "object-duplicate-member-nested",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "{\"job\":\"urn:bq:orders:created\",\"attempts\":0,\"data\":{\"k\":1,\"k\":2}}",
+        "expect": {
+          "shape": "splice_or_wrapper",
+          "record": {
+            "raw": "{\"job\":\"urn:bq:orders:created\",\"attempts\":0,\"data\":{\"k\":1,\"k\":2}}"
+          },
+          "splice_literals": [
+            "\"k\":1",
+            "\"k\":2"
+          ],
+          "splice_keys": [
+            "job",
+            "attempts",
+            "data"
+          ]
+        }
+      },
+      {
+        "name": "object-nan-literal",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "{\"job\":\"urn:bq:orders:created\",\"attempts\":0,\"data\":{\"n\":NaN}}",
+        "expect": {
+          "shape": "wrapper",
+          "record": {
+            "raw": "{\"job\":\"urn:bq:orders:created\",\"attempts\":0,\"data\":{\"n\":NaN}}"
+          }
+        }
+      },
+      {
+        "name": "object-infinity-literal",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "{\"job\":\"urn:bq:orders:created\",\"attempts\":0,\"data\":{\"n\":Infinity}}",
+        "expect": {
+          "shape": "wrapper",
+          "record": {
+            "raw": "{\"job\":\"urn:bq:orders:created\",\"attempts\":0,\"data\":{\"n\":Infinity}}"
+          }
+        }
+      },
+      {
+        "name": "object-negative-infinity-literal",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "{\"n\":-Infinity}",
+        "expect": {
+          "shape": "wrapper",
+          "record": {
+            "raw": "{\"n\":-Infinity}"
+          }
+        }
+      },
+      {
+        "name": "object-lone-high-surrogate-escape",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "{\"a\":\"\\ud800\"}",
+        "expect": {
+          "shape": "wrapper",
+          "record": {
+            "raw": "{\"a\":\"\\ud800\"}"
+          }
+        }
+      },
+      {
+        "name": "object-lone-low-surrogate-escape",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "{\"a\":\"\\udc00\"}",
+        "expect": {
+          "shape": "wrapper",
+          "record": {
+            "raw": "{\"a\":\"\\udc00\"}"
+          }
+        }
+      },
+      {
+        "name": "object-high-surrogate-then-non-low-escape",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "{\"a\":\"\\ud800\\u0041\"}",
+        "expect": {
+          "shape": "wrapper",
+          "record": {
+            "raw": "{\"a\":\"\\ud800\\u0041\"}"
+          }
+        }
+      },
+      {
+        "name": "object-lone-surrogate-escape-in-key",
+        "source": "ADR-0035 (poison DLQ record shape); error-handling.md section 6",
+        "body": "{\"\\ud800\":1}",
+        "expect": {
+          "shape": "wrapper",
+          "record": {
+            "raw": "{\"\\ud800\":1}"
+          }
+        }
       }
     ]
   }
