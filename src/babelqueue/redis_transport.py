@@ -26,7 +26,9 @@ of aborting the script. The handler always receives the **raw** job (Laravel's `
 therefore the count *before* this delivery); the ack handle is the reserved member
 (``attempts + 1``), so either side can ``ZREM`` the other's reservation. A poison job is delivered
 under :data:`~babelqueue.transport.NON_NUMERIC_ATTEMPTS_ROUTE`: the runtime dead-letters the raw
-body byte for byte and acks it, leaving nothing in ``:reserved``. A failed job is returned by one
+body byte for byte and acks it, leaving nothing in ``:reserved``. The legacy layout does the same
+for a body that is not a JSON object: on its first delivery the raw body goes to ``<queue>.dlq``
+through the gated settle script and leaves ``:processing`` (it is never retried or rebuilt). A failed job is returned by one
 atomic script (``ZREM :reserved`` + ``ZADD :delayed floor(now)+ceil(delay)``) with ``attempts``
 advanced by the runtime; the transport is a :class:`~babelqueue.transport.Redeliverer`. Before
 each pop, due ``:delayed`` members and (unless ``retry_after`` is ``None``) lapsed ``:reserved``
@@ -63,6 +65,7 @@ import time
 from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
 from urllib.parse import parse_qs, urlsplit
 
+from ._envelope_shape import envelope_violation
 from .codec import parse_envelope
 from .exceptions import BabelQueueError
 from .transport import NON_NUMERIC_ATTEMPTS_ROUTE, ReceivedMessage, Transport
@@ -431,8 +434,17 @@ class RedisTransport(Transport):
                 # The stored value may be a header frame (publish_with_headers) or a bare wire
                 # envelope. The handle keeps the raw stored value so the settle LREM matches.
                 unframed, headers = _unframe(text)
+                # A body the Go reference's typed ``Decode`` rejects (not valid JSON, not an object,
+                # or a member of the wrong type such as a string ``attempts``/``meta``) can never
+                # be decoded or retried: hand it over as poison so the runtime dead-letters the raw
+                # bytes on this first delivery instead of rebuilding and retrying it. An object
+                # without an identity is NOT poison (it keeps the bounded FAIL path), and neither is
+                # a bare ``null``. (``envelope_violation`` parses the body once; ``dispatch`` parses
+                # it again for the handler -- one extra parse of an already small body.)
+                route = "" if envelope_violation(unframed) is None else NON_NUMERIC_ATTEMPTS_ROUTE
                 return ReceivedMessage(
-                    body=unframed, queue=queue, handle=_LegacyHandle(text, token), headers=headers
+                    body=unframed, queue=queue, handle=_LegacyHandle(text, token),
+                    headers=headers, route_urn=route,
                 )
             remaining = end - time.monotonic()
             if remaining <= 0:

@@ -206,7 +206,9 @@ class Rewinder(Protocol):
     acking a record is not enough there, because acking a later record on the same partition
     commits past it and it is lost. :meth:`rewind` moves the consumer back to ``message`` so the
     next :meth:`Transport.pop` returns it again. The runtime calls it only when it deliberately
-    leaves a message unsettled (a version-gated message whose dead-letter write failed)."""
+    leaves a message unsettled: a version-gated or poison message whose dead-letter write failed,
+    a retry release / re-publish that failed (e.g. a Kafka transport without retry tiers), and the
+    verbatim release of an unknown-URN message that failed."""
 
     def rewind(self, message: ReceivedMessage) -> None:
         """Position the consumer so ``message`` is delivered again by the next ``pop``."""
@@ -217,7 +219,7 @@ class Rewinder(Protocol):
 #: producer). It sits under the version-gated prefix, so the runtime dead-letters it directly, raw
 #: and never retried (retrying needs a numeric attempt counter); ``redrive`` restores it to the DLQ
 #: instead of replaying it to a work topic. Produced only by :class:`~babelqueue.redis_transport.RedisTransport`
-#: for a poison body in the Laravel layout (ADR-0033 A1), which the runtime dead-letters unconditionally.
+#: for a poison body (ADR-0033 A1: Laravel layout, and a legacy ``:processing`` body Go's typed ``Decode`` rejects), which the runtime dead-letters unconditionally.
 NON_NUMERIC_ATTEMPTS_ROUTE = "babelqueue:unsupported-schema-version:non-numeric-attempts"
 
 

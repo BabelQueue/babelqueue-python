@@ -511,13 +511,30 @@ class BabelQueue:
             self.transport.rewind(received)
         except Exception:  # noqa: BLE001 - reported, never kills the loop
             logger.error(
-                "Failed to rewind an unsettled version-gated message (route %r) on queue %r.",
+                "Failed to rewind an unsettled message (route %r) on queue %r.",
                 received.route_urn,
                 received.queue,
                 exc_info=True,
             )
             return
         self._stop.wait(self._rewind_pause)
+
+    def _leave_republish_unsettled(self, received: ReceivedMessage, exc: BaseException) -> None:
+        """A retry release / re-publish failed (e.g. a Kafka transport without retry tiers, or a
+        broker write error): acknowledging the message would lose it, so it is logged and left
+        **unsettled** -- never acked, never committed -- and the consume loop carries on (Go
+        ``leaveRepublishUnsettled``). A :class:`~babelqueue.transport.Rewinder` transport (Kafka)
+        seeks back to the record and the loop pauses ``_rewind_pause`` seconds first so a broker
+        that stays unavailable is not hammered in a hot loop; any other transport redelivers the
+        message when its reservation or visibility timeout lapses."""
+        logger.error(
+            "Re-publishing a message for retry on queue %r (route %r) failed; it was NOT "
+            "acknowledged and will be redelivered.",
+            received.queue,
+            received.route_urn,
+            exc_info=exc,
+        )
+        self._rewind_unsettled(received)
 
     def _release_unprocessed(self, received: ReceivedMessage) -> None:
         """Release a message whose handler never completed (shutdown): unchanged body
@@ -553,35 +570,39 @@ class BabelQueue:
         self._phase = _SETTLING
 
     def _warn_if_retries_cannot_redeliver(self) -> None:
-        """Warn at start-up when a failing handler would stop the worker (Kafka without tiers).
+        """Warn at start-up when a failing handler could not be retried (Kafka without tiers).
 
         A tierless :class:`~babelqueue.kafka_transport.KafkaTransport` has no way to delay a
-        retry: ``redeliver`` raises, the loop stops and the record stays uncommitted. That only
-        happens once a handler fails, so it is a warning (not a start-up error) -- a worker whose
-        handlers never fail keeps working.
+        retry: ``redeliver`` raises. The worker logs that, leaves the record uncommitted (rewound,
+        after a pause) and keeps consuming, so the record is redelivered but never retried
+        through a tier. That only happens once a handler fails, so it is a warning (not a
+        start-up error).
         """
         tiers = getattr(self.transport, "retry_tiers_ms", None)
         if isinstance(tiers, list) and not tiers and self.max_attempts > 1 and isinstance(self.transport, Redeliverer):
             logger.warning(
-                "The Kafka transport has no retry tiers but max_attempts=%d: the first handler "
-                "failure will stop this worker and leave the record uncommitted. Configure "
-                "retry_tiers_ms (or set max_attempts=1) to retry without stopping.",
+                "The Kafka transport has no retry tiers but max_attempts=%d: a failing handler "
+                "cannot be retried -- the record is left uncommitted and redelivered after a "
+                "pause, so it keeps failing in place. Configure retry_tiers_ms (or set "
+                "max_attempts=1) to retry through the tiers.",
                 self.max_attempts,
             )
 
     def _route_unknown(self, urn: str, received: ReceivedMessage, envelope: Mapping[str, Any]) -> None:
         strategy = self.on_unknown_urn
         # A Kafka poison record (§6.5: not valid UTF-8 / not a decodable body) is not an unknown URN: it
-        # never decoded into an envelope, so ``on_unknown_urn`` has no say. It is checked before the
-        # DELETE strategy and settled like the Go reference does -- dead-lettered (wrapped, reason
-        # ``poison``) and committed, or dropped only when no DLQ is configured. Other transports'
-        # version-gated deliveries keep their existing order below.
-        # The Redis (Laravel layout) poison reservation (ADR-0033 A1: a body that does not decode or
-        # has no numeric ``attempts``) is the same kind of delivery: it is dead-lettered raw, and
+        # never decoded into an envelope, so the URN part of ``on_unknown_urn`` has no say. It takes
+        # the Go reference's ``routePoison`` order, which is checked before the generic DELETE
+        # branch: DELETE drops it; with the DLQ on (``dead_letter`` or the DEAD_LETTER strategy) it
+        # is dead-lettered (wrapped, reason ``poison``) and committed; with the DLQ off it takes the
+        # bounded FAIL path (retry through the tiers up to ``max_attempts``, then drop), never an
+        # unconditional DLQ write. Other transports' version-gated deliveries keep their order below.
+        # The Redis (Laravel layout) poison reservation (ADR-0033 A1: a body that does not decode as
+        # an envelope) is a different, unconditional case: it is dead-lettered raw, and
         # ``on_unknown_urn=DELETE`` must not silently discard it. Only that one route is lifted
         # ahead of DELETE; the generic version-gated prefix below keeps its order.
         if isinstance(received.route_urn, PoisonRoute):
-            self._settle_version_gated(received)
+            self._route_poison(received)
             return
         if received.route_urn == NON_NUMERIC_ATTEMPTS_ROUTE:
             # broker-bindings §1.1 / ADR-0033: the DLQ write is an unconditional MUST, so it does
@@ -604,7 +625,12 @@ class BabelQueue:
         # instead (retry up to max_attempts, then dead-letter or drop); only a genuinely unknown
         # URN keeps the verbatim release.
         if strategy == UnknownUrnStrategy.RELEASE and urn:
-            self._release(received, received.body, self.unknown_urn_release_delay)
+            try:
+                self._release(received, received.body, self.unknown_urn_release_delay)
+            except Exception as release_exc:  # noqa: BLE001 - a failed release must not stop the worker
+                # Go ``routeUnknown``: the release failed (e.g. a Kafka transport without retry
+                # tiers), so acknowledging would lose the message. Left unsettled, loop survives.
+                self._leave_republish_unsettled(received, release_exc)
             return
         if strategy == UnknownUrnStrategy.DEAD_LETTER:
             self._dead_letter(received, dict(envelope), "unknown_urn", None)
@@ -613,6 +639,29 @@ class BabelQueue:
         # (never kills the loop).
         raise UnknownUrnError(f"No handler mapped for URN [{urn or '(empty)'}].")
 
+    def _route_poison(self, received: ReceivedMessage) -> None:
+        """Settle a Kafka poison delivery the way Go ``routePoison`` does.
+
+        DELETE drops it. With the DLQ on (``dead_letter`` or the DEAD_LETTER strategy) it is written
+        to the DLQ wrapped (``reason: poison``). With the DLQ off it takes the bounded FAIL path:
+        retried through the transport's tiers until ``max_attempts``, then dropped. The attempt
+        count comes from the record (``bq-attempts``), because a poison delivery has no decoded
+        envelope; the retry body is a bare ``{"attempts": N}`` that stays poison on redelivery.
+        Called from the dispatch ``try``: a failed DLQ write propagates and is rewound there."""
+        route = received.route_urn
+        if self.on_unknown_urn == UnknownUrnStrategy.DELETE:
+            self._ack_settled(received)
+            return
+        if self.dead_letter_enabled or self.on_unknown_urn == UnknownUrnStrategy.DEAD_LETTER:
+            self._settle_version_gated(received, always=True)
+            return
+        attempts = int(getattr(route, "attempts", 0) or 0)
+        self._retry_or_dead_letter(
+            received,
+            {"attempts": attempts},
+            UnknownUrnError("The record is poison: it carries no decodable envelope."),
+        )
+
     def _dead_letter_target(self, received: ReceivedMessage) -> str:
         """The queue a dead-lettered delivery is written to (configured DLQ or ``<queue><suffix>``)."""
         return self.dead_letter_queue or (received.queue + self.dead_letter_suffix)
@@ -620,8 +669,10 @@ class BabelQueue:
     def _settle_version_gated(self, received: ReceivedMessage, always: bool = False) -> None:
         """Dead-letter a version-gated delivery directly (no retry); drop it when no DLQ is set.
 
-        ``always`` (the Redis poison reservation, §1.1 / ADR-0033) writes the DLQ record in every
-        configuration, ignoring ``dead_letter_enabled``.
+        ``always`` (the Redis poison reservation, §1.1 / ADR-0033, whose DLQ write is an
+        unconditional MUST) writes the DLQ record in every configuration, ignoring
+        ``dead_letter_enabled``. A Kafka poison record reaches it with the DLQ already on
+        (:meth:`_route_poison`).
 
         The gate rejects the message *without decoding it*, so the DLQ record is the incoming raw
         body, byte-identical, with no ``dead_letter`` block (matching the Java, .NET and Node
@@ -646,7 +697,10 @@ class BabelQueue:
         envelope["attempts"] = attempts
 
         if attempts < self.max_attempts:
-            self._release(received, EnvelopeCodec.encode(envelope), self._retry_delay(attempts))
+            try:
+                self._release(received, EnvelopeCodec.encode(envelope), self._retry_delay(attempts))
+            except Exception as release_exc:  # noqa: BLE001 - a failed release must not stop the worker
+                self._leave_republish_unsettled(received, release_exc)
             return
 
         if self.dead_letter_enabled:

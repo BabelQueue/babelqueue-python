@@ -24,7 +24,9 @@ from babelqueue import BabelQueue, BabelQueueError, EnvelopeCodec
 from babelqueue.redis_transport import (
     _DEAD_LETTER,
     _POP,
+    _RESERVE_LEGACY,
     _SETTLE,
+    _SWEEP,
     RedisTransport,
     _frame_value,
     _pop_result,
@@ -268,6 +270,105 @@ class PopScriptWithoutRedisTest(unittest.TestCase):
     def test_the_script_source_guards_the_encode_with_pcall(self):
         self.assertIn("pcall(cjson.encode", _POP)
         self.assertNotIn("= cjson.encode(", _POP)
+
+
+class LegacyPoisonWithoutRedisTest(unittest.TestCase):
+    """Legacy layout: an undecodable body is dead-lettered raw on its FIRST delivery (broker-free).
+
+    The client double answers the reserve/sweep scripts and records the gated settle call, so the
+    test proves the transport hands the body over as poison and the runtime settles it through the
+    one gated script (write to the DLQ + remove from ``:processing``) without touching the body.
+    """
+
+    class Client:
+        def __init__(self, stored):
+            self.stored = [stored]
+            self.settles = []
+
+        def eval(self, script, numkeys, *args):
+            if script == _SWEEP:
+                return 0
+            if script == _RESERVE_LEGACY:
+                return self.stored.pop(0) if self.stored else None
+            if script == _SETTLE:
+                self.settles.append((numkeys, args))
+                return 1
+            raise AssertionError("unexpected script")
+
+        def rpush(self, *args):  # pragma: no cover - a plain publish must never be used here
+            raise AssertionError("poison must be settled through the gated script")
+
+    def consume(self, stored, **kwargs):
+        client = self.Client(stored)
+        app = BabelQueue(
+            transport=RedisTransport("redis://", client=client, retry_after=90),
+            queue="orders", **kwargs,
+        )
+        app.register(URN, lambda data, meta: None)
+        self.assertEqual(app.consume("orders", max_messages=1, timeout=0), 1)
+        return client
+
+    def test_non_json_body_goes_to_the_raw_dlq_on_first_delivery(self):
+        for garbage in ("not-json at all", "[1, 2]", '"a string"', "", "{truncated"):
+            with self.subTest(body=garbage):
+                client = self.consume(garbage, max_attempts=3, dead_letter=True)
+                ((numkeys, args),) = client.settles
+                self.assertEqual(numkeys, 3)
+                self.assertEqual(args[:3], ("orders:processing", "orders:processing:deadlines", "orders.dlq"))
+                self.assertEqual(args[4], garbage)  # handle.raw: LREM matches the stored value
+                self.assertEqual(args[5], garbage)  # written byte for byte, no wrapper
+
+    def test_it_is_dead_lettered_even_with_the_dlq_off_and_never_retried(self):
+        client = self.consume("garbage", max_attempts=5, dead_letter=False)
+        ((numkeys, args),) = client.settles
+        self.assertEqual((numkeys, args[2], args[5]), (3, "orders.dlq", "garbage"))
+        self.assertEqual(client.stored, [])  # nothing re-queued
+
+    def test_a_framed_garbage_body_keeps_its_headers_in_the_dead_letter(self):
+        frame = json.dumps({"__bq_frame": 1, "headers": {"traceparent": "00-ab"}, "body": "garbage"})
+        client = self.consume(frame, dead_letter=True)
+        ((_, args),) = client.settles
+        self.assertEqual(args[4], frame)  # the ack handle keeps the stored frame
+        dead = json.loads(args[5])  # re-framed so the out-of-band headers survive the DLQ hop
+        self.assertEqual(dead["body"], "garbage")
+        self.assertEqual(dead["headers"], {"traceparent": "00-ab"})
+
+    def test_a_body_go_typed_decode_rejects_is_poison_on_the_first_delivery(self):
+        # Go's typed ``Decode`` rejects wrong member types, not just non-objects (review MAJOR 1).
+        for garbage in (
+            '{"job":"urn:a","attempts":"x"}',
+            '{"job":"urn:a","attempts":1.5}',
+            '{"job":"urn:a","meta":"oops"}',
+        ):
+            with self.subTest(body=garbage):
+                client = self.Client(garbage)
+                message = RedisTransport("redis://", client=client).pop("orders", timeout=0)
+                self.assertEqual(message.route_urn, NON_NUMERIC_ATTEMPTS_ROUTE)
+                client = self.consume(garbage, max_attempts=3, dead_letter=True)
+                ((_, args),) = client.settles
+                self.assertEqual(args[5], garbage)  # dead-lettered raw, never handled or retried
+
+    def test_a_bare_null_is_not_poison(self):
+        client = self.Client("null")
+        message = RedisTransport("redis://", client=client).pop("orders", timeout=0)
+        self.assertEqual(message.route_urn, "")
+
+    def test_an_identity_less_object_is_not_poison(self):
+        # {} / an object without job or urn still takes the bounded FAIL path, not the raw DLQ.
+        client = self.Client('{"attempts":0}')
+        message = RedisTransport("redis://", client=client).pop("orders", timeout=0)
+        self.assertEqual(message.route_urn, "")
+
+    def test_a_valid_envelope_is_not_flagged(self):
+        client = self.Client(make_body("orders"))
+        message = RedisTransport("redis://", client=client).pop("orders", timeout=0)
+        self.assertEqual(message.route_urn, "")
+
+    def test_poison_is_flagged_with_the_non_numeric_attempts_route(self):
+        client = self.Client("garbage")
+        message = RedisTransport("redis://", client=client).pop("orders", timeout=0)
+        self.assertEqual(message.route_urn, NON_NUMERIC_ATTEMPTS_ROUTE)
+        self.assertEqual(message.body, "garbage")
 
 
 class _BrokerTest(unittest.TestCase):
@@ -838,6 +939,25 @@ class LegacyLayoutTest(_BrokerTest):
         self.assertEqual(json.loads(record)["attempts"], 2)
         self.assertEqual(self.client.llen(self.processing), 0)
         self.assertEqual(self.client.zcard(self.deadlines), 0)
+
+    def test_undecodable_body_is_dead_lettered_raw_on_first_delivery(self):
+        garbage = "not json {"
+        self.client.rpush(self.queue, garbage)
+        app = self.app(max_attempts=3, dead_letter=True)
+        app.register(URN, lambda data, meta: None)
+        self.assertEqual(app.consume(self.queue, max_messages=1, timeout=0), 1)
+        self.assertEqual(self.client.lrange(f"{self.queue}.dlq", 0, -1), [garbage])
+        self.assertEqual(self.client.llen(self.processing), 0)
+        self.assertEqual(self.client.zcard(self.deadlines), 0)
+        self.assertEqual(self.client.llen(self.queue), 0)  # never re-queued for a retry
+
+    def test_undecodable_body_is_dead_lettered_with_the_dlq_off_too(self):
+        self.client.rpush(self.queue, "[1]")
+        app = self.app(max_attempts=3, dead_letter=False)
+        app.register(URN, lambda data, meta: None)
+        self.assertEqual(app.consume(self.queue, max_messages=1, timeout=0), 1)
+        self.assertEqual(self.client.lrange(f"{self.queue}.dlq", 0, -1), ["[1]"])
+        self.assertEqual(self.client.llen(self.processing), 0)
 
     def test_publish_with_headers_stores_a_frame_and_pop_unframes(self):
         body = make_body(self.queue)

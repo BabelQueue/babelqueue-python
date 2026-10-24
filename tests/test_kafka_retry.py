@@ -19,6 +19,7 @@ from test_kafka_transport import (
     FakeProducer,
     OffsetConsumer,
     OffsetMessage,
+    URN,
     ReportingProducer,
     body,
     header_map,
@@ -85,9 +86,33 @@ class TierlessTest(unittest.TestCase):
         text = warnings[0].getMessage()
         self.assertIn("no retry tiers", text)
         self.assertIn("max_attempts=3", text)
-        self.assertIn("stop this worker", text)
         self.assertIn("uncommitted", text)
+        self.assertIn("redelivered", text)
         self.assertIn("retry_tiers_ms", text)
+        self.assertNotIn("stop this worker", text)
+
+    def test_a_failing_handler_without_tiers_does_not_stop_the_worker_and_is_not_committed(self):
+        # Faz 14 / Go parity (leaveRepublishUnsettled): the transport still raises, but the runtime
+        # logs it, leaves the record unsettled (rewind, no commit) and keeps the consume loop alive.
+        consumer = OffsetConsumer([OffsetMessage(body().encode("utf-8"), [], offset=0)])
+        producer = ReportingProducer()
+        kafka = KafkaTransport(producer=producer, consumer_factory=lambda _q: consumer)
+        app = BabelQueue(transport=kafka, queue="orders", max_attempts=3)
+        app._rewind_pause = 0.0  # noqa: SLF001
+        calls: list = []
+
+        @app.handler(URN)
+        def _boom(data, meta):
+            calls.append(data)
+            raise RuntimeError("handler failed")
+
+        with self.assertLogs("babelqueue.app", level="ERROR") as logs:
+            app.consume(max_messages=1, handle_signals=False)  # must not raise
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(consumer.commits, [])
+        self.assertEqual(consumer.seeks, [("orders", 0, 0)])
+        self.assertEqual(producer.produced, [])
+        self.assertTrue(any("NOT acknowledged" in m for m in logs.output))
 
     def test_no_warning_when_tiers_are_configured(self):
         kafka = _tier_transport(FakeProducer())

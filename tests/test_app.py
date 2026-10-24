@@ -339,6 +339,60 @@ class AppTest(unittest.TestCase):
                 self.assertEqual(tr.rewound, [received])
                 self.assertEqual(tr.size("orders"), 0)
 
+    def test_a_failed_retry_release_on_a_non_rewinder_transport_is_left_unacknowledged(self) -> None:
+        # A failing ``redeliver`` (SQS ChangeMessageVisibility / Redis republish error) must neither
+        # ack the delivery (it would be lost) nor kill the loop; the broker redelivers it on its own.
+        class FailingRedeliver(InMemoryTransport):
+            def __init__(self) -> None:
+                super().__init__()
+                self.acked = 0
+                self.redeliveries = 0
+
+            def redeliver(self, message, body, delay) -> None:  # noqa: ANN001
+                self.redeliveries += 1
+                raise RuntimeError("release refused")
+
+            def ack(self, received) -> None:  # noqa: ANN001
+                self.acked += 1
+
+        body = EnvelopeCodec.encode(EnvelopeCodec.make("urn:babel:orders:created", {}, queue="orders"))
+        tr = FailingRedeliver()
+        app = BabelQueue(transport=tr, queue="orders", max_attempts=5, dead_letter=True)
+        app._rewind_pause = 0.0  # noqa: SLF001
+
+        @app.handler("urn:babel:orders:created")
+        def _boom(data, meta):  # noqa: ANN001
+            raise RuntimeError("handler failure")
+
+        with self.assertLogs("babelqueue.app", level="ERROR"):
+            app.dispatch(ReceivedMessage(body=body, queue="orders", route_urn=""))  # must not raise
+        self.assertEqual(tr.redeliveries, 1)
+        self.assertEqual(tr.acked, 0)
+        self.assertEqual(tr.size("orders"), 0)
+
+    def test_a_failed_unknown_urn_release_is_left_unacknowledged(self) -> None:
+        class FailingRedeliver(InMemoryTransport):
+            def __init__(self) -> None:
+                super().__init__()
+                self.acked = 0
+
+            def redeliver(self, message, body, delay) -> None:  # noqa: ANN001
+                raise RuntimeError("release refused")
+
+            def ack(self, received) -> None:  # noqa: ANN001
+                self.acked += 1
+
+        body = EnvelopeCodec.encode(EnvelopeCodec.make("urn:babel:unknown:thing", {}, queue="orders"))
+        tr = FailingRedeliver()
+        app = BabelQueue(
+            transport=tr, queue="orders", max_attempts=1, dead_letter=False,
+            on_unknown_urn=UnknownUrnStrategy.RELEASE,
+        )
+        app._rewind_pause = 0.0  # noqa: SLF001
+        with self.assertLogs("babelqueue.app", level="ERROR"):
+            app.dispatch(ReceivedMessage(body=body, queue="orders", route_urn=""))  # must not raise
+        self.assertEqual(tr.acked, 0)  # not dropped through the exhausted-retry path
+
     def test_version_gated_message_without_dead_letter_is_dropped_without_retry(self) -> None:
         route = "babelqueue:unsupported-schema-version:x"
         body = EnvelopeCodec.encode(EnvelopeCodec.make("urn:babel:orders:created", {}, queue="orders"))

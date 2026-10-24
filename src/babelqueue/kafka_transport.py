@@ -22,10 +22,13 @@ record's key unchanged (``ReceivedMessage.key``; null stays null, empty stays em
 synthesised). A poison record (§6.5: a value that is not valid UTF-8, not valid JSON, not a JSON
 object other than ``null``, or a member of the wrong type, member names matched exactly as spelled: what the Go
 reference's typed ``Decode`` rejects, see :mod:`babelqueue._envelope_shape`) is handed to the runtime under a
-reserved route and dead-lettered directly, never retried, *wrapped* like the Go reference: a body that
-is one JSON object keeps its keys, anything else is carried as ``{"raw": "<body>"}``, and a
-``dead_letter`` block with ``reason: "poison"`` is added (the key is preserved; with the DLQ off it is
-dropped and committed; ``on_unknown_urn``, ``DELETE`` included, has no say). The record is handed over raw under a
+reserved route. With the DLQ on (``dead_letter`` or ``on_unknown_urn=DEAD_LETTER``) it is dead-lettered
+directly, never retried, *wrapped* like the Go reference: a body that is one JSON object keeps its keys,
+anything else is carried as ``{"raw": "<body>"}``, and a ``dead_letter`` block with ``reason: "poison"`` is
+added (the key is preserved; the DLQ is the configured one or ``<queue>.dlq``, which must exist). With
+the DLQ off it is NOT written to a DLQ (Go ``routePoison``): ``on_unknown_urn=DELETE`` drops it, any other
+strategy takes the bounded FAIL path (retried through the tiers up to ``max_attempts``, then dropped).
+The record is handed over raw under a
 ``PoisonRoute`` and wrapped by ``publish_settle`` only when it is written to a queue other than the one
 it was read from, so a ``redrive`` restore into the DLQ it popped it from (any DLQ name) is byte for
 byte and never double-wraps. The version gate (§6.7) still
@@ -82,16 +85,15 @@ _LONE_SURROGATE = re.compile("[\ud800-\udbff\udc00-\udc7f\udd00-\udfff]")
 UNSUPPORTED_SCHEMA_ROUTE_PREFIX = "babelqueue:unsupported-schema-version:"
 
 #: Reserved ``route_urn`` of a record whose value is not valid UTF-8. Like a version-gated record it
-#: can never gain a handler and must not be retried (a retry would re-publish the same bytes), so it
-#: reuses the gated route: the runtime dead-letters it directly, byte-identical, and drops it when no
-#: DLQ is configured. The body carries the raw bytes as ``surrogateescape`` text, which
+#: can never gain a handler; it takes the poison path of :data:`POISON_ROUTE` (``PoisonRoute``). The body carries the raw bytes as ``surrogateescape`` text, which
 #: :meth:`KafkaTransport.publish` encodes back to the exact original bytes.
 NON_UTF8_ROUTE = UNSUPPORTED_SCHEMA_ROUTE_PREFIX + "non-utf8-payload"
 
 #: Reserved ``route_urn`` of a record whose value is not a decodable BabelQueue body (invalid JSON, a
-#: non-object root, a member of the wrong type). Like the gated routes it is dead-lettered directly and
-#: never retried, but the DLQ record is the *wrapped* poison body built by
-#: :meth:`KafkaTransport._poison_body` (``dead_letter.reason == "poison"``), not the raw bytes.
+#: non-object root, a member of the wrong type). With the DLQ on it is dead-lettered directly and never
+#: retried, and the DLQ record is the *wrapped* poison body built by
+#: :meth:`KafkaTransport._poison_body` (``dead_letter.reason == "poison"``), not the raw bytes. With
+#: the DLQ off the runtime drops it (DELETE) or retries it up to ``max_attempts`` (Go ``routePoison``).
 POISON_ROUTE = UNSUPPORTED_SCHEMA_ROUTE_PREFIX + "poison"
 
 
@@ -566,7 +568,8 @@ class KafkaTransport(Transport):
         body ``attempts`` kept in sync. The ``delay`` argument is ignored: Kafka does not apply
         the runtime's ``retry_backoff`` (ADR-0034 §9). The consumed record's key is written back
         byte for byte, the write is confirmed, and only then is the original record acknowledged.
-        With no tiers configured this raises :class:`BabelQueueError` and produces nothing."""
+        With no tiers configured this raises :class:`BabelQueueError` and produces nothing (the
+        runtime logs it, leaves the record uncommitted, rewinds to it and keeps consuming)."""
         if not self._retry_tiers_ms:
             raise BabelQueueError(
                 "Kafka retry needs retry tiers: pass retry_tiers_ms (e.g. DEFAULT_RETRY_TIERS_MS)."
@@ -712,12 +715,12 @@ class KafkaTransport(Transport):
             except Exception as exc:  # noqa: BLE001 - any decode failure is poison, never a wedged partition
                 cause = "the body could not be decoded (%s)" % type(exc).__name__
         if cause is not None:
-            # §6.5 poison: there is no envelope to retry or hand to a handler, so the record is handed
-            # over, raw, under a reserved route and dead-lettered directly (never retried; dropped when
-            # no DLQ is configured). The route carries what ``publish_settle`` needs to wrap the DLQ
-            # body like the Go reference (``dead_letter.reason == "poison"``, the original key); a
+            # §6.5 poison: there is no envelope to hand to a handler, so the record is handed over, raw,
+            # under a reserved route; the runtime dead-letters it directly when the DLQ is on, and
+            # otherwise drops it (DELETE) or retries it through the bounded FAIL path. The route
+            # carries what ``publish_settle`` needs to wrap the DLQ body like the Go reference (``dead_letter.reason == "poison"``, the original key); a
             # restore to the queue the record was read from (``redrive``) stays byte for byte.
-            _logger.warning("Kafka record on %r is poison (%s); dead-lettering it.", queue, cause)
+            _logger.warning("Kafka record on %r is poison (%s); settling it per the DLQ / on_unknown_urn configuration.", queue, cause)
             base = NON_UTF8_ROUTE if non_utf8 else POISON_ROUTE
             received = ReceivedMessage(
                 body=payload,

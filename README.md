@@ -244,17 +244,25 @@ value and key byte for byte back to its work topic once the tier delay has elaps
 write, so delivery stays at-least-once. It holds every record it has accepted per partition (oldest
 first, a record never overtakes the one before it) and a failed write rewinds the partition to the
 failed record. Without `retry_tiers_ms`, `publish_delayed` and a retry
-raise `BabelQueueError` and nothing is produced. A worker started without tiers while
-`max_attempts` is above 1 logs a warning at start-up: the first handler failure stops that worker
-and leaves the record uncommitted (it is not lost, but it is not retried either) until tiers are
-configured. The re-inject delay is measured from the record
+raise `BabelQueueError` and nothing is produced. The worker does not stop on that error: it logs
+it, leaves the record uncommitted (the consumer seeks back to it and the loop pauses briefly, so
+the record is redelivered and never lost) and keeps consuming. A worker started without tiers
+while `max_attempts` is above 1 logs a warning at start-up: a failing handler cannot be retried
+(the record keeps failing in place) until tiers are configured. The re-inject delay is measured from the record
 timestamp: set `message.timestamp.type=LogAppendTime` on the `.retry.<n>` topics so that
 timestamp is the broker's, not a producer clock's.
 
 **Records without an identity are poison.** A Kafka record whose JSON object has neither a valid
-string `job` nor a valid string `urn` (ADR-0034 section 10) is dead-lettered as poison (wrapped with
-`dead_letter.reason: "poison"`, key preserved) and never retried; it is not routed by
-`on_unknown_urn`.
+string `job` nor a valid string `urn` (ADR-0034 section 10) is poison, not an unknown URN. With
+the DLQ on (`dead_letter` or `on_unknown_urn=DEAD_LETTER`) it is dead-lettered on its first delivery
+(wrapped with `dead_letter.reason: "poison"`, key preserved) and never retried: the record is
+written to `<topic>.dlq` (which must exist) and its offset is committed once that write
+is confirmed; a failed write leaves it uncommitted and rewound. With the DLQ off nothing is written:
+`on_unknown_urn=DELETE` drops it, any other strategy retries it through the retry tiers up to
+`max_attempts` and then drops it (without tiers the record is redelivered in place, as above). On
+the Redis legacy (`<queue>:processing`) layout a body that Go's typed decode rejects (neither a JSON
+object nor `null`, or wrong member types) is dead-lettered raw on its first
+delivery and removed from `:processing`.
 
 ### Sharing a Redis queue with Laravel
 

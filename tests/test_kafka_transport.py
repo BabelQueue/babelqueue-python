@@ -540,13 +540,15 @@ class KafkaRestartRedeliveryTest(unittest.TestCase):
             if len(seen) == 1:
                 raise RuntimeError("handler failure")
 
-        # The retry copy cannot be published: the failure escapes and the loop dies.
-        with self.assertRaises(RuntimeError):
+        # The retry copy cannot be published: the failure is logged, the record is left
+        # uncommitted and rewound, and the loop survives (Go ``leaveRepublishUnsettled`` parity).
+        with self.assertLogs("babelqueue", level="ERROR") as logs:
             app.consume(queue="orders", max_messages=1)
+        self.assertIn("NOT acknowledged", logs.output[0])
         self.assertEqual(consumer.commits, [])
         self.assertEqual(consumer.committed_offset, 0)
 
-        # The loop is restarted on the same consumer: record 0 comes back before record 1.
+        # The same loop keeps consuming: record 0 comes back before record 1.
         app.consume(queue="orders", max_messages=2)
         self.assertEqual(consumer.commits, [0, 1])
         self.assertEqual(len(seen), 3)  # record 0 handled twice, record 1 once
@@ -738,7 +740,7 @@ class KafkaDeliveryConfirmationTest(unittest.TestCase):
         producer = ReportingProducer(["error", "error"])
         app = self._app(producer, consumer)
         self._failing_handler(app)
-        with self.assertRaises(KafkaDeliveryError):
+        with self.assertLogs("babelqueue", level="ERROR"):
             app.consume(queue="orders", max_messages=1)  # leaves the record in flight
 
         app.publish("urn:babel:other", {"x": 1}, queue="other")  # must not raise
@@ -773,10 +775,11 @@ class KafkaDeliveryConfirmationTest(unittest.TestCase):
         app = self._app(producer, consumer)
         seen = self._failing_handler(app)
 
-        with self.assertRaises(KafkaDeliveryError):
-            app.consume(queue="orders", max_messages=1)
+        with self.assertLogs("babelqueue", level="ERROR"):
+            app.consume(queue="orders", max_messages=1)  # logged, rewound, the loop survives
         self.assertEqual(consumer.commits, [])
         self.assertEqual(consumer.committed_offset, 0)
+        self.assertEqual(consumer.seeks, [("orders", 0, 0)])
 
         app.consume(queue="orders", max_messages=1)  # the broker is back
         self.assertEqual(consumer.seeks, [("orders", 0, 0)])
@@ -789,9 +792,10 @@ class KafkaDeliveryConfirmationTest(unittest.TestCase):
         app = self._app(producer, consumer)
         self._failing_handler(app)
 
-        with self.assertRaises(KafkaDeliveryError):
+        with self.assertLogs("babelqueue", level="ERROR"):
             app.consume(queue="orders", max_messages=1)
         self.assertEqual(consumer.commits, [])
+        self.assertEqual(consumer.seeks, [("orders", 0, 0)])
 
     def test_envelope_dead_letter_delivery_error_does_not_commit(self):
         consumer = OffsetConsumer([OffsetMessage(body().encode("utf-8"), [], offset=0)])
@@ -891,14 +895,17 @@ class KafkaDeliveryConfirmationTest(unittest.TestCase):
             parsed["dead_letter"].pop("failed_at")  # a timestamp, set at each write
         self.assertEqual(first, second)  # the redelivered record is wrapped identically
 
-    def test_non_utf8_record_is_dropped_and_committed_without_a_dlq(self):
+    def test_non_utf8_record_without_a_dlq_takes_the_bounded_fail_path(self):
+        # Go ``routePoison``: with the DLQ off the poison record is NOT written to a DLQ; it is
+        # retried through the tiers (a bare ``{"attempts": 1}`` body) and the original is committed.
         consumer = OffsetConsumer([OffsetMessage(self.BAD, [], offset=0)])
         producer = ReportingProducer()
         app = self._app(producer, consumer, dead_letter=False)
 
         with self.assertLogs("babelqueue.kafka", level="WARNING"):
             app.consume(queue="orders", max_messages=1)
-        self.assertEqual(producer.produced, [])
+        self.assertEqual([m["topic"] for m in producer.produced], ["orders.retry.1"])
+        self.assertEqual(json.loads(producer.produced[0]["value"]), {"attempts": 1})
         self.assertEqual(consumer.commits, [0])
 
     def test_non_numeric_attempts_is_dead_lettered_wrapped_without_running_the_handler(self):
@@ -997,7 +1004,7 @@ class KafkaDeliveryConfirmationTest(unittest.TestCase):
         message = transport(ReportingProducer(), consumer).pop("orders")
         self.assertEqual(json.loads(message.body)["attempts"], 2)
 
-    def test_non_numeric_attempts_is_dropped_and_committed_without_a_dlq(self):
+    def test_non_numeric_attempts_without_a_dlq_takes_the_bounded_fail_path(self):
         bad = '{"job":"%s","attempts":"three"}' % URN
         consumer = OffsetConsumer([OffsetMessage(bad.encode("utf-8"), [], offset=0)])
         producer = ReportingProducer()
@@ -1006,7 +1013,7 @@ class KafkaDeliveryConfirmationTest(unittest.TestCase):
         with self.assertLogs("babelqueue.kafka", level="WARNING"):
             app.consume(queue="orders", max_messages=1)
         self.assertEqual(failing, [])
-        self.assertEqual(producer.produced, [])
+        self.assertEqual([m["topic"] for m in producer.produced], ["orders.retry.1"])
         self.assertEqual(consumer.commits, [0])
 
     def test_non_utf8_attempts_header_does_not_raise(self):
@@ -1566,10 +1573,10 @@ class KafkaPoisonWrapTest(unittest.TestCase):
                 json.loads(producer.produced[0]["value"].decode("utf-8"))
                 self.assertEqual(consumer.committed_offset, 1)
 
-    def test_poison_is_dead_lettered_whatever_the_unknown_urn_strategy(self):
-        # Poison never decoded into an envelope, so ``on_unknown_urn`` has no say: with a DLQ configured it
-        # is written wrapped (reason ``poison``) and committed under every strategy, DELETE included.
-        for strategy in ("fail", "delete", "dead_letter", "release"):
+    def test_poison_is_dead_lettered_under_every_strategy_but_delete_when_the_dlq_is_on(self):
+        # Poison never decoded into an envelope. With a DLQ configured it is written wrapped (reason
+        # ``poison``) and committed; DELETE is the one strategy that drops it (Go ``routePoison``).
+        for strategy in ("fail", "dead_letter", "release"):
             for value in (b"not json at all", b"\xff\xfe bad \x80"):
                 with self.subTest(strategy=strategy, value=value):
                     produced = self._poison(value, key=b"k", on_unknown_urn=strategy)
@@ -1577,10 +1584,82 @@ class KafkaPoisonWrapTest(unittest.TestCase):
                     self.assertEqual(produced[0]["key"], b"k")
                     poison_dlq(self, produced[0]["value"])
 
-    def test_poison_is_still_dropped_without_a_dlq_under_every_strategy(self):
-        for strategy in ("fail", "delete", "release"):
+    def test_delete_drops_poison_with_or_without_a_dlq(self):
+        for dlq_on in (True, False):
+            for value in (b"not json at all", b"\xff\xfe bad \x80"):
+                with self.subTest(dlq_on=dlq_on, value=value):
+                    produced = self._poison(value, dead_letter=dlq_on, on_unknown_urn="delete")
+                    self.assertEqual(produced, [])  # committed (the helper asserts it), nothing written
+
+    def test_dead_letter_strategy_writes_poison_even_with_dead_letter_off(self):
+        produced = self._poison(b"nope", dead_letter=False, on_unknown_urn="dead_letter")
+        self.assertEqual([m["topic"] for m in produced], ["orders.dlq"])
+        poison_dlq(self, produced[0]["value"])
+
+    def test_poison_without_a_dlq_is_retried_through_the_tiers_not_dead_lettered(self):
+        # Go ``routePoison``: DLQ off + FAIL / RELEASE -> the bounded FAIL path, never a DLQ write.
+        for strategy in ("fail", "release"):
             with self.subTest(strategy=strategy):
-                self.assertEqual(self._poison(b"nope", dead_letter=False, on_unknown_urn=strategy), [])
+                produced = self._poison(b"nope", dead_letter=False, on_unknown_urn=strategy, max_attempts=3)
+                self.assertEqual([m["topic"] for m in produced], ["orders.retry.1"])
+                self.assertEqual(json.loads(produced[0]["value"]), {"attempts": 1})
+                self.assertEqual(header_map(produced[0]["headers"])["bq-attempts"], "1")
+
+    def test_the_retry_count_comes_from_the_record_and_ends_in_a_drop(self):
+        # The poison record carries ``bq-attempts``: the count advances on every redelivery and is
+        # bounded by ``max_attempts``; the exhausted record is dropped (committed, nothing written).
+        retried = self._poison(
+            b'{"attempts":1}', headers=[("bq-attempts", b"1")], dead_letter=False, max_attempts=3
+        )
+        self.assertEqual(len(retried), 1)
+        self.assertTrue(retried[0]["topic"].startswith("orders.retry."))
+        self.assertEqual(json.loads(retried[0]["value"]), {"attempts": 2})
+        self.assertEqual(header_map(retried[0]["headers"])["bq-attempts"], "2")
+        dropped = self._poison(
+            b'{"attempts":2}', headers=[("bq-attempts", b"2")], dead_letter=False, max_attempts=3
+        )
+        self.assertEqual(dropped, [])
+
+    def test_poison_redelivered_through_a_tier_is_still_poison_and_bounded(self):
+        # The retry body ({"attempts": N}) names no URN, so it comes back as poison: feed each retry
+        # record back in and prove the chain ends after max_attempts without any ``.dlq`` write.
+        value, headers, topics = b"nope", [], []
+        for _ in range(6):
+            produced = self._poison(value, headers=headers, dead_letter=False, max_attempts=3)
+            if not produced:
+                break
+            topics.append(produced[0]["topic"])
+            value = produced[0]["value"]
+            headers = [("bq-attempts", header_map(produced[0]["headers"])["bq-attempts"].encode())]
+        self.assertEqual(topics, ["orders.retry.1", "orders.retry.2"])  # then dropped; never ``.dlq``
+
+    def test_a_failed_poison_dlq_write_is_rewound_and_the_loop_survives(self):
+        # The DLQ write fails (e.g. the topic does not exist): the record stays uncommitted, is
+        # rewound and the worker keeps going (not retried, not dropped).
+        consumer = OffsetConsumer([OffsetMessage(b"nope", [], offset=0)])
+        producer = ReportingProducer(["error", "error"])
+        app = BabelQueue(transport=transport(producer, consumer), dead_letter=True, max_attempts=3)
+        app._rewind_pause = 0.0  # noqa: SLF001
+        with self.assertLogs("babelqueue", level="WARNING"):
+            app.consume(queue="orders", max_messages=1)  # must not raise
+        self.assertEqual(consumer.commits, [])
+        self.assertEqual(len(consumer.seeks), 1)
+        self.assertEqual([m["topic"] for m in producer.produced], ["orders.dlq"])
+
+    def test_a_tier_less_transport_releasing_an_unknown_urn_rewinds_instead_of_acking(self):
+        # ``on_unknown_urn=RELEASE`` re-parks the delivery; with no retry tiers ``redeliver`` raises.
+        # The record must be left unsettled (rewound), never acked/committed, and the worker must
+        # survive (review MINOR 1).
+        consumer = OffsetConsumer([OffsetMessage(body().encode("utf-8"), [], offset=0)])
+        producer = ReportingProducer()
+        t = KafkaTransport(producer=producer, consumer_factory=lambda _q: consumer)  # no tiers
+        app = BabelQueue(transport=t, dead_letter=False, on_unknown_urn="release", max_attempts=1)
+        app._rewind_pause = 0.0  # noqa: SLF001
+        with self.assertLogs("babelqueue", level="WARNING"):
+            app.consume(queue="orders", max_messages=1)  # must not raise
+        self.assertEqual(consumer.commits, [])
+        self.assertEqual(len(consumer.seeks), 1)
+        self.assertEqual(producer.produced, [])
 
     def test_a_pathologically_nested_body_is_poison_never_a_wedged_partition(self):
         # Deeper than the interpreter's recursion limit: ``json`` raises RecursionError, which must be
@@ -1662,8 +1741,9 @@ class KafkaPoisonWrapTest(unittest.TestCase):
         self.assertEqual(dead["raw"], "�� bad �")
         self.assertEqual(produced[0]["key"], b"k")
 
-    def test_poison_is_dropped_and_committed_without_a_dlq(self):
-        self.assertEqual(self._poison(b"nope", dead_letter=False), [])
+    def test_poison_without_a_dlq_is_committed_and_writes_no_dlq_record(self):
+        produced = self._poison(b"nope", dead_letter=False)
+        self.assertNotIn("orders.dlq", [m["topic"] for m in produced])
 
     def test_a_valid_object_without_a_urn_is_poison_on_kafka(self):
         # ADR-0032 section 6 / conformance ``kafka_poison``: a readable body that names no valid

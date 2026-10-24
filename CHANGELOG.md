@@ -27,9 +27,32 @@ Implements ADR-0033 (Redis) and ADR-0034 (Kafka tiers, backoff, poison). The env
   each reserve moves lapsed reservations back to the end of `<queue>`. Ack, release and dead-letter
   are gated on their own reservation, so a late ack never touches a newer one. The legacy mode
   remains the default and the `<queue>:processing` key name is unchanged.
-- **Kafka: a record without a valid `job` / `urn` is poison** (ADR-0034 section 10): dead-lettered
-  wrapped with `dead_letter.reason: "poison"` and never retried, instead of being routed as an
-  unknown URN.
+- **Kafka without retry tiers: a failing handler no longer stops the worker** (Go
+  `leaveRepublishUnsettled` parity). The transport still raises `BabelQueueError` (section 6.5), but
+  the runtime now catches a failed retry release, logs it (`babelqueue.app`, ERROR, "NOT
+  acknowledged"), leaves the record unsettled (no commit; a rewind-capable transport seeks back and
+  the loop pauses `_rewind_pause` first) and keeps consuming. Previously the error escaped
+  `consume()`. Applies to any transport whose retry release fails.
+- **Kafka poison follows Go `routePoison` when no DLQ is configured.** With the DLQ on
+  (`dead_letter=True` or `on_unknown_urn=DEAD_LETTER`) the wrapped record is written to
+  `<topic>.dlq` (`dead_letter.reason: "poison"`) and then committed. With the DLQ off the poison
+  record is **not** written anywhere: `on_unknown_urn=DELETE` drops it, every other strategy takes
+  the bounded FAIL path (retried through the retry tiers up to `max_attempts` with a bare
+  `{"attempts": N}` body, then dropped; without tiers the record is redelivered in place).
+  Operational note: when the DLQ is on, `<topic>.dlq` must exist; a failed write leaves the record
+  uncommitted and rewound (it is never dropped).
+- **Unknown-URN `RELEASE` and the retry release leave the delivery unsettled on failure** (Go
+  `leaveRepublishUnsettled`): a failed re-publish of an unknown-URN message is no longer counted as
+  a handler failure and can no longer lead to the record being acked and lost.
+- **Redis, legacy `:processing` layout: an undecodable body is dead-lettered on its first
+  delivery.** A body Go's typed `Decode` rejects (neither a JSON object nor `null`, or wrong member types such as
+  a string `attempts`/`meta`; same criterion as Kafka poison) is written verbatim to `<queue>.dlq`
+  through the gated settle script and removed from `:processing`, in every configuration, instead of
+  being retried until `max_attempts`. A valid JSON object without an identity keeps the existing
+  bounded path.
+- **Kafka: a record without a valid `job` / `urn` is poison** (ADR-0034 section 10), not an
+  unknown URN: with the DLQ on it is dead-lettered wrapped with `dead_letter.reason: "poison"` and
+  never retried; with the DLQ off it follows Go `routePoison` (see above).
 
 - **Redis, Laravel-compatible layout: the reserve script no longer aborts on a body that decodes
   but cannot be re-encoded** (`cjson.encode` of `inf`/`NaN`, e.g. `1e400`, raised after the `LPOP`
@@ -45,8 +68,8 @@ Implements ADR-0033 (Redis) and ADR-0034 (Kafka tiers, backoff, poison). The env
   logged** (`babelqueue.app`, WARNING) instead of disappearing silently.
 - **Kafka `RetryReinjector` no longer loses records:** it kept one held record per partition, so a
   second record on the same partition overwrote the first. It now keeps all of them in order.
-- **A worker on a tier-less Kafka transport with `max_attempts` > 1 warns at start-up** that the
-  first handler failure stops the worker and leaves the record uncommitted.
+- **A worker on a tier-less Kafka transport with `max_attempts` > 1 warns at start-up** that a
+  failing handler cannot be retried: the record is left uncommitted and redelivered.
 - Internal: the legacy `:processing` settle script takes `[token, raw]` and builds the deadline
   member itself.
 
@@ -59,7 +82,8 @@ Implements ADR-0033 (Redis) and ADR-0034 (Kafka tiers, backoff, poison). The env
 - Kafka: `KafkaTransport(retry_tiers_ms=...)` with `DEFAULT_RETRY_TIERS_MS`, `retry_topic()` and
   the `babelqueue.kafka_retry.RetryReinjector` consumer that moves parked records from
   `<topic>.retry.<n>` back to the work topic (broker-bindings section 6.4). Opt-in: without tiers a
-  retry / `publish_delayed` raises `BabelQueueError`.
+  retry / `publish_delayed` raises `BabelQueueError` (the transport raises; the worker logs it and
+  leaves the record uncommitted, see Fixed).
 - Worker-side retry backoff: `BabelQueue(retry_backoff=, retry_backoff_multiplier=,
   retry_backoff_max=, retry_jitter=)` (ADR-0034 section 9); the defaults keep an immediate release.
 - Conformance runner covers the v1.6.0 sections (`redis_layout`, `redis_delay`, `retry_backoff`,
@@ -68,7 +92,8 @@ Implements ADR-0033 (Redis) and ADR-0034 (Kafka tiers, backoff, poison). The env
 ### Changed
 - **Kafka retries go to the retry tiers.** With `retry_tiers_ms` set a failed message is parked on
   `<queue>.retry.<n>` and needs a running `RetryReinjector`; the retry topics must exist. Without
-  tiers a retry now raises instead of republishing onto the work topic.
+  tiers a retry now raises from the transport instead of republishing onto the work topic; the
+  runtime logs it and redelivers the record rather than stopping the worker.
 
 ### Documentation
 - README: Redis layouts, the limit that the Laravel-compatible layout carries no out-of-band headers (ADR-0033 §5),
