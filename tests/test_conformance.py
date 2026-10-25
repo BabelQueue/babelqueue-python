@@ -101,6 +101,8 @@ _RUNNERS: Dict[str, List[Tuple[str, str, str]]] = {
     "redis_delay": [("test_behaviour_conformance", "RedisDelayConformanceTest", "test_redis_delay_cases")],
     "kafka_poison": [("test_behaviour_conformance", "KafkaPoisonConformanceTest", "test_kafka_poison_cases")],
     "poison_dlq": [("test_behaviour_conformance", "PoisonDlqConformanceTest", "test_poison_dlq_cases")],
+    "identity_verdict": [("test_behaviour_conformance", "IdentityVerdictConformanceTest", "test_identity_verdict_cases")],
+    "pulsar_exhaustion": [("test_behaviour_conformance", "PulsarExhaustionConformanceTest", "test_pulsar_exhaustion_cases")],
     # The broker bindings are evidenced per runner, not per case (every method must pass).
     "sqs": [("test_sqs_conformance", "SqsConformanceTest", m) for m in (
         "test_attribute_projection", "test_attempts_reconciliation", "test_schema_version_gate")],

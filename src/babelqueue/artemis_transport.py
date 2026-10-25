@@ -233,7 +233,8 @@ class ArtemisTransport(Transport):
     def _payload(message: Any) -> str:
         body = getattr(message, "body", None)
         if isinstance(body, bytes):
-            return body.decode("utf-8")
+            # Lossless: see ``PulsarTransport._payload`` (ADR-0035 poison record, no crash).
+            return body.decode("utf-8", "surrogateescape")
         return str(body) if body is not None else ""
 
     # -- Transport ----------------------------------------------------------

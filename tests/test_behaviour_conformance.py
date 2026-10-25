@@ -29,6 +29,8 @@ from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple
 import redis_backend
 from test_kafka_transport import FakeConsumer, FakeProducer, OffsetConsumer, OffsetMessage, ReportingProducer
 from test_kafka_transport import transport as poison_transport
+from test_pulsar_transport import FakeMessage as PulsarFakeMessage
+from test_pulsar_transport import Timeout as PulsarTimeout
 from test_sqs_transport import FakeSQS
 
 from babelqueue import BabelQueue, BabelQueueError, EnvelopeCodec
@@ -40,6 +42,7 @@ from babelqueue.idempotency import wrap as idempotency_wrap
 from babelqueue._poison_record import build_poison_record
 from babelqueue.kafka_transport import DEFAULT_RETRY_TIERS_MS, POISON_ROUTE, KafkaTransport, retry_topic
 from babelqueue.pika_transport import PikaTransport
+from babelqueue.pulsar_transport import PulsarTransport
 from babelqueue.redis_transport import RedisTransport, _LegacyHandle
 from babelqueue.schema import validate_schema
 from babelqueue.sqs_transport import SqsTransport
@@ -1296,6 +1299,145 @@ def _eval_kafka_poison(case: Mapping[str, Any]) -> None:
         _ensure(message.body == body, "a poison record is handed over raw")
 
 
+def _eval_identity_verdict(case: Mapping[str, Any]) -> None:
+    """``identity_verdict``: the core decoder's verdict outside Kafka (ADR-0036 decision 4), then
+    the fate on a transport that does not classify poison itself (the memory transport): a
+    ``poison`` body never reaches a handler and is dead-lettered as the ADR-0035 record with
+    ``reason: "poison"`` and the original body preserved; an ``ok`` body reaches its handler."""
+    body = case["body"]
+    verdict = "ok" if EnvelopeCodec.poison_cause(body) is None else "poison"
+    _ensure(verdict == case["expect"], f"verdict: {verdict!r} != {case['expect']!r}")
+
+    calls: List[Any] = []
+    app = BabelQueue("memory://", queue="orders", dead_letter=True, max_attempts=3)
+    if verdict == "ok":
+        urn = EnvelopeCodec.urn(EnvelopeCodec.decode(body))  # must not raise
+        _ensure(urn != "", "an ok body resolves an identity")
+        app.register(urn, lambda data, meta: calls.append(urn))
+    else:
+        app.register("urn:babel:orders:created", lambda data, meta: calls.append("called"))
+    app.transport.publish("orders", body)
+    app.consume("orders", max_messages=1, timeout=0.01, handle_signals=False)
+
+    if verdict == "ok":
+        _ensure(len(calls) == 1, "an ok body must reach its handler once")
+        _ensure(app.transport.size("orders.dlq") == 0, "an ok body is not dead-lettered")
+        return
+    _ensure(calls == [], "a poison body must never reach a handler")
+    _ensure(app.transport.size("orders") == 0, "a poison body must not be retried (dead-lettering is on)")
+    _ensure(app.transport.size("orders.dlq") == 1, "a poison body must be dead-lettered once")
+    record_text = app.transport._queues["orders.dlq"][0]  # noqa: SLF001
+    record = json.loads(record_text)
+    block = record["dead_letter"]
+    _ensure(block["reason"] == "poison", f"reason: {block['reason']!r} is not 'poison'")
+    _ensure(block["original_queue"] == "orders", "original_queue")
+    if "raw" in record and "raw_encoding" not in record:
+        _ensure(record["raw"] == body, "the wrapper must carry the original body")
+    else:  # spliced: every original character is kept, only a dead_letter member is appended
+        trimmed = body.strip(" \t\r\n")
+        _ensure(record_text.startswith(trimmed[:-1]), "the spliced record must keep the original body")
+
+
+class _TopicProducer:
+    def __init__(self, sent: List[Tuple[str, str, Any]], topic: str) -> None:
+        self._sent, self._topic = sent, topic
+
+    def send(self, content: Any, properties: Any = None) -> None:
+        text = content.decode("utf-8") if isinstance(content, (bytes, bytearray)) else str(content)
+        self._sent.append((self._topic, text, properties))
+
+
+class _OnceConsumer:
+    def __init__(self, message: Any) -> None:
+        self._messages = [message]
+        self.acked: List[Any] = []
+
+    def receive(self, timeout_millis: Any = None) -> Any:
+        if not self._messages:
+            raise PulsarTimeout()
+        return self._messages.pop(0)
+
+    def acknowledge(self, message: Any) -> None:
+        self.acked.append(message)
+
+
+class _PulsarClient:
+    def __init__(self, consumer: _OnceConsumer) -> None:
+        self.consumer = consumer
+        self.sent: List[Tuple[str, str, Any]] = []
+
+    def create_producer(self, topic: str) -> _TopicProducer:
+        return _TopicProducer(self.sent, topic)
+
+    def subscribe(self, topic: str, subscription: str, **kwargs: Any) -> _OnceConsumer:
+        return self.consumer
+
+
+def _eval_pulsar_exhaustion(case: Mapping[str, Any]) -> None:
+    """``pulsar_exhaustion``: the settle decision of ADR-0036 decisions 1 and 2, driven through the
+    real ``PulsarTransport`` (reconciliation) and runtime (the decision) over a duck-typed client.
+    Python has the ``on_unknown_urn`` option, so every row runs (none is skipped)."""
+    kind = case["kind"]
+    expect = case["expect"]
+    max_attempts = case.get("max_attempts", 3)
+    properties = {"bq-attempts": case["bq_attempts"]} if "bq_attempts" in case else None
+    if kind == "poison":
+        body = "not json"
+    else:
+        envelope = EnvelopeCodec.make("urn:babel:orders:created", {"k": 1}, queue="orders")
+        envelope["attempts"] = case["body_attempts"]
+        body = EnvelopeCodec.encode(envelope)
+    reconciled = case.get("body_attempts", 0)
+    if "bq_attempts" in case:
+        reconciled = int(case["bq_attempts"])
+    reconciled = max(reconciled, case["redelivery_count"])
+    counted = reconciled + 1
+
+    consumer = _OnceConsumer(PulsarFakeMessage(body, case["redelivery_count"], properties))
+    client = _PulsarClient(consumer)
+    app = BabelQueue(
+        transport=PulsarTransport("pulsar://localhost:6650", client=client),
+        queue="orders",
+        max_attempts=max_attempts,
+        dead_letter=case["dead_letter"],
+        on_unknown_urn=case.get("on_unknown_urn", "fail"),
+    )
+    calls: List[str] = []
+    if kind == "failed":
+        def fail(data: Any, meta: Any) -> None:
+            calls.append("called")
+            raise RuntimeError("boom")
+
+        app.register("urn:babel:orders:created", fail)
+    else:
+        app.register("urn:babel:other", lambda data, meta: calls.append("called"))
+    app.consume("orders", max_messages=1, timeout=0.01, handle_signals=False)
+
+    _ensure(calls == ([] if kind != "failed" else ["called"]), f"handler calls: {calls!r}")
+    topics = [topic for topic, _, _ in client.sent]
+    if topics == ["orders.dlq"]:
+        outcome = "dlq"
+    elif topics == ["orders"]:
+        outcome = "retry"
+    elif topics == []:
+        outcome = "drop"
+    else:
+        raise AssertionError(f"unexpected publishes: {topics!r}")
+    _ensure(outcome == expect["outcome"], f"outcome: {outcome!r} != {expect['outcome']!r}")
+    _ensure(len(consumer.acked) == 1, "the original is acknowledged exactly once")
+    if outcome == "retry":
+        retried = json.loads(client.sent[0][1])
+        _ensure(retried["attempts"] == counted, f"retry attempts {retried['attempts']!r} != {counted!r}")
+    if outcome == "dlq":
+        block = json.loads(client.sent[0][1])["dead_letter"]
+        _ensure(block["reason"] == expect["reason"], f"reason: {block['reason']!r} != {expect['reason']!r}")
+        if "dead_letter_attempts" in expect:
+            _ensure(
+                block["attempts"] == expect["dead_letter_attempts"],
+                f"dead_letter.attempts {block['attempts']!r} != {expect['dead_letter_attempts']!r}",
+            )
+
+
 def _top_level_names(text: str) -> List[str]:
     """Every top-level member name of the JSON object ``text`` (duplicates kept, last-wins not applied)."""
     names: List[List[str]] = []
@@ -1421,8 +1563,8 @@ class JobTypeConformanceTest(unittest.TestCase):
 
 
 class RunnerCaseIdTest(unittest.TestCase):
-    #: ``section -> number of case ids`` of the vendored conformance 1.6.0 manifest.
-    EXPECTED_COUNTS = {"trim": 35, "job_type": 11, "traceparent": 14, "delay": 9, "backoff": 29, "redis_layout": 59, "redis_delay": 8, "retry_backoff": 18, "kafka_poison": 92, "poison_dlq": 43, "idempotency": 7, "redis": 1, "rabbitmq": 1}
+    #: ``section -> number of case ids`` of the vendored conformance 1.7.0 manifest.
+    EXPECTED_COUNTS = {"identity_verdict": 97, "pulsar_exhaustion": 29, "trim": 35, "job_type": 11, "traceparent": 14, "delay": 9, "backoff": 29, "redis_layout": 59, "redis_delay": 8, "retry_backoff": 18, "kafka_poison": 92, "poison_dlq": 43, "idempotency": 7, "redis": 1, "rabbitmq": 1}
 
     def test_case_id_counts_match_the_manifest(self) -> None:
         for section, count in self.EXPECTED_COUNTS.items():
@@ -1451,7 +1593,7 @@ class RunnerCaseIdTest(unittest.TestCase):
         self.assertEqual(sum(len(c) for c in KNOWN_GAPS.values()), len(keys))
 
     def test_there_are_no_known_gaps(self) -> None:
-        # Every conformance 1.6.0 case is implemented (r1 Faz 08): the gap list stays empty, and a
+        # Every conformance 1.7.0 case is implemented (r1 Faz 08; conformance 1.7.0, post-R1 Faz 06): the gap list stays empty, and a
         # new entry is a deliberate, reviewed change to this test as well.
         self.assertEqual({}, KNOWN_GAPS)
 
@@ -1480,6 +1622,37 @@ class RetryBackoffConformanceTest(unittest.TestCase):
 class KafkaPoisonConformanceTest(unittest.TestCase):
     def test_kafka_poison_cases(self) -> None:
         _run_cases(self, "kafka_poison", _eval_kafka_poison)
+
+
+class IdentityVerdictConformanceTest(unittest.TestCase):
+    def test_identity_verdict_cases(self) -> None:
+        _run_cases(self, "identity_verdict", _eval_identity_verdict)
+
+    def test_the_first_cases_are_every_kafka_poison_case_with_no_identity_mapped_to_poison(self) -> None:
+        verdicts = [case for _, case in iter_cases(MANIFEST, "identity_verdict")]
+        kafka = [case for _, case in iter_cases(MANIFEST, "kafka_poison")]
+        self.assertGreaterEqual(len(verdicts), len(kafka))
+        for source, derived in zip(kafka, verdicts):
+            with self.subTest(case=source["name"]):
+                self.assertEqual(source["name"], derived["name"])
+                self.assertEqual(source["body"], derived["body"])
+                self.assertEqual("poison" if source["expect"] == "no_identity" else source["expect"], derived["expect"])
+
+    def test_the_kafka_verdict_agrees_with_the_core_verdict(self) -> None:
+        for case_id, case in iter_cases(MANIFEST, "kafka_poison"):
+            with self.subTest(case=case_id):
+                core = "ok" if EnvelopeCodec.poison_cause(case["body"]) is None else "poison"
+                self.assertEqual("poison" if case["expect"] != "ok" else "ok", core)
+
+
+class PulsarExhaustionConformanceTest(unittest.TestCase):
+    def test_pulsar_exhaustion_cases(self) -> None:
+        _run_cases(self, "pulsar_exhaustion", _eval_pulsar_exhaustion)
+
+    def test_the_strategy_rows_are_not_skipped(self) -> None:
+        # Python has the on_unknown_urn option: every row runs (a skip would be a pass by omission).
+        rows = [c for _, c in iter_cases(MANIFEST, "pulsar_exhaustion") if "on_unknown_urn" in c]
+        self.assertEqual(10, len(rows))
 
 
 class PoisonDlqConformanceTest(unittest.TestCase):

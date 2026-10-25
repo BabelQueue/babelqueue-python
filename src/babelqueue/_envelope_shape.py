@@ -15,7 +15,7 @@ Go reference's ``babelqueue.Decode``, except that member names are case-sensitiv
   decoder read them) and every occurrence of a duplicated key is checked; any other member (a
   differently-cased name or a non-string ``urn`` alias included) is only checked for syntax.
   A non-string ``job`` is **not** poison either: the identity resolver ignores it (ADR-0032 section 6),
-  so the body is readable and simply carries no identity (conformance ``kafka_poison``, v1.6.0).
+  so the body is readable and simply carries no identity (conformance ``kafka_poison``, v1.6.0, and ``identity_verdict``, v1.7.0).
 
 A well-typed but non-conformant envelope is not poison: Go's consume path never calls ``Accepts``.
 """

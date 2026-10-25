@@ -259,9 +259,31 @@ the DLQ on (`dead_letter` or `on_unknown_urn=DEAD_LETTER`) it is dead-lettered o
 written to `<topic>.dlq` (which must exist) and its offset is committed once that write
 is confirmed; a failed write leaves it uncommitted and rewound. With the DLQ off nothing is written:
 `on_unknown_urn=DELETE` drops it, any other strategy retries it through the retry tiers up to
-`max_attempts` and then drops it (without tiers the record is redelivered in place, as above). On
-the Redis legacy (`<queue>:processing`) layout a body that Go's typed decode rejects (neither a JSON
-object nor `null`, or wrong member types) is dead-lettered raw on its first
+`max_attempts` and then drops it. **Without retry tiers** that bounded retry has no tier to use, so
+(with the DLQ off and `on_unknown_urn` not `DELETE`) the poison record is committed, dropped and logged
+instead of blocking the partition (section 6.5 degrade-to-delete, ADR-0036 decision 5); enable
+`dead_letter` to keep it in `<topic>.dlq`. A failing handler without tiers still cannot be retried, as above.
+
+### Poison messages on every other transport
+
+A message body that does not decode into an envelope (not a JSON object, malformed, a wrongly typed
+member, or bytes that are not valid UTF-8, even inside a JSON string) or that has neither a valid
+string `job` nor a valid string `urn` is **poison** on every transport (ADR-0036 decisions 2, 4 and
+6; conformance `identity_verdict`). It is never handed to a handler and never takes the
+unknown-URN strategies, which are for a valid envelope whose URN has no handler:
+
+- DLQ on (`dead_letter` or `on_unknown_urn=DEAD_LETTER`): written to `<queue>.dlq` at once, with no
+  retry, as the ADR-0035 record (`dead_letter.reason: "poison"`, the original body preserved,
+  base64 plus `raw_encoding` when it is not UTF-8), then acknowledged. A failed write leaves it
+  unacknowledged.
+- `on_unknown_urn=DELETE`: acknowledged and dropped (logged).
+- DLQ off: the bounded `FAIL` path (`RELEASE` is replaced by it): retried up to `max_attempts`, then
+  dropped and logged. The count comes from the broker where it has one (SQS receive count, Pulsar
+  `bq-attempts` / redelivery count), otherwise from a bare `{"attempts": n}` body the retry leaves.
+
+On Redis (both layouts) an identity-less body is dead-lettered as poison in **every** configuration,
+including `on_unknown_urn=DELETE` and dead-lettering off (broker-bindings section 1.1). On the legacy
+(`<queue>:processing`) layout a body that Go's typed decode rejects is dead-lettered raw on its first
 delivery and removed from `:processing`.
 
 ### Sharing a Redis queue with Laravel

@@ -9,6 +9,74 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+Implements ADR-0036 (post-R1 parity) decisions 2, 4, 5 and 6. A MINOR: every change is a
+consumer-side settle decision, so the envelope stays at `schema_version: 1`. The vendored
+conformance suite moves to v1.7.0 (new sections `identity_verdict` and `pulsar_exhaustion`, both
+passing; `conformance-known-gaps.json` stays empty).
+
+### Changed (behaviour)
+- **A body that does not decode, or has no identity, is poison on every transport (ADR-0036
+  decisions 4 and 6).** A JSON object that has neither a valid string `job` nor a valid string
+  `urn` (ADR-0032 section 6) used to be an *unknown URN*, and on SQS, AMQP, Pulsar, Azure Service
+  Bus, Artemis and the memory transport a body that did not decode was decoded leniently into an
+  empty envelope and retried as an unknown URN, finally dead-lettered as `reason: "unknown_urn"`
+  without the original body. Both are now **poison** and take the poison route of Go's
+  `routePoison`: they are never handed to a handler and never take the unknown-URN strategies
+  (those remain for a valid envelope whose URN has no handler). With the DLQ on (`dead_letter=True`
+  or `on_unknown_urn=DEAD_LETTER`) the message is written to the DLQ at once, with no retry, as the
+  ADR-0035 record (`dead_letter.reason: "poison"`, the original body preserved: a strict JSON
+  object spliced byte for byte, anything else as `raw`, base64 plus `raw_encoding` when it is not
+  valid UTF-8) and acknowledged after the write; `on_unknown_urn=DELETE` drops it (logged); with
+  the DLQ off `RELEASE` is replaced by the bounded `FAIL` path (re-published with `attempts + 1`
+  up to `max_attempts`, then dropped and logged). An operator who relied on a poison body being
+  retried through the unknown-URN strategy, or on a `reason: "unknown_urn"` record for it, sees the
+  new behaviour. The classification is `EnvelopeCodec.poison_cause(raw)` (new, pure): the typed
+  decode of the Go reference plus the identity rule; `decode` / `decode_lenient` are unchanged.
+- **Pulsar poison records carry `reason: "poison"`** (they were `unknown_urn`). The Pulsar
+  transport also reports the reconciled `bq-attempts` / redelivery count to the runtime
+  (`ReceivedMessage.native_attempts`, new), as does SQS (`ApproximateReceiveCount - 1`), so a poison
+  body, which cannot carry `attempts`, is still bounded by `max_attempts`.
+- **Redis: an identity-less body is dead-lettered unconditionally (ADR-0036 decision 4,
+  broker-bindings section 1.1 "Identity-less body").** In both layouts (legacy `:processing`
+  and Laravel-compatible zset) a body that decodes but names no identity (including a bare `null`,
+  which used to follow the bounded `FAIL` path) is handed over as transport poison: it is written
+  to `<queue>.dlq` as the ADR-0035 record with `reason: "poison"` in every configuration
+  (`on_unknown_urn=DELETE` and dead-lettering off change nothing), never handed to a handler and
+  never retried. Nothing else in the Redis transport changes.
+- **Kafka without retry tiers: a poison record no longer blocks the partition (ADR-0036 decision
+  5, broker-bindings section 6.5 degrade-to-delete).** With no `retry_tiers_ms`, dead-lettering off
+  and `on_unknown_urn` not `DELETE`, the bounded retry of a poison record (including an
+  identity-less body) needs a tier and raised, leaving the record uncommitted with `bq-attempts`
+  never advancing. It is now committed, dropped and logged, and the partition advances. A failing
+  handler and `RELEASE` of a valid envelope keep the section 6.5 rule (they still raise
+  `BabelQueueError` without tiers). The start-up warning for a tierless transport now says so; enable
+  `dead_letter` to keep such records in `<topic>.dlq`.
+- A message dropped after its retries are exhausted with no DLQ configured is now logged
+  (`babelqueue.app`, WARNING) instead of being dropped silently.
+
+- **Pulsar: a failed DLQ write or retry publish is negatively acknowledged (Go `Rewind`).**
+  `PulsarTransport` is now a `Rewinder` (`negative_acknowledge`), so the unsettled original is
+  redelivered by the broker instead of staying un-acknowledged for the life of the consumer. A
+  graceful-shutdown release of an in-flight Pulsar message is now a nack as well rather than a
+  re-publish (on a `Shared` subscription the native redelivery count advances; on `Exclusive` /
+  `Failover` it does not, which is harmless: `bq-attempts` carries the attempt limit).
+
+### Fixed
+- **Bytes that are not valid UTF-8 no longer crash the AMQP, Pulsar and Artemis consumers.** They
+  were decoded strictly in `pop`; they are now kept losslessly (`surrogateescape`). Invalid UTF-8
+  is poison wherever it sits, **also inside a JSON string** (`EnvelopeCodec.poison_cause`,
+  error-handling section 7): it is never handed to a handler and is dead-lettered as the ADR-0035
+  base64 record, like on Redis and Kafka.
+
+### Added
+- `EnvelopeCodec.poison_cause(raw, *, require_identity=True)`; `Transport.classifies_poison`
+  (Kafka and Redis classify poison themselves and opt out of the runtime's classification);
+  `ReceivedMessage.native_attempts`.
+- Conformance runners for `identity_verdict` (the core verdict on all 97 bodies, plus the fate on
+  the memory transport) and `pulsar_exhaustion` (all 29 rows, driven through the real
+  `PulsarTransport` and runtime over a duck-typed client), and per-transport poison tests.
+- `ci.yml` / `release.yml` pin conformance `1.7.0` (the `fetch.sh` SHA-256 is unchanged).
+
 ## [1.22.0] - 2026-10-24
 
 Implements ADR-0033 (Redis) and ADR-0034 (Kafka tiers, backoff, poison). The envelope stays at

@@ -115,7 +115,9 @@ class PikaTransport(Transport):
             if timeout and timeout > 0:
                 self._connection.sleep(timeout)
             return None
-        text = body.decode("utf-8") if isinstance(body, (bytes, bytearray)) else str(body)
+        # Lossless: bytes that are not UTF-8 stay recoverable (``surrogateescape``) so a poison
+        # body is dead-lettered as the ADR-0035 base64 record instead of crashing the consumer.
+        text = body.decode("utf-8", "surrogateescape") if isinstance(body, (bytes, bytearray)) else str(body)
         headers = _delivery_headers(props)
         return ReceivedMessage(body=text, queue=queue, handle=method.delivery_tag, headers=headers)
 

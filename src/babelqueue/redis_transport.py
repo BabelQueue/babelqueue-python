@@ -67,8 +67,7 @@ import time
 from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple, Union
 from urllib.parse import parse_qs, urlsplit
 
-from ._envelope_shape import envelope_violation
-from .codec import parse_envelope
+from .codec import EnvelopeCodec, parse_envelope
 from .exceptions import BabelQueueError
 from .transport import NON_NUMERIC_ATTEMPTS_ROUTE, ReceivedMessage, Transport
 
@@ -232,6 +231,10 @@ class _LegacyHandle(NamedTuple):
 
 
 class RedisTransport(Transport):
+    #: Classifies poison itself (undecodable, invalid UTF-8, identity-less): see ``_pop_legacy`` /
+    #: ``_zset_message``; the runtime does not classify the body a second time.
+    classifies_poison = True
+
     def __init__(
         self,
         url: str = "redis://localhost:6379/0",
@@ -441,18 +444,19 @@ class RedisTransport(Transport):
                 # The stored value may be a header frame (publish_with_headers) or a bare wire
                 # envelope. The handle keeps the raw stored value so the settle LREM matches.
                 unframed, headers = _unframe(text)
-                # A body the Go reference's typed ``Decode`` rejects (not valid JSON, not an object,
-                # or a member of the wrong type such as a string ``attempts``/``meta``) can never
-                # be decoded or retried: hand it over as poison so the runtime dead-letters the raw
-                # bytes on this first delivery instead of rebuilding and retrying it. An object
-                # without an identity is NOT poison (it keeps the bounded FAIL path), and neither is
-                # a bare ``null``. (``envelope_violation`` parses the body once; ``dispatch`` parses
-                # it again for the handler -- one extra parse of an already small body.)
-                # A stored value carrying invalid UTF-8 is poison even when it decodes (broker-bindings
-                # section 1.1): never delivered, retried or re-published, only dead-lettered.
+                # A body that does not decode into an envelope (not valid JSON, not an object, a
+                # member of the wrong type such as a string ``attempts``/``meta``: what the Go
+                # reference's typed ``Decode`` rejects) or that has neither a valid ``job`` nor a
+                # valid ``urn`` (ADR-0036 decision 4, broker-bindings section 1.1 "Identity-less
+                # body") can never be decoded, retried or routed: hand it over as poison so the
+                # runtime dead-letters the raw bytes on this first delivery, in every
+                # configuration, instead of rebuilding and retrying it. (``poison_cause`` parses the
+                # body once; ``dispatch`` parses it again for the handler -- one extra parse of an
+                # already small body.) A stored value carrying invalid UTF-8 is poison even when it
+                # decodes (section 1.1): never delivered, retried or re-published, only dead-lettered.
                 route = (
                     ""
-                    if not _has_invalid_utf8(text) and envelope_violation(unframed) is None
+                    if not _has_invalid_utf8(text) and EnvelopeCodec.poison_cause(unframed) is None
                     else NON_NUMERIC_ATTEMPTS_ROUTE
                 )
                 return ReceivedMessage(
@@ -515,7 +519,13 @@ class RedisTransport(Transport):
         # The handler gets the RAW job; the reserved member (attempts + 1, or the raw job for a
         # poison body) is only the ack handle, so a failure counts the attempt exactly once.
         # Invalid UTF-8 is poison even when the reserve script could decode and re-encode it.
-        route = NON_NUMERIC_ATTEMPTS_ROUTE if job == reserved or _has_invalid_utf8(job) else ""
+        # An identity-less body (ADR-0036 decision 4) is poison on this layout too, in every
+        # configuration; the reserved member (not the raw job) is what the dead-letter script removes.
+        route = (
+            NON_NUMERIC_ATTEMPTS_ROUTE
+            if job == reserved or _has_invalid_utf8(job) or EnvelopeCodec.poison_cause(job) is not None
+            else ""
+        )
         return ReceivedMessage(body=job, queue=queue, handle=reserved, route_urn=route)
 
     def _migrate(self, ready: str) -> None:

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "conformance_version": "1.6.0",
+  "conformance_version": "1.7.0",
   "sections": {
     "cases": {
       "scope": "core"
@@ -79,6 +79,12 @@
     },
     "poison_dlq": {
       "scope": "core"
+    },
+    "identity_verdict": {
+      "scope": "core"
+    },
+    "pulsar_exhaustion": {
+      "scope": "pulsar"
     }
   },
   "exceptions": [
@@ -5795,6 +5801,817 @@
           "record": {
             "raw": "{\"\\ud800\":1}"
           }
+        }
+      }
+    ]
+  },
+  "identity_verdict": {
+    "description": "Body classification outside Kafka (ADR-0036 decision 4; ADR-0032 section 6; error-handling.md section 3). Scope: `core`, because the decoder verdict is the same for every binding. For each case, feed `body` (a JSON string; it is the raw message body, so a case may hold invalid JSON, a BOM or duplicate keys) to the SDK core decoder and assert the verdict `expect`: `ok` - the body decodes into an envelope with a valid identity; `poison` - it does not (a decode error, or no valid identity). On a transport other than Kafka a `poison` body is never handed to a handler: it takes the poison route (broker-bindings.md section 5.5 and error-handling.md section 7; ADR-0035 record with `reason: poison`), not the unknown-URN strategies of error-handling.md section 3, which remain for a valid envelope whose URN has no handler. The case set starts with EVERY `kafka_poison` case (same names, bodies and order, the first 92 cases), with `no_identity` mapped to `poison` and `ok` / `poison` unchanged, so the two sections stay in step; the 5 cases after them are extra rows that pin the ADR-0036 decision 4 bodies `kafka_poison` does not hold (a blank or non-string `job` next to a valid `urn`, and a tab-only `job`) (a body with a valid identity but a wrongly typed known member is `poison` in both); a CI oracle derives the first 92 cases from `kafka_poison`, fails on any difference, and checks the extra rows with its own identity rule. The duplicate-key rule (the LAST value of a repeated top-level key wins) and the identity rule are those of `kafka_poison`: a `job` that is not a string is ignored; a blank (empty or whitespace-only) string `job` falls back to `urn`; a `urn` that is not a non-blank string is ignored; when neither is valid the body has no identity. Rows that pin the ADR-0036 decision 4 table (a `job` of `\"\"`, `\" \\t\"`, `null` or `{}` next to a valid `urn` is `ok`; see also the extra rows): a valid envelope (`full valid`) and a body whose only valid identity is `urn` (`urn alias string`), a blank `job` with a valid `urn` (`job blank with valid urn alias`), a non-string `job` with a valid `urn` (`job number with valid urn alias`) are `ok`; `{}` (`empty object`), a non-string `job` without `urn` (`job number`, `job null`), a non-string `urn` without `job` (`urn alias number`), non-object top-level values (`null literal`, `empty array`, `string`, `number`) and a non-JSON or empty body (`not json`, `empty`) are `poison`. The edge that a transport routes on an out-of-band identity property (Pulsar / Kafka `bq-job`) is outside this section.",
+    "cases": [
+      {
+        "name": "empty",
+        "body": "",
+        "expect": "poison"
+      },
+      {
+        "name": "whitespace only",
+        "body": "   ",
+        "expect": "poison"
+      },
+      {
+        "name": "not json",
+        "body": "not-json",
+        "expect": "poison"
+      },
+      {
+        "name": "truncated",
+        "body": "{\"job\":\"urn:a\"",
+        "expect": "poison"
+      },
+      {
+        "name": "empty array",
+        "body": "[]",
+        "expect": "poison"
+      },
+      {
+        "name": "array",
+        "body": "[1]",
+        "expect": "poison"
+      },
+      {
+        "name": "string",
+        "body": "\"str\"",
+        "expect": "poison"
+      },
+      {
+        "name": "number",
+        "body": "123",
+        "expect": "poison"
+      },
+      {
+        "name": "boolean",
+        "body": "true",
+        "expect": "poison"
+      },
+      {
+        "name": "null literal",
+        "body": "null",
+        "expect": "poison"
+      },
+      {
+        "name": "empty object",
+        "body": "{}",
+        "expect": "poison"
+      },
+      {
+        "name": "full valid",
+        "body": "{\"job\":\"urn:babel:orders:created\",\"trace_id\":\"t\",\"data\":{},\"meta\":{\"id\":\"i\",\"queue\":\"q\",\"lang\":\"php\",\"schema_version\":1,\"created_at\":1700000000000},\"attempts\":0}",
+        "expect": "ok"
+      },
+      {
+        "name": "job number",
+        "body": "{\"job\":5}",
+        "expect": "poison"
+      },
+      {
+        "name": "job null",
+        "body": "{\"job\":null}",
+        "expect": "poison"
+      },
+      {
+        "name": "urn alias number",
+        "body": "{\"urn\":5}",
+        "expect": "poison"
+      },
+      {
+        "name": "urn alias string",
+        "body": "{\"urn\":\"urn:x\"}",
+        "expect": "ok"
+      },
+      {
+        "name": "urn alias padded",
+        "body": "{\"urn\":\"  urn:x  \"}",
+        "expect": "ok"
+      },
+      {
+        "name": "trace_id number",
+        "body": "{\"trace_id\":7}",
+        "expect": "poison"
+      },
+      {
+        "name": "data array",
+        "body": "{\"data\":[]}",
+        "expect": "poison"
+      },
+      {
+        "name": "data string",
+        "body": "{\"data\":\"x\"}",
+        "expect": "poison"
+      },
+      {
+        "name": "data null",
+        "body": "{\"data\":null}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta string",
+        "body": "{\"meta\":\"x\"}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta array",
+        "body": "{\"meta\":[]}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta null",
+        "body": "{\"meta\":null}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta.id number",
+        "body": "{\"meta\":{\"id\":5}}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta.queue number",
+        "body": "{\"meta\":{\"queue\":5}}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta.lang boolean",
+        "body": "{\"meta\":{\"lang\":true}}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta.created_at string",
+        "body": "{\"meta\":{\"created_at\":\"2026\"}}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta.created_at fractional",
+        "body": "{\"meta\":{\"created_at\":1.5}}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta.created_at integer",
+        "body": "{\"meta\":{\"created_at\":1700000000000}}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta.created_at exponent",
+        "body": "{\"meta\":{\"created_at\":1e3}}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta.created_at decimal zero",
+        "body": "{\"meta\":{\"created_at\":1.0}}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta.created_at int64 overflow",
+        "body": "{\"meta\":{\"created_at\":9223372036854775808}}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta.created_at int64 max",
+        "body": "{\"meta\":{\"created_at\":9223372036854775807}}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta.created_at negative",
+        "body": "{\"meta\":{\"created_at\":-1}}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta.created_at negative zero",
+        "body": "{\"meta\":{\"created_at\":-0}}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta.schema_version string",
+        "body": "{\"meta\":{\"schema_version\":\"1\"}}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta.schema_version two",
+        "body": "{\"meta\":{\"schema_version\":2}}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta.schema_version decimal zero",
+        "body": "{\"meta\":{\"schema_version\":1.0}}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta.schema_version null",
+        "body": "{\"meta\":{\"schema_version\":null}}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta.schema_version boolean",
+        "body": "{\"meta\":{\"schema_version\":true}}",
+        "expect": "poison"
+      },
+      {
+        "name": "attempts fractional",
+        "body": "{\"attempts\":1.5}",
+        "expect": "poison"
+      },
+      {
+        "name": "attempts string",
+        "body": "{\"attempts\":\"3\"}",
+        "expect": "poison"
+      },
+      {
+        "name": "attempts integer",
+        "body": "{\"attempts\":2}",
+        "expect": "poison"
+      },
+      {
+        "name": "attempts exponent",
+        "body": "{\"attempts\":1e0}",
+        "expect": "poison"
+      },
+      {
+        "name": "attempts upper exponent",
+        "body": "{\"attempts\":1E2}",
+        "expect": "poison"
+      },
+      {
+        "name": "attempts negative zero",
+        "body": "{\"attempts\":-0}",
+        "expect": "poison"
+      },
+      {
+        "name": "attempts overflow",
+        "body": "{\"attempts\":9223372036854775808}",
+        "expect": "poison"
+      },
+      {
+        "name": "attempts null",
+        "body": "{\"attempts\":null}",
+        "expect": "poison"
+      },
+      {
+        "name": "dead_letter string",
+        "body": "{\"dead_letter\":\"x\"}",
+        "expect": "poison"
+      },
+      {
+        "name": "dead_letter null",
+        "body": "{\"dead_letter\":null}",
+        "expect": "poison"
+      },
+      {
+        "name": "dead_letter empty object",
+        "body": "{\"dead_letter\":{}}",
+        "expect": "poison"
+      },
+      {
+        "name": "dead_letter.attempts string",
+        "body": "{\"dead_letter\":{\"attempts\":\"3\"}}",
+        "expect": "poison"
+      },
+      {
+        "name": "dead_letter.reason number",
+        "body": "{\"dead_letter\":{\"reason\":5}}",
+        "expect": "poison"
+      },
+      {
+        "name": "dead_letter.error number",
+        "body": "{\"dead_letter\":{\"error\":5}}",
+        "expect": "poison"
+      },
+      {
+        "name": "dead_letter nullable strings",
+        "body": "{\"dead_letter\":{\"error\":null,\"exception\":null}}",
+        "expect": "poison"
+      },
+      {
+        "name": "dead_letter.failed_at string",
+        "body": "{\"dead_letter\":{\"failed_at\":\"x\"}}",
+        "expect": "poison"
+      },
+      {
+        "name": "dead_letter.failed_at fractional",
+        "body": "{\"dead_letter\":{\"failed_at\":1.5}}",
+        "expect": "poison"
+      },
+      {
+        "name": "dead_letter.original_queue array",
+        "body": "{\"dead_letter\":{\"original_queue\":[]}}",
+        "expect": "poison"
+      },
+      {
+        "name": "dead_letter.lang object",
+        "body": "{\"dead_letter\":{\"lang\":{}}}",
+        "expect": "poison"
+      },
+      {
+        "name": "dead_letter full",
+        "body": "{\"dead_letter\":{\"error\":\"e\",\"exception\":\"x\",\"failed_at\":1,\"original_queue\":\"q\",\"attempts\":1,\"lang\":\"go\",\"reason\":\"r\"}}",
+        "expect": "poison"
+      },
+      {
+        "name": "upper-case job key with number is an unknown member (names are case-sensitive)",
+        "body": "{\"JOB\":5}",
+        "expect": "poison"
+      },
+      {
+        "name": "mixed-case meta.id key with number is an unknown member (names are case-sensitive)",
+        "body": "{\"Meta\":{\"ID\":5}}",
+        "expect": "poison"
+      },
+      {
+        "name": "upper-case job key with string",
+        "body": "{\"JOB\":\"urn:x\"}",
+        "expect": "poison"
+      },
+      {
+        "name": "trailing garbage",
+        "body": "{\"job\":\"x\"} trailing",
+        "expect": "poison"
+      },
+      {
+        "name": "two objects",
+        "body": "{\"job\":\"x\"}{\"job\":\"y\"}",
+        "expect": "poison"
+      },
+      {
+        "name": "unknown keys",
+        "body": "{\"x\":1}",
+        "expect": "poison"
+      },
+      {
+        "name": "forbidden keys with odd types",
+        "body": "{\"timestamp\":\"x\",\"meta\":{\"max_retries\":\"x\",\"attempts\":\"y\",\"source\":5,\"ts\":\"z\"}}",
+        "expect": "poison"
+      },
+      {
+        "name": "nested lookalikes in data",
+        "body": "{\"data\":{\"a\":[1,2,{\"b\":null}],\"meta\":5,\"job\":5},\"extra\":{\"meta\":5}}",
+        "expect": "poison"
+      },
+      {
+        "name": "duplicate job string then number",
+        "body": "{\"job\":\"urn:x\",\"job\":5}",
+        "expect": "poison"
+      },
+      {
+        "name": "duplicate job number then string",
+        "body": "{\"job\":5,\"job\":\"urn:x\"}",
+        "expect": "ok"
+      },
+      {
+        "name": "byte order mark",
+        "body": "\ufeff{\"job\":\"x\"}",
+        "expect": "poison"
+      },
+      {
+        "name": "leading zero number",
+        "body": "{\"attempts\":01}",
+        "expect": "poison"
+      },
+      {
+        "name": "NaN literal",
+        "body": "{\"attempts\":NaN}",
+        "expect": "poison"
+      },
+      {
+        "name": "single quotes",
+        "body": "{'a':1}",
+        "expect": "poison"
+      },
+      {
+        "name": "meta duplicate-case key",
+        "body": "{\"meta\":{\"id\":\"a\",\"queue\":\"b\",\"lang\":\"c\",\"schema_version\":1,\"created_at\":1,\"ID\":\"dup\"}}",
+        "expect": "poison"
+      },
+      {
+        "name": "attempts huge exponent",
+        "body": "{\"attempts\":1e400}",
+        "expect": "poison"
+      },
+      {
+        "name": "data with huge number",
+        "body": "{\"data\":{\"n\":1e400}}",
+        "expect": "poison"
+      },
+      {
+        "name": "job number with valid urn alias",
+        "body": "{\"job\":5,\"urn\":\"urn:x\"}",
+        "expect": "ok"
+      },
+      {
+        "name": "job blank with valid urn alias",
+        "body": "{\"job\":\"  \",\"urn\":\"urn:x\"}",
+        "expect": "ok"
+      },
+      {
+        "name": "job valid with urn number",
+        "body": "{\"job\":\"urn:x\",\"urn\":5}",
+        "expect": "ok"
+      },
+      {
+        "name": "job blank without urn",
+        "body": "{\"job\":\"  \"}",
+        "expect": "poison"
+      },
+      {
+        "name": "job and urn both empty strings",
+        "body": "{\"job\":\"\",\"urn\":\"\"}",
+        "expect": "poison"
+      },
+      {
+        "name": "job and urn both arrays",
+        "body": "{\"job\":[],\"urn\":[]}",
+        "expect": "poison"
+      },
+      {
+        "name": "job object without urn",
+        "body": "{\"job\":{}}",
+        "expect": "poison"
+      },
+      {
+        "name": "identity with null data",
+        "body": "{\"job\":\"urn:x\",\"data\":null}",
+        "expect": "ok"
+      },
+      {
+        "name": "identity with null meta",
+        "body": "{\"job\":\"urn:x\",\"meta\":null}",
+        "expect": "ok"
+      },
+      {
+        "name": "identity with null attempts",
+        "body": "{\"job\":\"urn:x\",\"attempts\":null}",
+        "expect": "ok"
+      },
+      {
+        "name": "identity with null dead_letter",
+        "body": "{\"job\":\"urn:x\",\"dead_letter\":null}",
+        "expect": "ok"
+      },
+      {
+        "name": "identity with integer attempts",
+        "body": "{\"job\":\"urn:x\",\"attempts\":2}",
+        "expect": "ok"
+      },
+      {
+        "name": "identity with wrong typed attempts",
+        "body": "{\"job\":\"urn:x\",\"attempts\":\"3\"}",
+        "expect": "poison"
+      },
+      {
+        "name": "identity with wrong typed data",
+        "body": "{\"job\":\"urn:x\",\"data\":[]}",
+        "expect": "poison"
+      },
+      {
+        "name": "job empty string with valid urn",
+        "body": "{\"job\":\"\",\"urn\":\"urn:x\"}",
+        "expect": "ok"
+      },
+      {
+        "name": "job space and tab with valid urn",
+        "body": "{\"job\":\" \\t\",\"urn\":\"urn:x\"}",
+        "expect": "ok"
+      },
+      {
+        "name": "job null with valid urn",
+        "body": "{\"job\":null,\"urn\":\"urn:x\"}",
+        "expect": "ok"
+      },
+      {
+        "name": "job object with valid urn",
+        "body": "{\"job\":{},\"urn\":\"urn:x\"}",
+        "expect": "ok"
+      },
+      {
+        "name": "job space and tab without urn",
+        "body": "{\"job\":\" \\t\"}",
+        "expect": "poison"
+      }
+    ]
+  },
+  "pulsar_exhaustion": {
+    "description": "Pulsar max-attempts settle decision (ADR-0036 decisions 1 and 2, amends ADR-0014; broker-bindings.md section 5.5 \"Max attempts and poison\"). Scope: `pulsar`. A pure function, no broker: for each case compute the outcome the consumer takes for a delivery and assert `expect`. Case `{name, kind, body_attempts?, bq_attempts?, redelivery_count, max_attempts?, dead_letter, on_unknown_urn?, expect}`. `kind`: `failed` (the handler throws), `unknown_urn` (an unmapped URN with no hook; strategy `fail`), `poison` (the body does not decode into an envelope, including an object with no valid identity, see `identity_verdict`). Inputs: `body_attempts` is the envelope's top-level `attempts` (absent for `poison`, which has no decodable body: its input is `bq_attempts` and `redelivery_count` only); `bq_attempts` is the `bq-attempts` message property, a string (absent = not set); `redelivery_count` is the native Pulsar RedeliveryCount (0-based); `max_attempts` absent = the default 3 (the total number of deliveries, the first included; a value below 1 is a SHOULD-level configuration error and is not a case); `dead_letter` is a boolean (dead-lettering on or off) and `off` has two meanings: in the Go and Python runtimes it is the dead-letter SETTING only, the DLQ target stays writable and the `dead_letter` strategy still writes a record; in the PHP `Consume\\Dispatcher` \"on\" means a `DeadLetterPublisher` is configured, so `off` means NO publisher and nothing can be written; `on_unknown_urn` absent = `fail`. Derivation: `reconciled` = `bq_attempts` when present and valid, else `body_attempts`, then `max(reconciled, redelivery_count)` (pulsar.attempts_reconciliation); `counted = reconciled + 1`. Decision. `failed` and `unknown_urn` (strategy `fail`): `counted < max_attempts` is `retry`; otherwise dead-lettering on is `dlq` (`reason` `failed` or `unknown_urn`, `dead_letter_attempts = counted`) and off is `drop` (acknowledge and log). `poison`: `on_unknown_urn: delete` is `drop`; `on_unknown_urn: dead_letter` is `dlq` with `reason: poison` whatever `dead_letter` says (the strategy writes the record where a DLQ writer exists; see `outcome_no_writer` below); dead-lettering on (strategy `fail` or `release`) is `dlq` with `reason: poison` and NO retry (the ADR-0035 record, `dead_letter_attempts` is not compared); dead-lettering off takes the bounded `fail` path (`release` is replaced by it) - `counted < max_attempts` is `retry`, otherwise `drop`. `unknown_urn` with `on_unknown_urn: delete` is `drop`; with `dead_letter` it is a direct `dlq` with `reason: unknown_urn` whatever `dead_letter` says (`dead_letter_attempts` is not compared; see `outcome_no_writer` below). `expect.outcome_no_writer` (optional, `drop`): present only on a row whose result differs for an SDK without a DLQ writer (the PHP `Dispatcher` without a publisher: `on_unknown_urn: dead_letter` is acknowledged, dropped and logged; owner decision 2026-10-25, ADR-0036 decision 3). A runner for such an SDK asserts `expect.outcome_no_writer` instead of `expect.outcome`; every other runner asserts `expect.outcome` and ignores the field; when the field is absent both kinds of SDK assert `expect.outcome`. On Kafka the PHP `Dispatcher` rethrows instead of dropping (outside this Pulsar-scoped section). Rows with any `on_unknown_urn` value (they are the rows with that key) apply only to an SDK that has the strategy option (the Go and Python runtimes and the PHP `Consume\\Dispatcher`, ADR-0036 decision 3); a runner for the Java, .NET or Node consumer, which have no such option, skips them and reports them as `skip`, not `pass`. `unknown_urn` with `release` is not a case: on Pulsar the Go and Python runtimes release it immediately without counting (the `unknown_urn_release_delay` known gap of broker-bindings.md section 5.5). Not covered here (no broker-less test): the DLQ write itself, the acknowledgement after a successful write, the negative acknowledgement after a failed one, and the PHP queue name of ADR-0036 decision 3; each SDK covers them in its own tests.",
+    "cases": [
+      {
+        "name": "failed-reconciled-0-dlq-on-retries",
+        "kind": "failed",
+        "body_attempts": 0,
+        "redelivery_count": 0,
+        "dead_letter": true,
+        "expect": {
+          "outcome": "retry"
+        }
+      },
+      {
+        "name": "failed-reconciled-1-dlq-on-retries",
+        "kind": "failed",
+        "body_attempts": 1,
+        "redelivery_count": 0,
+        "dead_letter": true,
+        "expect": {
+          "outcome": "retry"
+        }
+      },
+      {
+        "name": "failed-reconciled-2-dlq-on-dead-letters",
+        "kind": "failed",
+        "body_attempts": 2,
+        "redelivery_count": 0,
+        "dead_letter": true,
+        "expect": {
+          "outcome": "dlq",
+          "reason": "failed",
+          "dead_letter_attempts": 3
+        }
+      },
+      {
+        "name": "failed-reconciled-2-dlq-off-drops",
+        "kind": "failed",
+        "body_attempts": 2,
+        "redelivery_count": 0,
+        "dead_letter": false,
+        "expect": {
+          "outcome": "drop"
+        }
+      },
+      {
+        "name": "failed-reconciled-7-dlq-on-counts-past-the-cap",
+        "kind": "failed",
+        "body_attempts": 7,
+        "redelivery_count": 0,
+        "dead_letter": true,
+        "expect": {
+          "outcome": "dlq",
+          "reason": "failed",
+          "dead_letter_attempts": 8
+        }
+      },
+      {
+        "name": "failed-max-1-dlq-on-first-delivery-dead-letters",
+        "kind": "failed",
+        "body_attempts": 0,
+        "redelivery_count": 0,
+        "max_attempts": 1,
+        "dead_letter": true,
+        "expect": {
+          "outcome": "dlq",
+          "reason": "failed",
+          "dead_letter_attempts": 1
+        }
+      },
+      {
+        "name": "failed-max-1-dlq-off-first-delivery-drops",
+        "kind": "failed",
+        "body_attempts": 0,
+        "redelivery_count": 0,
+        "max_attempts": 1,
+        "dead_letter": false,
+        "expect": {
+          "outcome": "drop"
+        }
+      },
+      {
+        "name": "failed-max-5-reconciled-3-dlq-off-retries",
+        "kind": "failed",
+        "body_attempts": 3,
+        "redelivery_count": 0,
+        "max_attempts": 5,
+        "dead_letter": false,
+        "expect": {
+          "outcome": "retry"
+        }
+      },
+      {
+        "name": "failed-max-5-reconciled-4-dlq-off-drops",
+        "kind": "failed",
+        "body_attempts": 4,
+        "redelivery_count": 0,
+        "max_attempts": 5,
+        "dead_letter": false,
+        "expect": {
+          "outcome": "drop"
+        }
+      },
+      {
+        "name": "unknown-urn-reconciled-1-dlq-on-retries",
+        "kind": "unknown_urn",
+        "body_attempts": 1,
+        "redelivery_count": 0,
+        "dead_letter": true,
+        "expect": {
+          "outcome": "retry"
+        }
+      },
+      {
+        "name": "unknown-urn-reconciled-2-dlq-on-dead-letters",
+        "kind": "unknown_urn",
+        "body_attempts": 2,
+        "redelivery_count": 0,
+        "dead_letter": true,
+        "expect": {
+          "outcome": "dlq",
+          "reason": "unknown_urn",
+          "dead_letter_attempts": 3
+        }
+      },
+      {
+        "name": "unknown-urn-reconciled-2-dlq-off-drops",
+        "kind": "unknown_urn",
+        "body_attempts": 2,
+        "redelivery_count": 0,
+        "dead_letter": false,
+        "expect": {
+          "outcome": "drop"
+        }
+      },
+      {
+        "name": "poison-reconciled-0-dlq-on-dead-letters-without-retry",
+        "kind": "poison",
+        "redelivery_count": 0,
+        "dead_letter": true,
+        "expect": {
+          "outcome": "dlq",
+          "reason": "poison"
+        }
+      },
+      {
+        "name": "poison-reconciled-0-dlq-off-retries",
+        "kind": "poison",
+        "redelivery_count": 0,
+        "dead_letter": false,
+        "expect": {
+          "outcome": "retry"
+        }
+      },
+      {
+        "name": "poison-reconciled-2-dlq-off-drops",
+        "kind": "poison",
+        "redelivery_count": 2,
+        "dead_letter": false,
+        "expect": {
+          "outcome": "drop"
+        }
+      },
+      {
+        "name": "poison-delete-dlq-on-drops",
+        "kind": "poison",
+        "redelivery_count": 0,
+        "dead_letter": true,
+        "on_unknown_urn": "delete",
+        "expect": {
+          "outcome": "drop"
+        }
+      },
+      {
+        "name": "poison-delete-dlq-off-drops",
+        "kind": "poison",
+        "redelivery_count": 0,
+        "dead_letter": false,
+        "on_unknown_urn": "delete",
+        "expect": {
+          "outcome": "drop"
+        }
+      },
+      {
+        "name": "poison-release-dlq-on-dead-letters-without-retry",
+        "kind": "poison",
+        "redelivery_count": 0,
+        "dead_letter": true,
+        "on_unknown_urn": "release",
+        "expect": {
+          "outcome": "dlq",
+          "reason": "poison"
+        }
+      },
+      {
+        "name": "poison-release-dlq-off-reconciled-0-takes-the-bounded-fail-path",
+        "kind": "poison",
+        "redelivery_count": 0,
+        "dead_letter": false,
+        "on_unknown_urn": "release",
+        "expect": {
+          "outcome": "retry"
+        }
+      },
+      {
+        "name": "poison-release-dlq-off-reconciled-2-drops-not-released-forever",
+        "kind": "poison",
+        "redelivery_count": 2,
+        "dead_letter": false,
+        "on_unknown_urn": "release",
+        "expect": {
+          "outcome": "drop"
+        }
+      },
+      {
+        "name": "poison-dead-letter-strategy-dlq-off-dead-letters",
+        "kind": "poison",
+        "redelivery_count": 0,
+        "dead_letter": false,
+        "on_unknown_urn": "dead_letter",
+        "expect": {
+          "outcome": "dlq",
+          "reason": "poison",
+          "outcome_no_writer": "drop"
+        }
+      },
+      {
+        "name": "unknown-urn-delete-dlq-on-drops",
+        "kind": "unknown_urn",
+        "body_attempts": 0,
+        "redelivery_count": 0,
+        "dead_letter": true,
+        "on_unknown_urn": "delete",
+        "expect": {
+          "outcome": "drop"
+        }
+      },
+      {
+        "name": "unknown-urn-dead-letter-strategy-dlq-off-dead-letters-directly",
+        "kind": "unknown_urn",
+        "body_attempts": 0,
+        "redelivery_count": 0,
+        "dead_letter": false,
+        "on_unknown_urn": "dead_letter",
+        "expect": {
+          "outcome": "dlq",
+          "reason": "unknown_urn",
+          "outcome_no_writer": "drop"
+        }
+      },
+      {
+        "name": "poison-dead-letter-strategy-dlq-on-dead-letters",
+        "kind": "poison",
+        "redelivery_count": 0,
+        "dead_letter": true,
+        "on_unknown_urn": "dead_letter",
+        "expect": {
+          "outcome": "dlq",
+          "reason": "poison"
+        }
+      },
+      {
+        "name": "unknown-urn-dead-letter-strategy-dlq-on-dead-letters-directly",
+        "kind": "unknown_urn",
+        "body_attempts": 0,
+        "redelivery_count": 0,
+        "dead_letter": true,
+        "on_unknown_urn": "dead_letter",
+        "expect": {
+          "outcome": "dlq",
+          "reason": "unknown_urn"
+        }
+      },
+      {
+        "name": "reconciliation-bq-attempts-string-over-body",
+        "kind": "failed",
+        "body_attempts": 0,
+        "bq_attempts": "2",
+        "redelivery_count": 0,
+        "dead_letter": true,
+        "expect": {
+          "outcome": "dlq",
+          "reason": "failed",
+          "dead_letter_attempts": 3
+        }
+      },
+      {
+        "name": "reconciliation-redelivery-count-floors-body",
+        "kind": "failed",
+        "body_attempts": 1,
+        "redelivery_count": 2,
+        "dead_letter": true,
+        "expect": {
+          "outcome": "dlq",
+          "reason": "failed",
+          "dead_letter_attempts": 3
+        }
+      },
+      {
+        "name": "reconciliation-bq-attempts-below-cap-retries",
+        "kind": "unknown_urn",
+        "body_attempts": 0,
+        "bq_attempts": "1",
+        "redelivery_count": 0,
+        "dead_letter": true,
+        "expect": {
+          "outcome": "retry"
+        }
+      },
+      {
+        "name": "reconciliation-poison-bq-attempts-dlq-off-drops",
+        "kind": "poison",
+        "bq_attempts": "2",
+        "redelivery_count": 0,
+        "dead_letter": false,
+        "expect": {
+          "outcome": "drop"
         }
       }
     ]
