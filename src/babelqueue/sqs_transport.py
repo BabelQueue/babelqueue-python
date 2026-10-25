@@ -25,6 +25,10 @@ contract keys win a collision, and the merge is bounded by SQS's 10-attribute li
 non-``bq-`` attributes back onto :attr:`~babelqueue.transport.ReceivedMessage.headers`. The frozen
 envelope is untouched (GR-1).
 
+A version-gated message (``bq-schema-version`` the consumer does not support) or a poison body is, with
+dead-lettering off, not deleted: :meth:`SqsTransport.settle_native` leaves it to SQS (visibility
+expiry, then the queue's ``RedrivePolicy``; ADR-0037).
+
 This implements §3 of the broker-bindings contract. The envelope is unchanged
 (``schema_version`` stays 1); SQS is purely additive.
 
@@ -364,6 +368,18 @@ class SqsTransport(Transport):
         self._sqs.delete_message(
             QueueUrl=self._resolve_url(message.queue), ReceiptHandle=message.handle
         )
+
+    def settle_native(self, message: ReceivedMessage, reason: str, description: str) -> None:
+        """Leave ``message`` to SQS itself (:class:`~babelqueue.transport.NativeSettler`, ADR-0037
+        decisions 1 and 2): a version-gated delivery or a poison body that the runtime may neither
+        process nor drop, with dead-lettering off. Deliberately does nothing on the wire: no
+        ``DeleteMessage``, no ``ChangeMessageVisibility``, no re-send. The message becomes visible
+        again when its visibility timeout lapses (the gate or the poison check rejects it again) and
+        the queue's ``RedrivePolicy`` moves it to the native DLQ once ``maxReceiveCount`` is reached;
+        without a ``RedrivePolicy`` it is redelivered until the retention period ends. The runtime
+        has already logged the event."""
+        if message.handle:
+            self._uncounted_handles.discard(message.handle)
 
     def redeliver(self, message: ReceivedMessage, body: str, delay: float) -> None:
         """Release ``message`` for redelivery after ``delay`` seconds (broker-bindings.md §3.5;

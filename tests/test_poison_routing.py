@@ -219,21 +219,46 @@ class SqsPoisonTest(unittest.TestCase):
                 self.fake.sent.clear()
                 self.fake.deleted.clear()
 
-    def test_the_native_receive_count_bounds_the_retry_when_the_dlq_is_off(self) -> None:
-        # SQS keeps the body and counts deliveries itself: the runtime reads the count off the
-        # delivery (an undecodable body cannot carry ``attempts``) and stops at max_attempts.
-        self.fake.seed(self.URL, "not json", 1)
-        app = BabelQueue(transport=self.transport, queue="orders", max_attempts=3)
-        app.register(URN, lambda data, meta: None)
-        deliveries = 0
+    def test_a_poison_message_is_left_to_sqs_when_the_dlq_is_off(self) -> None:
+        # ADR-0037 decision 2 (Go and Python): with the DLQ off and a strategy other than delete,
+        # a poison body (invalid JSON, identity-less object) is settled natively on the FIRST
+        # delivery: no DeleteMessage, no empty-envelope re-send, no ChangeMessageVisibility retry.
+        # Visibility expiry redelivers it and the queue's RedrivePolicy takes over.
+        for body in ("not json", '{"foo":1}'):
+            for strategy in (UnknownUrnStrategy.FAIL, UnknownUrnStrategy.RELEASE):
+                with self.subTest(body=body, strategy=strategy):
+                    fake = FakeSQS()
+                    transport = SqsTransport("sqs://", client=fake, queue_url_prefix="http://fake")
+                    fake.seed(self.URL, body, 1)
+                    app = BabelQueue(transport=transport, queue="orders", max_attempts=3,
+                                     on_unknown_urn=strategy)
+                    app.register(URN, lambda data, meta: None)
+                    with self.assertLogs("babelqueue.app", level="WARNING") as logs:
+                        app.consume("orders", max_messages=1, timeout=0, handle_signals=False)
+                    self.assertEqual([], fake.deleted)
+                    self.assertEqual([], fake.sent)
+                    self.assertEqual([], fake.visibility_changes)
+                    self.assertTrue(any("native mechanism" in line for line in logs.output))
+
+    def test_delete_still_deletes_and_the_dlq_on_record_is_unchanged(self) -> None:
+        fake = FakeSQS()
+        transport = SqsTransport("sqs://", client=fake, queue_url_prefix="http://fake")
+        fake.seed(self.URL, "not json", 1)
+        app = BabelQueue(transport=transport, queue="orders", max_attempts=3,
+                         on_unknown_urn=UnknownUrnStrategy.DELETE)
         with self.assertLogs("babelqueue.app", level="WARNING"):
-            while self.fake.visible.get(self.URL) and deliveries < 10:
-                app.consume("orders", max_messages=1, timeout=0, handle_signals=False)
-                deliveries += 1
-        self.assertEqual(3, deliveries)
-        self.assertEqual(2, len(self.fake.visibility_changes))  # retried twice, dropped the third time
-        self.assertEqual(1, len(self.fake.deleted))
-        self.assertEqual([], self.fake.sent)
+            app.consume("orders", max_messages=1, timeout=0, handle_signals=False)
+        self.assertEqual(1, len(fake.deleted))
+        self.assertEqual([], fake.sent)
+
+        fake = FakeSQS()
+        transport = SqsTransport("sqs://", client=fake, queue_url_prefix="http://fake")
+        fake.seed(self.URL, "not json", 1)
+        app = BabelQueue(transport=transport, queue="orders", max_attempts=3,
+                         on_unknown_urn=UnknownUrnStrategy.DEAD_LETTER)
+        app.consume("orders", max_messages=1, timeout=0, handle_signals=False)
+        self.assertEqual(1, len(fake.deleted))
+        assert_poison_record(self, fake.sent[-1]["MessageBody"], "not json")
 
     def test_the_delivery_carries_the_native_attempts(self) -> None:
         self.fake.seed(self.URL, "not json", 4)
@@ -411,6 +436,51 @@ class AsbPoisonTest(unittest.TestCase):
                 self.assertEqual("orders.dlq", queue)
                 assert_poison_record(self, record, body)
                 self.assertEqual([received], receiver.completed)
+
+
+    def test_a_poison_message_is_dead_lettered_natively_when_the_dlq_is_off(self) -> None:
+        # ADR-0037 decision 2 (Go and Python): no Complete, no re-send, no retry; the body is
+        # unchanged and Azure Service Bus moves it to $DeadLetterQueue (reason "poison").
+        for body in ("not json", '{"foo":1}'):
+            for strategy in (UnknownUrnStrategy.FAIL, UnknownUrnStrategy.RELEASE):
+                with self.subTest(body=body, strategy=strategy):
+                    received = AsbReceived(body)
+                    receiver = AsbReceiver([received])
+                    transport = AsbTransport(client=AsbClient(receiver=receiver))
+                    capture = _PublishCapture(transport)
+                    app = BabelQueue(transport=transport, queue="orders", max_attempts=3,
+                                     on_unknown_urn=strategy)
+                    app.register(URN, lambda data, meta: None)
+                    with self.assertLogs("babelqueue.app", level="WARNING"):
+                        app.consume("orders", max_messages=1, timeout=0, handle_signals=False)
+                    self.assertEqual([], receiver.completed)
+                    self.assertEqual([], capture.written)
+                    self.assertEqual([(received, "poison")], [(m, r) for m, r, _ in receiver.dead_lettered])
+
+    def test_delete_completes_and_the_dlq_on_record_is_unchanged(self) -> None:
+        received = AsbReceived("not json")
+        receiver = AsbReceiver([received])
+        transport = AsbTransport(client=AsbClient(receiver=receiver))
+        app = BabelQueue(transport=transport, queue="orders", max_attempts=3,
+                         on_unknown_urn=UnknownUrnStrategy.DELETE)
+        with self.assertLogs("babelqueue.app", level="WARNING"):
+            app.consume("orders", max_messages=1, timeout=0, handle_signals=False)
+        self.assertEqual([received], receiver.completed)
+        self.assertEqual([], receiver.dead_lettered)
+
+        received = AsbReceived("not json")
+        receiver = AsbReceiver([received])
+        transport = AsbTransport(client=AsbClient(receiver=receiver))
+        capture = _PublishCapture(transport)
+        app = BabelQueue(transport=transport, queue="orders", max_attempts=3,
+                         on_unknown_urn=UnknownUrnStrategy.DEAD_LETTER)
+        app.register(URN, lambda data, meta: None)
+        app.consume("orders", max_messages=1, timeout=0, handle_signals=False)
+        ((queue, record),) = capture.written
+        self.assertEqual("orders.dlq", queue)
+        assert_poison_record(self, record, "not json")
+        self.assertEqual([received], receiver.completed)
+        self.assertEqual([], receiver.dead_lettered)
 
 
 class ArtemisPoisonTest(unittest.TestCase):

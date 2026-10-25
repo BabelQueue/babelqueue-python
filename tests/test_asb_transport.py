@@ -13,7 +13,7 @@ from urllib.parse import quote
 
 from babelqueue import BabelQueue, EnvelopeCodec
 from babelqueue.asb_transport import AsbTransport
-from babelqueue.transport import ReceivedMessage, make_transport
+from babelqueue.transport import Abandoner, ReceivedMessage, Rewinder, make_transport
 
 try:
     import azure.servicebus  # noqa: F401
@@ -72,6 +72,14 @@ class FakeReceiver:
     def __init__(self, messages=()) -> None:
         self._messages = list(messages)
         self.completed: list = []
+        self.dead_lettered: list = []  # (message, reason, error_description)
+        self.abandoned: list = []
+
+    def dead_letter_message(self, message, reason=None, error_description=None) -> None:
+        self.dead_lettered.append((message, reason, error_description))
+
+    def abandon_message(self, message) -> None:
+        self.abandoned.append(message)
 
     def receive_messages(self, max_message_count: int = 1, max_wait_time=None):
         batch = self._messages[:max_message_count]
@@ -272,6 +280,145 @@ class AsbSchemaVersionGateTest(unittest.TestCase):
         got = tr.pop("orders")
         tr.ack(got)
         self.assertEqual(receiver.completed, [got.handle])
+
+    def test_settle_native_dead_letters_with_reason_and_description(self):
+        receiver = FakeReceiver([FakeReceived("{not json", 1, {"bq-schema-version": "2"})])
+        tr = AsbTransport(client=FakeClient(receiver=receiver))
+        got = tr.pop("orders")
+        tr.settle_native(got, "unsupported schema version", "declares version 2")
+        self.assertEqual(
+            receiver.dead_lettered, [(got.handle, "unsupported schema version", "declares version 2")]
+        )
+        self.assertEqual(receiver.completed, [])
+        self.assertEqual(receiver.abandoned, [])
+
+    def test_settle_native_abandons_when_the_receiver_cannot_dead_letter(self):
+        class AbandonOnly:
+            def __init__(self, inner):
+                self.inner = inner
+
+            def receive_messages(self, **kwargs):
+                return self.inner.receive_messages(**kwargs)
+
+            def abandon_message(self, message):
+                self.inner.abandon_message(message)
+
+        inner = FakeReceiver([FakeReceived("{not json", 1, {"bq-schema-version": "2"})])
+        tr = AsbTransport(client=FakeClient(receiver=AbandonOnly(inner)))
+        got = tr.pop("orders")
+        tr.settle_native(got, "poison", "x")
+        self.assertEqual(inner.abandoned, [got.handle])
+        self.assertEqual(inner.completed, [])
+
+    def test_abandon_releases_the_lock_and_never_completes(self):
+        receiver = FakeReceiver([FakeReceived(body(), 1, {"bq-schema-version": "2"})])
+        tr = AsbTransport(client=FakeClient(receiver=receiver))
+        got = tr.pop("orders")
+        self.assertIsInstance(tr, Abandoner)
+        tr.abandon(got)
+        self.assertEqual(receiver.abandoned, [got.handle])
+        self.assertEqual(receiver.completed, [])
+        self.assertEqual(receiver.dead_lettered, [])
+
+    def test_abandon_is_a_noop_without_a_handle(self):
+        receiver = FakeReceiver()
+        tr = AsbTransport(client=FakeClient(receiver=receiver))
+        tr.abandon(ReceivedMessage(body="x", queue="orders", handle=None))
+        self.assertEqual(receiver.abandoned, [])
+
+    def test_a_failed_dlq_write_for_a_gated_message_abandons_it(self):
+        receiver = FakeReceiver([FakeReceived(body(), 1, {"bq-schema-version": "2"})])
+        app = BabelQueue(
+            transport=AsbTransport(client=FakeClient(receiver=receiver)), max_attempts=5, dead_letter=True
+        )
+        app._rewind_pause = 0  # noqa: SLF001
+        with mock.patch.object(AsbTransport, "publish", side_effect=RuntimeError("dlq unavailable")):
+            with self.assertLogs("babelqueue.app", level="ERROR"):
+                app.consume(queue="orders", max_messages=1)
+        self.assertEqual(len(receiver.abandoned), 1)
+        self.assertEqual(receiver.completed, [])
+
+    def test_a_failed_dlq_write_for_a_poison_body_is_not_abandoned(self):
+        # Only the version-gate unsettled branch abandons (owner decision 2026-10-25).
+        receiver = FakeReceiver([FakeReceived("not json", 1)])
+        app = BabelQueue(
+            transport=AsbTransport(client=FakeClient(receiver=receiver)), max_attempts=5, dead_letter=True
+        )
+        app._rewind_pause = 0  # noqa: SLF001
+        with mock.patch.object(AsbTransport, "publish", side_effect=RuntimeError("dlq unavailable")):
+            with self.assertLogs("babelqueue.app", level="ERROR"):
+                app.consume(queue="orders", max_messages=1)
+        self.assertEqual((receiver.abandoned, receiver.completed), ([], []))
+
+    def test_asb_is_not_a_rewinder_so_shutdown_and_retry_paths_keep_their_old_handling(self):
+        self.assertNotIsInstance(AsbTransport(client=FakeClient()), Rewinder)
+
+    def test_graceful_shutdown_release_republishes_a_copy_and_completes(self):
+        # A message whose handler never completed at shutdown: copy re-publish + Complete, no Abandon.
+        raw = body()
+        received = FakeReceived(raw, 1)
+        receiver = FakeReceiver([received])
+        tr = AsbTransport(client=FakeClient(receiver=receiver))
+        app = BabelQueue(transport=tr, max_attempts=5)
+        msg = tr.pop("orders")
+        with mock.patch.object(AsbTransport, "publish") as publish:
+            app._release_unprocessed(msg)  # noqa: SLF001
+        publish.assert_called_once_with("orders", raw)
+        self.assertEqual(receiver.completed, [received])
+        self.assertEqual((receiver.abandoned, receiver.dead_lettered), ([], []))
+
+    def test_a_failed_retry_republish_is_left_unsettled_without_abandon(self):
+        received = FakeReceived(body(), 1)
+        receiver = FakeReceiver([received])
+        app = BabelQueue(transport=AsbTransport(client=FakeClient(receiver=receiver)), max_attempts=5)
+        app._rewind_pause = 0  # noqa: SLF001
+
+        @app.handler(URN)
+        def _boom(data, meta):
+            raise RuntimeError("handler failed")
+
+        with mock.patch.object(AsbTransport, "publish", side_effect=RuntimeError("broker down")):
+            with self.assertLogs("babelqueue.app", level="ERROR"):
+                app.consume(queue="orders", max_messages=1)
+        self.assertEqual((receiver.abandoned, receiver.completed, receiver.dead_lettered), ([], [], []))
+
+    def test_settle_native_is_a_noop_without_a_handle(self):
+        receiver = FakeReceiver()
+        tr = AsbTransport(client=FakeClient(receiver=receiver))
+        tr.settle_native(ReceivedMessage(body="x", queue="orders", handle=None), "poison", "x")
+        self.assertEqual(receiver.dead_lettered, [])
+
+    def test_app_without_dead_letter_dead_letters_natively_not_completes(self):
+        # ADR-0037 decision 1 rule 3: DLQ off + default fail -> explicit native DeadLetter.
+        for kwargs in ({}, {"on_unknown_urn": "release"}):
+            with self.subTest(**kwargs):
+                receiver = FakeReceiver([FakeReceived(body(), 1, {"bq-schema-version": "2"})])
+                app = BabelQueue(
+                    transport=AsbTransport(client=FakeClient(receiver=receiver)), max_attempts=5, **kwargs
+                )
+                seen: list = []
+
+                @app.handler(URN)
+                def _on(data, meta):
+                    seen.append(data)
+
+                with self.assertLogs("babelqueue.app", level="WARNING"):
+                    app.consume(queue="orders", max_messages=1)
+
+                self.assertEqual(seen, [])
+                self.assertEqual(receiver.completed, [])
+                self.assertEqual([r for _, r, _ in receiver.dead_lettered], ["unsupported schema version"])
+
+    def test_delete_strategy_completes_a_gated_message_without_dead_letter(self):
+        receiver = FakeReceiver([FakeReceived(body(), 1, {"bq-schema-version": "2"})])
+        app = BabelQueue(
+            transport=AsbTransport(client=FakeClient(receiver=receiver)),
+            max_attempts=5,
+            on_unknown_urn="delete",
+        )
+        app.consume(queue="orders", max_messages=1)
+        self.assertEqual(len(receiver.completed), 1)
+        self.assertEqual(receiver.dead_lettered, [])
 
     def test_app_dead_letters_unsupported_version_without_reaching_a_handler(self):
         # max_attempts > 1: a gated message is dead-lettered directly, never retried

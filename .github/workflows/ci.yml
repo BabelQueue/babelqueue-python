@@ -177,7 +177,7 @@ jobs:
           --health-retries 10
     env:
       # The pinned conformance release (ADR-0032). Bump together with tests/conformance/.
-      BQ_CONFORMANCE_VERSION: 1.7.0
+      BQ_CONFORMANCE_VERSION: 1.8.0
       # sha256 of that release's fetch.sh: the script runs on the runner, so it is pinned rather
       # than trusted from a mutable tag. Bump together with BQ_CONFORMANCE_VERSION.
       BQ_FETCH_SH_SHA256: 8bb6ba567b288fb0ac71a70fd17041b2503df119e01998d76fdad372570bf849

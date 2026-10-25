@@ -9,6 +9,55 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+Implements conformance **1.8.0** (vendored from the `v1.8.0` release asset, verified with
+`fetch.sh --check`; `BQ_CONFORMANCE_VERSION` is now `1.8.0` in `ci.yml` and `release.yml`). The
+envelope stays at `schema_version: 1`; nothing here touches the wire (ADR-0037). The new
+`version_gate_pulsar`, `version_gate_artemis`, `version_gate_sqs` and `version_gate_asb` sections run
+and pass (17 cases each; Python has the `on_unknown_urn` option, so no row is skipped). A MINOR; the
+version number is set at release time.
+
+### Changed (behaviour)
+- **With the DLQ off, SQS and Azure Service Bus no longer drop a version-gated message or retry a
+  poison body; they are left to the broker's native mechanism (ADR-0037 decision 1 rule 3 and
+  decision 2 "Go and Python"; broker-bindings 3.5, 4.5, 5.7; owner decision 2026-10-25).**
+  - *Version-gated message* (an unsupported `bq-schema-version`), `dead_letter` off and a strategy
+    other than `DELETE` or `DEAD_LETTER`: it used to be acknowledged and dropped. It is now **not**
+    acknowledged. SQS: no `DeleteMessage`; visibility expiry redelivers it (the gate rejects it
+    again) and the queue's `RedrivePolicy` moves it to the native DLQ after `maxReceiveCount`. Azure
+    Service Bus: an explicit native `DeadLetter` (reason `unsupported schema version`) into
+    `$DeadLetterQueue` instead of `Complete`.
+  - *Poison body* (invalid JSON or an identity-less object), `dead_letter` off and a strategy other
+    than `DELETE` or `DEAD_LETTER`: it used to take the bounded `FAIL` path (re-publish an empty
+    envelope up to `max_attempts`, then drop). On SQS and Azure Service Bus it is now settled
+    natively **on the first delivery** exactly as above (Azure Service Bus reason `poison`): no
+    re-publish, no retry, no ack, body unchanged, the event is logged. Every other transport
+    (Pulsar, Artemis, AMQP, Kafka, Redis, memory) keeps its behaviour; `DELETE` (ack and drop),
+    `dead_letter=True` and the `DEAD_LETTER` strategy (the raw record, then ack) are unchanged on
+    SQS and Azure Service Bus too.
+  - A deployment that relied on SQS/Azure Service Bus silently dropping these messages now needs a
+    `RedrivePolicy` (SQS) or accepts them in `$DeadLetterQueue` (Azure Service Bus), or sets
+    `dead_letter=True` / `on_unknown_urn=DELETE`.
+
+### Added
+- **`babelqueue.transport.NativeSettler`**, an optional `Transport` capability
+  (`settle_native(message, reason, description)`). With the DLQ off the runtime calls it instead of
+  acknowledging a version-gated message (and, on the poison route, instead of the bounded retry) on
+  a transport that offers it; the decision follows the capability, never the transport's name.
+  `SqsTransport.settle_native` is a deliberate no-op on the wire; `AsbTransport.settle_native`
+  dead-letters natively (falling back to `abandon_message` for a receiver without
+  `dead_letter_message`). Transports without it are unchanged.
+- **`babelqueue.transport.Abandoner` and `AsbTransport.abandon`.** When the dead-letter write of a
+  *version-gated* message fails, Azure Service Bus now `Abandon`s the peek-lock (broker-bindings 4.5,
+  "A failed write `Abandon`s it") so the broker redelivers it at once, instead of leaving it locked until
+  the lock lapses (up to 5 minutes). Only that branch abandons (owner decision 2026-10-25): `AsbTransport`
+  is deliberately **not** a `Rewinder`, so a graceful-shutdown release and a failed retry re-publish keep
+  their previous handling (a copy is re-published and the original completed), and a failed dead-letter
+  write of a poison body is still left to its lock. Tests pin all three. The `version_gate_asb` runner
+  asserts the `Abandon` on its `unsettled` rows.
+- Conformance `version_gate_*` runners (`version_gate_pulsar` / `version_gate_artemis` through the
+  runtime, `version_gate_sqs` / `version_gate_asb` through the real transports) and their entries in
+  the results writer.
+
 ## [1.23.0] - 2026-10-25
 
 Implements ADR-0036 (post-R1 parity) decisions 2, 4, 5 and 6. A MINOR: every change is a

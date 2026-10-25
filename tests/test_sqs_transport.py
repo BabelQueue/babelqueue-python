@@ -660,22 +660,49 @@ class SqsSchemaVersionGateTest(unittest.TestCase):
                 self.assertEqual(fake.sent[0]["MessageBody"], incoming)
                 self.assertNotIn("dead_letter", fake.sent[0]["MessageBody"])
 
-    def test_app_without_dead_letter_drops_unsupported_version_without_retry(self):
+    def test_app_without_dead_letter_leaves_unsupported_version_to_sqs_without_retry(self):
+        # ADR-0037 decision 1 rule 3: DLQ off + the default fail strategy. The message is neither
+        # deleted nor re-sent nor released: it is left to visibility expiry and the queue's
+        # RedrivePolicy (the gate rejects it again on every redelivery).
+        for strategy in (UnknownUrnStrategy.FAIL, UnknownUrnStrategy.RELEASE):
+            with self.subTest(strategy=strategy):
+                tr, fake = self._tr()
+                app = BabelQueue(transport=tr, queue="orders", max_attempts=3, retry_backoff=30,
+                                 on_unknown_urn=strategy)
+                seen: list = []
+
+                @app.handler(self.URN)
+                def _on(data, meta):
+                    seen.append(data)
+
+                self._enqueue(fake, self._body(), "2")
+                with self.assertLogs("babelqueue.app", level="WARNING") as logs:
+                    app.consume("orders", max_messages=1, timeout=0)
+
+                self.assertEqual(seen, [])
+                self.assertEqual(fake.sent, [])
+                self.assertEqual(fake.visibility_changes, [])  # no ChangeMessageVisibility retry loop
+                self.assertEqual(fake.deleted, [])  # no DeleteMessage
+                self.assertTrue(any("native mechanism" in line for line in logs.output))
+
+    def test_delete_strategy_still_deletes_an_unsupported_version_without_dead_letter(self):
         tr, fake = self._tr()
-        app = BabelQueue(transport=tr, queue="orders", max_attempts=3, retry_backoff=30)
-        seen: list = []
-
-        @app.handler(self.URN)
-        def _on(data, meta):
-            seen.append(data)
-
+        app = BabelQueue(transport=tr, queue="orders", max_attempts=3,
+                         on_unknown_urn=UnknownUrnStrategy.DELETE)
         self._enqueue(fake, self._body(), "2")
         app.consume("orders", max_messages=1, timeout=0)
-
-        self.assertEqual(seen, [])
-        self.assertEqual(fake.sent, [])
-        self.assertEqual(fake.visibility_changes, [])  # no ChangeMessageVisibility retry loop
         self.assertEqual(fake.deleted, ["rh-gate"])
+        self.assertEqual(fake.sent, [])
+
+    def test_settle_native_does_nothing_on_the_wire(self):
+        tr, fake = self._tr()
+        self._enqueue(fake, self._body(), "2", receive_count=None)
+        got = tr.pop("orders", timeout=0)
+        tr.settle_native(got, "unsupported schema version", "x")
+        self.assertEqual(fake.deleted, [])
+        self.assertEqual(fake.sent, [])
+        self.assertEqual(fake.visibility_changes, [])
+        self.assertNotIn("rh-gate", tr._uncounted_handles)  # the handle is not leaked
 
     def test_gated_message_without_receive_count_is_still_acknowledged_by_its_handle(self):
         tr, fake = self._tr()
