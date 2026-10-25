@@ -5,6 +5,7 @@ All tests use the in-memory transport — no broker required.
 
 from __future__ import annotations
 
+import json
 import unittest
 
 from babelqueue import BabelQueue, EnvelopeCodec, UnknownUrnStrategy
@@ -423,9 +424,10 @@ class AppTest(unittest.TestCase):
                 self.assertEqual(app.transport.size("orders.dlq"), 0)
                 self.assertEqual(app.transport._queues["orders"].popleft(), body)  # noqa: SLF001
 
-    def test_ungated_poison_is_bounded_under_release(self) -> None:
-        # Not version-gated: an undecodable body and a body naming no URN can never gain a handler
-        # either, so RELEASE takes the bounded FAIL path for them too (Go routePoison parity).
+    def test_poison_is_dead_lettered_at_once_under_release_when_the_dlq_is_on(self) -> None:
+        # ADR-0036 decisions 2/4/6: a body that does not decode, or names no identity, is poison.
+        # With the DLQ on it is written as the ADR-0035 record (reason ``poison``) on its first
+        # delivery, with no retry, whatever the unknown-URN strategy says.
         no_urn = EnvelopeCodec.encode(EnvelopeCodec.make("urn:babel:orders:created", {}, queue="orders"))
         no_urn = no_urn.replace('"urn:babel:orders:created"', '""')
         for name, body in (("undecodable", "{not json"), ("no-urn", no_urn)):
@@ -434,9 +436,26 @@ class AppTest(unittest.TestCase):
                     "memory://", queue="orders", max_attempts=3, dead_letter=True,
                     on_unknown_urn=UnknownUrnStrategy.RELEASE,
                 )
-                self.assertEqual(self._redeliver_until_settled(app, "orders", "", body), 3)
+                self.assertEqual(self._redeliver_until_settled(app, "orders", "", body), 1)
                 self.assertEqual(app.transport.size("orders"), 0)
                 self.assertEqual(app.transport.size("orders.dlq"), 1)
+                record = json.loads(app.transport._queues["orders.dlq"][0])  # noqa: SLF001
+                self.assertEqual(record["dead_letter"]["reason"], "poison")
+
+    def test_poison_is_bounded_under_release_when_the_dlq_is_off(self) -> None:
+        # Dead-lettering off: RELEASE is replaced by the bounded FAIL path (a poison body would
+        # otherwise be released forever): max_attempts deliveries, then a logged drop.
+        no_urn = EnvelopeCodec.encode(EnvelopeCodec.make("urn:babel:orders:created", {}, queue="orders"))
+        no_urn = no_urn.replace('"urn:babel:orders:created"', '""')
+        for name, body in (("undecodable", "{not json"), ("no-urn", no_urn)):
+            with self.subTest(body=name):
+                app = BabelQueue(
+                    "memory://", queue="orders", max_attempts=3, on_unknown_urn=UnknownUrnStrategy.RELEASE,
+                )
+                with self.assertLogs("babelqueue.app", level="WARNING"):
+                    self.assertEqual(self._redeliver_until_settled(app, "orders", "", body), 3)
+                self.assertEqual(app.transport.size("orders"), 0)
+                self.assertEqual(app.transport.size("orders.dlq"), 0)
 
     def test_unsupported_broker_scheme_raises(self) -> None:
         from babelqueue import BabelQueueError

@@ -317,12 +317,23 @@ class SqsTransport(Transport):
             queue=queue,
             handle=handle,
             headers=headers,
+            # SQS counts deliveries itself: a poison body has no envelope to carry ``attempts``,
+            # so the runtime reads the native count (``ApproximateReceiveCount - 1``) instead.
+            native_attempts=self._native_attempts(receive_count),
             route_urn=(
                 UNSUPPORTED_SCHEMA_ROUTE_PREFIX + quote(unsupported, safe="")
                 if unsupported is not None
                 else ""
             ),
         )
+
+    @staticmethod
+    def _native_attempts(receive_count: Any) -> int:
+        """``ApproximateReceiveCount - 1`` (the 0-based delivery count), 0 when absent or invalid."""
+        try:
+            return max(int(receive_count) - 1, 0)
+        except (ValueError, TypeError):
+            return 0
 
     @staticmethod
     def _unsupported_schema_version(attributes: Any) -> Optional[str]:

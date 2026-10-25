@@ -28,8 +28,10 @@ spliced byte for byte, anything else is carried as ``{"raw": "<body>"}`` (base64
 ``raw_encoding: "base64"`` when it is not valid UTF-8), and a ``dead_letter`` block with
 ``reason: "poison"`` is added (the key is preserved; the DLQ is the configured one or ``<queue>.dlq``, which must exist). With
 the DLQ off it is NOT written to a DLQ (Go ``routePoison``): ``on_unknown_urn=DELETE`` drops it, any other
-strategy takes the bounded FAIL path (retried through the tiers up to ``max_attempts``, then dropped).
-The record is handed over raw under a
+strategy takes the bounded FAIL path (retried through the tiers up to ``max_attempts``, then dropped); with
+no retry tiers configured as well, that path has no tier to retry through, so the record is committed, dropped
+and logged (the §6.5 degrade-to-delete rule, ADR-0036 decision 5) instead of blocking the partition. The record is
+handed over raw under a
 ``PoisonRoute`` and wrapped by ``publish_settle`` only when it is written to a queue other than the one
 it was read from, so a ``redrive`` restore into the DLQ it popped it from (any DLQ name) is byte for
 byte and never double-wraps. The version gate (§6.7) still
@@ -161,6 +163,10 @@ def _brokers_from_url(url: str) -> str:
 
 
 class KafkaTransport(Transport):
+    #: Classifies poison itself (``_poll_one``, ADR-0034 section 10): the runtime does not classify
+    #: the body a second time.
+    classifies_poison = True
+
     def __init__(
         self,
         url: str = "kafka://localhost:9092",

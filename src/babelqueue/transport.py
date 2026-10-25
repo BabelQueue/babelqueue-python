@@ -48,6 +48,13 @@ class ReceivedMessage:
     #: to a :class:`SettlePublisher` on its own re-publishes (retry, DLQ) so the key is not lost;
     #: it never synthesises one. Not part of the envelope; ``None`` for every other transport.
     key: Optional[bytes] = None
+    #: The delivery count the broker itself reports for this delivery (0-based: ``0`` on the first
+    #: delivery), for transports that have one (SQS ``ApproximateReceiveCount - 1``, the Pulsar
+    #: ``bq-attempts`` property floored by the ``RedeliveryCount``). A **poison** body has no
+    #: decodable envelope to carry ``attempts``, so the runtime counts its bounded retry from the
+    #: larger of this value and the ``attempts`` of the (bare) body it re-publishes. ``0`` for
+    #: every transport that does not report one.
+    native_attempts: int = 0
 
 
 class PoisonRoute(str):
@@ -79,6 +86,13 @@ class PoisonRoute(str):
 
 class Transport(ABC):
     """Minimal broker contract: publish a raw body, pop one, acknowledge it."""
+
+    #: ``True`` for a transport that already classifies poison bodies itself and hands them over
+    #: under a poison route (Kafka, Redis). The runtime then does not classify the body again; for
+    #: every other transport it applies the poison rule of ADR-0036 decisions 4 and 6 in
+    #: :meth:`BabelQueue.dispatch` (a body that does not decode, or has no identity, is never
+    #: handed to a handler and takes the poison route).
+    classifies_poison: bool = False
 
     @abstractmethod
     def publish(self, queue: str, body: str) -> None:

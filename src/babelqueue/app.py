@@ -326,15 +326,37 @@ class BabelQueue:
             # §3.7/§4.7/§5.7/§6.7/§7.7): the raw body goes to the DLQ byte-identical, so there is
             # no envelope to read here.
             gated = received.route_urn.startswith(_UNSUPPORTED_SCHEMA_ROUTE_PREFIX)
-            envelope = {} if gated else EnvelopeCodec.decode_lenient(received.body)
+            # A body that does not decode, or has no identity, is poison (ADR-0036 decisions 4 and
+            # 6): never decoded leniently into an empty envelope, never handed to a handler and
+            # never routed as an unknown URN. A transport that already hands its poison over under
+            # a poison route (Kafka, Redis) is not classified twice. A delivery that carries an
+            # out-of-band routing URN is exempt from the identity half of the rule only.
+            poison_cause = (
+                None
+                if gated or getattr(self.transport, "classifies_poison", False)
+                else EnvelopeCodec.poison_cause(
+                    received.body, require_identity=not received.route_urn
+                )
+            )
+            envelope = (
+                {}
+                if gated or poison_cause is not None
+                else EnvelopeCodec.decode_lenient(received.body)
+            )
             urn = str(envelope.get("job") or envelope.get("urn") or "")
             if received.route_urn and envelope:
                 # Transport-supplied routing override; body untouched. Only for a body that
                 # decodes: an undecodable one (decode() yields {}) stays on the poison path.
                 urn = received.route_urn
-            handler = self._handlers.get(urn) if urn else None
+            handler = (
+                self._handlers.get(urn) if urn and poison_cause is None else None
+            )
 
             try:
+                if poison_cause is not None:
+                    self._phase = _SETTLING
+                    self._route_body_poison(received, poison_cause)
+                    return
                 if handler is None:
                     self._phase = _SETTLING
                     self._route_unknown(urn, received, envelope)
@@ -344,15 +366,19 @@ class BabelQueue:
                 self._phase = _SETTLING
             except Exception as exc:  # noqa: BLE001 - one bad message must not kill the loop
                 self._phase = _SETTLING
-                if received.route_urn.startswith(_UNSUPPORTED_SCHEMA_ROUTE_PREFIX):
-                    # A version-gated delivery never takes the generic retry path, even when its
-                    # dead-letter write fails: a retry re-publish may rebuild the version header
-                    # from the (valid) body and walk the message past the gate into a handler.
-                    # It is left unacked; the broker (or a rewind, for cumulative-offset brokers
-                    # such as Kafka) brings it back and the gate rejects it again.
+                if poison_cause is not None or received.route_urn.startswith(
+                    _UNSUPPORTED_SCHEMA_ROUTE_PREFIX
+                ):
+                    # A version-gated or poison delivery never takes the generic retry path, even
+                    # when its dead-letter write fails: a retry re-publish may rebuild the version
+                    # header from the (valid) body and walk the message past the gate into a
+                    # handler, and a poison body has no envelope to retry. It is left unacked; the
+                    # broker (or a rewind, for cumulative-offset brokers such as Kafka) brings it
+                    # back and the same decision is taken again.
                     logger.error(
-                        "Dead-lettering a version-gated message (route %r) on queue %r failed; it was NOT "
-                        "retried or acknowledged; it will come back and the dead-letter write will be retried.",
+                        "Dead-lettering a version-gated or poison message (route %r) on queue %r "
+                        "failed; it was NOT retried or acknowledged; it will come back and the "
+                        "dead-letter write will be retried.",
                         received.route_urn,
                         received.queue,
                         exc_info=exc,
@@ -579,13 +605,16 @@ class BabelQueue:
         through a tier. That only happens once a handler fails, so it is a warning (not a
         start-up error).
         """
-        tiers = getattr(self.transport, "retry_tiers_ms", None)
-        if isinstance(tiers, list) and not tiers and self.max_attempts > 1 and isinstance(self.transport, Redeliverer):
+        if self._retry_tiers_unavailable() and self.max_attempts > 1:
             logger.warning(
                 "The Kafka transport has no retry tiers but max_attempts=%d: a failing handler "
                 "cannot be retried -- the record is left uncommitted and redelivered after a "
                 "pause, so it keeps failing in place. Configure retry_tiers_ms (or set "
-                "max_attempts=1) to retry through the tiers.",
+                "max_attempts=1) to retry through the tiers. A poison record (a body that does "
+                "not decode, or has no identity) is different: with dead-lettering off and "
+                "on_unknown_urn not 'delete' it is committed and dropped with a logged warning "
+                "(broker-bindings section 6.5, degrade-to-delete), so it never blocks the "
+                "partition; enable dead_letter to keep it in <topic>.dlq instead.",
                 self.max_attempts,
             )
 
@@ -657,6 +686,19 @@ class BabelQueue:
         if self.dead_letter_enabled or self.on_unknown_urn == UnknownUrnStrategy.DEAD_LETTER:
             self._settle_version_gated(received, always=True)
             return
+        if self._retry_tiers_unavailable():
+            # broker-bindings §6.5 / ADR-0036 decision 5: no retry tier, no dead-lettering and not
+            # ``delete`` degrades to ``delete``. The bounded retry of a poison record needs a tier
+            # and would raise, leaving the record uncommitted with ``bq-attempts`` never advancing,
+            # so the partition would block. Commit, drop, and say so.
+            logger.warning(
+                "Dropping a poison record on queue %r (route %r): the Kafka transport has no retry "
+                "tiers and dead-lettering is off, so it can be neither retried nor dead-lettered "
+                "(broker-bindings section 6.5, degrade-to-delete). The offset was committed.",
+                received.queue, str(route),
+            )
+            self._ack_settled(received)
+            return
         attempts = int(getattr(route, "attempts", 0) or 0)
         self._retry_or_dead_letter(
             received,
@@ -664,8 +706,60 @@ class BabelQueue:
             UnknownUrnError("The record is poison: it carries no decodable envelope."),
         )
 
-    def _settle_transport_poison(self, received: ReceivedMessage) -> None:
-        """Dead-letter a Redis poison reservation (broker-bindings §1.1 / §1.3, ADR-0033, ADR-0035).
+    def _route_body_poison(self, received: ReceivedMessage, cause: str) -> None:
+        """Settle a body that does not decode into an envelope, or has no identity, on SQS, AMQP,
+        Pulsar, Azure Service Bus, Artemis, the memory transport and any other transport that does
+        not classify poison itself (ADR-0036 decisions 2, 4 and 6; Go ``routePoison``).
+
+        The body is never handed to a handler and never takes the unknown-URN strategies:
+
+        * ``on_unknown_urn=DELETE`` drops it (acknowledged and logged);
+        * with the DLQ on (``dead_letter`` or the DEAD_LETTER strategy) it is written to the DLQ as
+          the ADR-0035 record with ``reason: "poison"`` (original body preserved) and acknowledged
+          after the write, with no retry;
+        * with the DLQ off it takes the bounded FAIL path (``RELEASE`` is replaced by it, a poison
+          body would otherwise be released forever): re-published with ``attempts + 1`` up to
+          ``max_attempts``, then dropped. The count is the larger of the transport's own delivery
+          count and the ``attempts`` of the bare body a previous retry left behind.
+
+        A failed DLQ write propagates: :meth:`dispatch` leaves the delivery unacknowledged."""
+        if self.on_unknown_urn == UnknownUrnStrategy.DELETE:
+            logger.warning(
+                "Dropping a poison message on queue %r (on_unknown_urn=delete): %s.",
+                received.queue, cause,
+            )
+            self._ack_settled(received)
+            return
+        attempts = self._poison_attempts(received)
+        if self.dead_letter_enabled or self.on_unknown_urn == UnknownUrnStrategy.DEAD_LETTER:
+            self._settle_transport_poison(received, cause, attempts)
+            return
+        self._retry_or_dead_letter(
+            received,
+            {"attempts": attempts},
+            UnknownUrnError("The message is poison: " + cause),
+        )
+
+    @staticmethod
+    def _poison_attempts(received: ReceivedMessage) -> int:
+        """Deliveries a poison body has already had: the larger of the transport's own count and
+        the integer ``attempts`` of the body (a bare ``{"attempts": N}`` left by a retry)."""
+        body_attempts = parse_envelope(received.body).get("attempts")
+        if isinstance(body_attempts, bool) or not isinstance(body_attempts, int):
+            body_attempts = 0
+        return max(int(received.native_attempts or 0), body_attempts, 0)
+
+    def _retry_tiers_unavailable(self) -> bool:
+        """Whether the transport is a Kafka transport with no retry tiers configured."""
+        tiers = getattr(self.transport, "retry_tiers_ms", None)
+        return isinstance(tiers, list) and not tiers and isinstance(self.transport, Redeliverer)
+
+    def _settle_transport_poison(
+        self, received: ReceivedMessage, cause: Optional[str] = None, attempts: int = 0
+    ) -> None:
+        """Dead-letter a poison delivery (broker-bindings §1.1 / §1.3, ADR-0033, ADR-0035): a Redis
+        poison reservation (unconditional) or, via :meth:`_route_body_poison`, a poison body of any
+        other transport (``cause`` and ``attempts`` are then known).
 
         The DLQ write is an unconditional MUST, so it ignores ``dead_letter_enabled``. The record
         follows ADR-0035 like every other poison record: a strict JSON object body is spliced byte
@@ -676,8 +770,8 @@ class BabelQueue:
             {},
             "poison",
             received.queue,
-            0,
-            error="Undecodable BabelQueue body",
+            attempts,
+            error="Undecodable BabelQueue body" + (": " + cause if cause else ""),
             exception=BabelQueueError.__name__,
         )["dead_letter"]
         self._write_dead_letter(
@@ -730,7 +824,12 @@ class BabelQueue:
             self._dead_letter(received, envelope, reason, exc)
             return
 
-        # Retries exhausted, no DLQ configured — drop it (ack so it leaves the queue).
+        # Retries exhausted, no DLQ configured — drop it (ack so it leaves the queue), loudly.
+        logger.warning(
+            "Dropping a message on queue %r after %d attempts: retries are exhausted and no "
+            "dead-letter queue is configured.",
+            received.queue, attempts,
+        )
         self._ack_settled(received)
 
     def _dead_letter(

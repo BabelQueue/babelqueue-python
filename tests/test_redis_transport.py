@@ -451,16 +451,49 @@ class LegacyPoisonWithoutRedisTest(unittest.TestCase):
                 ((_, args),) = client.settles
                 assert_poison_record(self, args[5], garbage, "orders")  # never handled or retried
 
-    def test_a_bare_null_is_not_poison(self):
+    def test_a_bare_null_is_poison_it_has_no_identity(self):
+        # ADR-0036 decision 4: a body that decodes but names no identity is poison (conformance
+        # ``identity_verdict``: ``null`` is ``poison``), no longer the bounded FAIL path.
         client = self.Client("null")
+        message = RedisTransport("redis://", client=client).pop("orders", timeout=0)
+        self.assertEqual(message.route_urn, NON_NUMERIC_ATTEMPTS_ROUTE)
+
+    def test_an_identity_less_object_is_poison(self):
+        # ADR-0036 decision 4 / broker-bindings section 1.1 "Identity-less body": an object with
+        # neither a valid ``job`` nor a valid ``urn`` is dead-lettered as poison, never handled.
+        for body in ('{"attempts":0}', "{}", '{"job":"  ","attempts":0}', '{"job":5,"urn":null}'):
+            with self.subTest(body=body):
+                client = self.Client(body)
+                message = RedisTransport("redis://", client=client).pop("orders", timeout=0)
+                self.assertEqual(message.route_urn, NON_NUMERIC_ATTEMPTS_ROUTE)
+
+    def test_a_urn_alias_is_an_identity_not_poison(self):
+        client = self.Client('{"urn":"urn:a","attempts":0}')
         message = RedisTransport("redis://", client=client).pop("orders", timeout=0)
         self.assertEqual(message.route_urn, "")
 
-    def test_an_identity_less_object_is_not_poison(self):
-        # {} / an object without job or urn still takes the bounded FAIL path, not the poison DLQ.
-        client = self.Client('{"attempts":0}')
-        message = RedisTransport("redis://", client=client).pop("orders", timeout=0)
-        self.assertEqual(message.route_urn, "")
+    def test_an_identity_less_object_is_dead_lettered_in_every_configuration(self):
+        for kwargs in (
+            {},  # dead-lettering off (the default)
+            {"dead_letter": True, "on_unknown_urn": UnknownUrnStrategy.DELETE},
+            {"on_unknown_urn": UnknownUrnStrategy.DELETE},
+            {"on_unknown_urn": UnknownUrnStrategy.RELEASE},
+        ):
+            with self.subTest(**{k: str(v) for k, v in kwargs.items()}):
+                body = '{"foo":1,"attempts":0}'
+                handled = []
+                client = self.Client(body)
+                app = BabelQueue(
+                    transport=RedisTransport("redis://", client=client, retry_after=90),
+                    queue="orders", max_attempts=3, **kwargs,
+                )
+                app.register(URN, lambda data, meta: handled.append(1))
+                self.assertEqual(app.consume("orders", max_messages=1, timeout=0), 1)
+                ((_, args),) = client.settles
+                self.assertEqual(args[2], "orders.dlq")
+                assert_poison_record(self, args[5], body, "orders")
+                self.assertEqual(handled, [])
+                self.assertEqual(client.stored, [])  # never retried
 
     def test_a_valid_envelope_is_not_flagged(self):
         client = self.Client(make_body("orders"))
@@ -792,6 +825,34 @@ class LaravelLayoutTest(_BrokerTest):
         self.assert_dlq_poison_records(poison)
         self.assertEqual(self.client.zcard(self.reserved), 0)
 
+    def test_identity_less_body_is_dead_lettered_in_every_configuration_and_never_handled(self):
+        # ADR-0036 decision 4: the zset layout too. The reserved member (attempts bumped when the
+        # body has a numeric ``attempts``) is the ack handle; the DLQ record keeps the raw job.
+        bodies = ['{"foo":1,"attempts":0}', "{}", "null", '{"job":"  ","attempts":0}', '{"foo":1}']
+        configs = (
+            {"dead_letter": False},
+            {"dead_letter": False, "on_unknown_urn": UnknownUrnStrategy.DELETE},
+            {"dead_letter": True, "on_unknown_urn": UnknownUrnStrategy.DELETE},
+            {"dead_letter": False, "on_unknown_urn": UnknownUrnStrategy.RELEASE},
+        )
+        for kwargs in configs:
+            for body in bodies:
+                with self.subTest(body=body, **{k: str(v) for k, v in kwargs.items()}):
+                    handled: list = []
+                    self.tr.publish(self.queue, body)
+                    app = self.app(max_attempts=3, **kwargs)
+                    app.register(URN, lambda data, meta: handled.append(1))
+                    message = self.tr.pop(self.queue, timeout=0)
+                    self.assertEqual(message.route_urn, NON_NUMERIC_ATTEMPTS_ROUTE)
+                    self.assertEqual(message.body, body)  # the raw job, not the reserved member
+                    app.dispatch(message)
+                    (record,) = self.client.lrange(f"{self.ready}.dlq", 0, -1)
+                    assert_poison_record(self, record, body, self.queue)
+                    self.assertEqual(handled, [])
+                    for key in (self.ready, self.reserved, self.delayed):
+                        self.assertEqual(self.client.exists(key), 0, key)  # never retried
+                    self.client.delete(f"{self.ready}.dlq", f"{self.ready}.dlq:notify", self.notify)
+
     def test_a_genuine_unknown_urn_is_still_deleted_with_the_delete_strategy(self):
         self.tr.publish(self.queue, make_body(self.queue))
         app = self.app(dead_letter=True, on_unknown_urn=UnknownUrnStrategy.DELETE)
@@ -1122,6 +1183,32 @@ class LegacyLayoutTest(_BrokerTest):
         (record,) = self.client.lrange(f"{self.queue}.dlq", 0, -1)
         assert_poison_record(self, record, "[1]", self.queue)
         self.assertEqual(self.client.llen(self.processing), 0)
+
+    def test_identity_less_body_is_dead_lettered_in_every_configuration_and_never_handled(self):
+        # ADR-0036 decision 4 / broker-bindings section 1.1 "Identity-less body": unconditional,
+        # so ``on_unknown_urn: delete`` and dead-lettering off change nothing, and no retry.
+        bodies = ['{"foo":1,"attempts":0}', "{}", "null", '{"job":"  ","attempts":0}']
+        configs = (
+            {"dead_letter": False},
+            {"dead_letter": False, "on_unknown_urn": UnknownUrnStrategy.DELETE},
+            {"dead_letter": True, "on_unknown_urn": UnknownUrnStrategy.DELETE},
+            {"dead_letter": False, "on_unknown_urn": UnknownUrnStrategy.RELEASE},
+        )
+        for kwargs in configs:
+            for body in bodies:
+                with self.subTest(body=body, **{k: str(v) for k, v in kwargs.items()}):
+                    handled: list = []
+                    self.client.rpush(self.queue, body)
+                    app = self.app(max_attempts=3, **kwargs)
+                    app.register(URN, lambda data, meta: handled.append(1))
+                    self.assertEqual(app.consume(self.queue, max_messages=1, timeout=0), 1)
+                    (record,) = self.client.lrange(f"{self.queue}.dlq", 0, -1)
+                    assert_poison_record(self, record, body, self.queue)
+                    self.assertEqual(handled, [])
+                    self.assertEqual(self.client.llen(self.queue), 0)  # never retried
+                    self.assertEqual(self.client.llen(self.processing), 0)
+                    self.assertEqual(self.client.zcard(self.deadlines), 0)
+                    self.client.delete(f"{self.queue}.dlq")
 
     def test_publish_with_headers_stores_a_frame_and_pop_unframes(self):
         body = make_body(self.queue)

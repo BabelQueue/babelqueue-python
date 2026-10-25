@@ -114,6 +114,62 @@ class TierlessTest(unittest.TestCase):
         self.assertEqual(producer.produced, [])
         self.assertTrue(any("NOT acknowledged" in m for m in logs.output))
 
+    def _tierless_poison(self, bodies, **app_kwargs):
+        records = [OffsetMessage(raw, [], offset=i) for i, raw in enumerate(bodies)]
+        consumer = OffsetConsumer(records)
+        producer = ReportingProducer()
+        kafka = KafkaTransport(producer=producer, consumer_factory=lambda _q: consumer)  # no tiers
+        app = BabelQueue(transport=kafka, queue="orders", **app_kwargs)
+        app._rewind_pause = 0.0  # noqa: SLF001
+        app.register(URN, lambda data, meta: None)
+        return app, consumer, producer
+
+    def test_a_poison_record_without_tiers_and_without_a_dlq_is_committed_and_dropped(self):
+        # ADR-0036 decision 5 / broker-bindings section 6.5 (degrade-to-delete): the bounded retry
+        # of a poison record needs a tier and used to raise, leaving the record uncommitted with
+        # ``bq-attempts`` never advancing, so the partition blocked. Now it is committed and
+        # dropped (logged), and the partition moves on to the next record.
+        poison = [b"not json", b"[]", b'{"foo":1}', b"\xff\xfe not utf-8", b'{"job":"u","attempts":"x"}']
+        for strategy in ("fail", "release"):
+            with self.subTest(strategy=strategy):
+                valid = body().encode("utf-8")
+                app, consumer, producer = self._tierless_poison(
+                    [*poison, valid], max_attempts=3, on_unknown_urn=strategy,
+                )
+                with self.assertLogs("babelqueue.app", level="WARNING") as logs:
+                    self.assertEqual(app.consume(max_messages=len(poison) + 1, handle_signals=False), 6)
+                self.assertEqual(consumer.seeks, [])  # nothing rewound
+                self.assertEqual(consumer.commits, [0, 1, 2, 3, 4, 5])  # the partition advanced
+                self.assertEqual(producer.produced, [])  # not retried, not dead-lettered
+                dropped = [m for m in logs.output if "Dropping a poison record" in m]
+                self.assertEqual(len(dropped), len(poison))
+                self.assertTrue(all("degrade-to-delete" in m for m in dropped))
+
+    def test_a_poison_record_without_tiers_is_still_dead_lettered_when_the_dlq_is_on(self):
+        app, consumer, producer = self._tierless_poison([b"not json"], max_attempts=3, dead_letter=True)
+        app.consume(max_messages=1, handle_signals=False)
+        (record,) = producer.produced
+        self.assertEqual(record["topic"], "orders.dlq")
+        self.assertEqual(consumer.commits, [0])
+
+    def test_a_poison_record_without_tiers_is_dropped_by_the_delete_strategy_too(self):
+        app, consumer, producer = self._tierless_poison([b"not json"], max_attempts=3, on_unknown_urn="delete")
+        app.consume(max_messages=1, handle_signals=False)
+        self.assertEqual(producer.produced, [])
+        self.assertEqual(consumer.commits, [0])
+
+    def test_handler_failure_without_tiers_keeps_the_section_6_5_rule(self):
+        # Only poison degrades to delete: a valid envelope whose handler fails still cannot be
+        # retried without a tier (covered above); an unknown URN under ``release`` likewise.
+        consumer = OffsetConsumer([OffsetMessage(body().encode("utf-8").replace(URN.encode(), b"urn:other"), [], offset=0)])
+        kafka = KafkaTransport(producer=ReportingProducer(), consumer_factory=lambda _q: consumer)
+        app = BabelQueue(transport=kafka, queue="orders", max_attempts=3, on_unknown_urn="release")
+        app._rewind_pause = 0.0  # noqa: SLF001
+        with self.assertLogs("babelqueue.app", level="ERROR"):
+            app.consume(max_messages=1, handle_signals=False)
+        self.assertEqual(consumer.commits, [])
+        self.assertEqual(consumer.seeks, [("orders", 0, 0)])
+
     def test_no_warning_when_tiers_are_configured(self):
         kafka = _tier_transport(FakeProducer())
         self.assertEqual(self._warnings(kafka, max_attempts=3), [])

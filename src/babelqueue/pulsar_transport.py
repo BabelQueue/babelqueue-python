@@ -231,6 +231,17 @@ class PulsarTransport(Transport):
         return value if value <= _MAX_ATTEMPTS else None
 
     @staticmethod
+    def _native_attempts(redelivery_count: Any, properties: Optional[Dict[str, str]] = None) -> int:
+        """``max(bq-attempts, RedeliveryCount)`` (§5.5; 0-based): the reconciled count of a delivery
+        that has no decodable body attempts. An invalid or absent ``bq-attempts`` counts as 0."""
+        from_property = PulsarTransport._parse_attempts((properties or {}).get("bq-attempts")) or 0
+        try:
+            native = int(redelivery_count)
+        except (TypeError, ValueError):
+            native = 0
+        return max(from_property, native, 0)
+
+    @staticmethod
     def _reconcile(
         body: str,
         redelivery_count: Any,
@@ -320,7 +331,9 @@ class PulsarTransport(Transport):
         getter = getattr(message, "data", None)
         data = getter() if callable(getter) else getter
         if isinstance(data, bytes):
-            return data.decode("utf-8")
+            # Lossless: bytes that are not UTF-8 stay recoverable (``surrogateescape``) so a poison
+            # body is dead-lettered as the ADR-0035 base64 record instead of crashing the consumer.
+            return data.decode("utf-8", "surrogateescape")
         return str(data) if data is not None else ""
 
     # -- Transport ----------------------------------------------------------
@@ -370,12 +383,32 @@ class PulsarTransport(Transport):
             properties,
             self._on_routing_mismatch,
         )
-        return ReceivedMessage(body=body, queue=queue, handle=message, route_urn=route_urn)
+        return ReceivedMessage(
+            body=body,
+            queue=queue,
+            handle=message,
+            route_urn=route_urn,
+            # The §5.5 reconciled count without a body: what a poison body (no envelope to carry
+            # ``attempts``) is counted by (ADR-0036 decision 2).
+            native_attempts=self._native_attempts(self._redelivery_count(message), properties),
+        )
 
     def ack(self, message: ReceivedMessage) -> None:
         if message.handle is None:
             return
         self._consumer(message.queue).acknowledge(message.handle)
+
+    def rewind(self, message: ReceivedMessage) -> None:
+        """:class:`~babelqueue.transport.Rewinder`: negatively acknowledge ``message`` so the broker
+        redelivers it (Go ``Rewind`` = ``Nack``; ADR-0036 decision 1: a failed DLQ write or retry
+        publish leaves the original un-acknowledged for redelivery instead of leaving it unsettled
+        for the life of the consumer). On a ``Shared`` subscription the native redelivery count
+        advances, which the §5.5 reconciliation reads back; on ``Exclusive`` / ``Failover`` it does
+        not, which is harmless: the attempt limit is carried by the ``bq-attempts`` property and
+        the body, never by the nack."""
+        if message.handle is None:
+            return
+        self._consumer(message.queue).negative_acknowledge(message.handle)
 
     def close(self) -> None:  # pragma: no cover - resource cleanup
         for resource in (*self._producers.values(), *self._consumers.values()):

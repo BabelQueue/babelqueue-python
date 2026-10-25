@@ -14,7 +14,7 @@ jobs:
     # Recommended for PyPI Trusted Publishing — configure a "pypi" environment +
     # a trusted publisher on PyPI (repo BabelQueue/babelqueue-python, this workflow).
     environment: pypi
-    # redis_layout (conformance 1.6.0) drives the real Lua scripts: a real redis:7 is mandatory,
+    # redis_layout (conformance 1.7.0) drives the real Lua scripts: a real redis:7 is mandatory,
     # exactly as in ci.yml's `conformance` job — without it the cases are reported as failures.
     services:
       redis:
@@ -28,7 +28,7 @@ jobs:
           --health-retries 10
     env:
       # The pinned conformance release (ADR-0032). Keep identical to ci.yml.
-      BQ_CONFORMANCE_VERSION: 1.6.0
+      BQ_CONFORMANCE_VERSION: 1.7.0
       BQ_FETCH_SH_SHA256: 8bb6ba567b288fb0ac71a70fd17041b2503df119e01998d76fdad372570bf849
     permissions:
       id-token: write   # PyPI Trusted Publishing (OIDC) — no API token needed

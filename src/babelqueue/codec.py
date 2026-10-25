@@ -16,7 +16,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-from ._envelope_shape import CORE_META_KEYS
+from ._envelope_shape import CORE_META_KEYS, envelope_violation
 from .exceptions import BabelQueueError, EnvelopeKeyError
 
 SCHEMA_VERSION = 1
@@ -87,6 +87,15 @@ def has_forbidden_keys(envelope: Mapping[str, Any]) -> bool:
     before re-emit must check ``"urn" in envelope`` as well.
     """
     return _has_forbidden_keys(envelope)
+
+
+def has_invalid_utf8(text: str) -> bool:
+    """Whether ``text`` carries a byte that was not valid UTF-8 when the transport read it.
+
+    Transports read a body losslessly (``errors="surrogateescape"``), so every invalid byte
+    appears as a lone surrogate in ``U+DC80..U+DCFF``. A ``\\udcff`` *escape* in the JSON text is
+    plain ASCII and is not flagged."""
+    return any("\udc80" <= ch <= "\udcff" for ch in text)
 
 
 def _is_valid_urn(value: Any) -> bool:
@@ -298,6 +307,42 @@ class EnvelopeCodec:
         """
         parsed = _parse_object(raw)
         return {} if parsed is None else _fold_identity(parsed)
+
+    @staticmethod
+    def poison_cause(raw: str, *, require_identity: bool = True) -> Optional[str]:
+        """Why ``raw`` is a **poison** body, or ``None`` when it decodes into an envelope with an
+        identity (ADR-0036 decision 4, conformance ``identity_verdict``).
+
+        A body is poison when it is not exactly one JSON object (malformed, BOM, trailing tokens,
+        ``NaN`` / ``Infinity``, a bare ``null``, an array, a scalar), when a known member has the
+        wrong type (the trigger set of :func:`~babelqueue._envelope_shape.envelope_violation`, the
+        Go reference's typed ``Decode``), when the core parser cannot read it, or, with
+        ``require_identity``, when it has neither a valid string ``job`` nor a valid string
+        ``urn`` (ADR-0032 section 6: a ``job`` that is not a string is ignored, a blank one falls
+        back to ``urn``, a ``urn`` that is not a non-blank string is ignored; the last value of a
+        repeated member wins). A poison body is never handed to a handler and never takes the
+        unknown-URN strategies, which are for a valid envelope whose URN has no handler.
+
+        ``require_identity=False`` keeps only the structural checks, for a delivery that a
+        transport routes on an out-of-band identity property (the Pulsar ``bq-job``), which is
+        outside the identity rule. Pure: no warning is logged and nothing is mutated."""
+        if has_invalid_utf8(raw):
+            # error-handling.md section 7: a body that is not valid UTF-8 is poison even when its
+            # invalid bytes sit inside a JSON string, where ``json.loads`` would accept the lone
+            # surrogate they were escaped to. It must never reach a handler or be re-encoded.
+            return "the body is not valid UTF-8"
+        try:
+            violation = envelope_violation(raw)
+            if violation is not None:
+                return violation
+            parsed = json.loads(raw)
+        except (ValueError, RecursionError, TypeError) as exc:
+            return "the core decoder cannot parse the body: " + str(exc)
+        if not isinstance(parsed, dict):
+            return "the JSON root is not an object"
+        if require_identity and not (_is_valid_urn(parsed.get("job")) or _is_valid_urn(parsed.get("urn"))):
+            return "the body carries no valid 'job' or 'urn' identity (ADR-0032 section 6)"
+        return None
 
     @staticmethod
     def urn(envelope: Mapping[str, Any]) -> str:

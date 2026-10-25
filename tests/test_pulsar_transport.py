@@ -86,6 +86,7 @@ class FakeConsumer:
     def __init__(self, messages=()) -> None:
         self._messages = list(messages)
         self.acked: list = []
+        self.nacked: list = []
         self.subscribe_kwargs: dict = {}
 
     def receive(self, timeout_millis=None):
@@ -95,6 +96,9 @@ class FakeConsumer:
 
     def acknowledge(self, message) -> None:
         self.acked.append(message)
+
+    def negative_acknowledge(self, message) -> None:
+        self.nacked.append(message)
 
 
 class FakeClient:
