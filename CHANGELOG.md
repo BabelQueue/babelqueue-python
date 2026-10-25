@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.23.0] - 2026-10-25
+
 Implements ADR-0036 (post-R1 parity) decisions 2, 4, 5 and 6. A MINOR: every change is a
 consumer-side settle decision, so the envelope stays at `schema_version: 1`. The vendored
 conformance suite moves to v1.7.0 (new sections `identity_verdict` and `pulsar_exhaustion`, both
