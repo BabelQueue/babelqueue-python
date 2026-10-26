@@ -158,8 +158,13 @@ untrimmed; Azure Service Bus and Artemis also accept the integer `1`). A message
 anything else is not decoded: it reaches the runtime on the reserved route
 `babelqueue:unsupported-schema-version:<v>` (the version percent-escaped) and is **never
 retried** — it goes straight to the dead-letter queue (the incoming body, byte-identical,
-with no `dead_letter` block) when `dead_letter` is enabled, and is dropped otherwise, whatever `max_attempts` is.
-It does not depend on a broker `RedrivePolicy`. If the dead-letter write fails the message is
+with no `dead_letter` block) when `dead_letter` is enabled (or `on_unknown_urn=DEAD_LETTER`), and
+`on_unknown_urn=DELETE` drops it, whatever `max_attempts` is. With `dead_letter` off, **SQS and Azure
+Service Bus no longer drop it** (ADR-0037): it is left to the broker's native mechanism and logged
+(SQS: no `DeleteMessage`, so visibility expiry redelivers it — the gate rejects it again — and the
+queue's `RedrivePolicy` moves it to the native DLQ after `maxReceiveCount`; Azure Service Bus: an
+explicit native `DeadLetter` with reason `unsupported schema version` into `$DeadLetterQueue`
+instead of `Complete`). Kafka, Artemis and Pulsar still acknowledge and drop it. If the dead-letter write fails the message is
 left unacknowledged (an error is logged), is never retried and never reaches a handler; the
 dead-letter write is attempted again when the broker brings it back, which depends on the
 broker:
@@ -199,10 +204,17 @@ a warning. A **per-message delay** at publish time is
 standard queue; a larger value, or any per-message delay on a FIFO queue, raises
 `BabelQueueError` instead of being truncated or dropped).
 
+**Poison bodies.** A body that does not decode, or has no identity, is never retried by the SDK
+(ADR-0037): `dead_letter=True` writes the ADR-0035 record to the DLQ (`<queue>-dlq` on SQS, `<queue>.dlq` elsewhere) and then deletes it,
+`on_unknown_urn=DELETE` deletes it, and with the DLQ off it is **not deleted and not re-sent**: the
+transport's `settle_native` capability leaves it to SQS on the first delivery (visibility expiry,
+then the queue's `RedrivePolicy`; the event is logged). Azure Service Bus does the same with a native
+`DeadLetter` (reason `poison`). Every other transport keeps the bounded retry up to `max_attempts`.
+
 **Poison-loop risk:** a message that always fails is redelivered at once until
 `max_attempts` is reached. If the receive count is unavailable the SDK cannot
 advance attempts at all. **Configure a native `RedrivePolicy`**
-(`maxReceiveCount` ≥ `max_attempts`, pointing at `<queue>.dlq`) on every SQS
+(`maxReceiveCount` ≥ `max_attempts`, pointing at `<queue>-dlq`, the SQS default DLQ name: FIFO `<queue>-dlq.fifo`, because an SQS queue name cannot contain a dot; `dead_letter_queue` overrides it, and `dead_letter_suffix` replaces `-dlq`, placed before `.fifo` on a FIFO queue) on every SQS
 queue as the broker-side backstop, and set a non-zero `retry_backoff` if the
 handler's dependencies need time to recover.
 

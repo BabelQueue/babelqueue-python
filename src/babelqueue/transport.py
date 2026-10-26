@@ -229,6 +229,59 @@ class Rewinder(Protocol):
         ...
 
 
+@runtime_checkable
+class DeadLetterNamer(Protocol):
+    """Optional :class:`Transport` capability: the name of the BabelQueue dead-letter queue for a
+    source queue, for a broker whose queue-name rules the runtime-wide ``<queue><suffix>`` shape cannot
+    satisfy. The runtime asks it whenever ``dead_letter_queue`` is not set, passing ``dead_letter_suffix``
+    (``None`` when not set). Amazon SQS implements it (a queue name cannot contain a dot and a FIFO name
+    must end in ``.fifo``): the default is ``<queue>-dlq``, FIFO ``<queue>-dlq.fifo``, and an explicit
+    suffix goes before ``.fifo`` too (``orders.fifo`` + ``-x`` -> ``orders-x.fifo``), never after it
+    (ADR-0037 decision 7). A transport without it keeps ``<queue><suffix>`` with the default ``.dlq``."""
+
+    def dead_letter_queue_name(self, queue: str, suffix: Optional[str] = None) -> str:
+        """The dead-letter queue name for ``queue`` (``suffix`` is the explicit one, or ``None``)."""
+        ...
+
+
+@runtime_checkable
+class Abandoner(Protocol):
+    """Optional :class:`Transport` capability: hand an unsettled *version-gated* delivery back to the
+    broker at once (Azure Service Bus ``Abandon``; broker-bindings.md section 4.5 "A failed write
+    ``Abandon``s it"; ADR-0037 decision 1 rule 5).
+
+    The runtime calls :meth:`abandon` only when the dead-letter write of a version-gated delivery
+    failed, instead of leaving it locked until the lock lapses. It is deliberately narrower than
+    :class:`Rewinder`: a transport that offers only this capability keeps its previous graceful
+    shutdown release and retry re-publish failure handling (copy re-publish and ack)."""
+
+    def abandon(self, message: ReceivedMessage) -> None:
+        """Release the broker lock on ``message`` so the broker redelivers it right away."""
+        ...
+
+
+@runtime_checkable
+class NativeSettler(Protocol):
+    """Optional :class:`Transport` capability: leave a delivery the runtime can neither process nor
+    safely drop to the broker's own mechanism, without acknowledging or deleting it and without
+    re-publishing or retrying it (ADR-0037 decisions 1 and 2).
+
+    The runtime calls :meth:`settle_native` instead of acknowledging when dead-lettering is off (and
+    the strategy is neither ``delete`` nor a writable ``dead_letter``) for a version-gated delivery
+    (broker-bindings.md section 5.7 rule 3) and for a poison body (error-handling.md section 7).
+    SQS implements it as "do nothing" (no ``DeleteMessage``: visibility expiry redelivers the message
+    and the queue's ``RedrivePolicy`` moves it to the native DLQ after ``maxReceiveCount``); Azure
+    Service Bus implements it with an explicit native ``DeadLetter(reason, description)`` into
+    ``$DeadLetterQueue``. The body is never altered. A transport that does not implement it keeps
+    the previous settle (acknowledge and drop), so the behaviour follows the capability, never the
+    transport's name."""
+
+    def settle_native(self, message: ReceivedMessage, reason: str, description: str) -> None:
+        """Leave ``message`` to the broker's native mechanism; ``reason`` and ``description`` say
+        why (e.g. ``"unsupported schema version"``, ``"poison"``)."""
+        ...
+
+
 #: Reserved ``route_urn`` of a record whose envelope carries a non-numeric ``attempts`` (a foreign
 #: producer). It sits under the version-gated prefix, so the runtime dead-letters it directly, raw
 #: and never retried (retrying needs a numeric attempt counter); ``redrive`` restores it to the DLQ

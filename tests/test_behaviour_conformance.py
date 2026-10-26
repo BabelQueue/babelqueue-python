@@ -46,7 +46,7 @@ from babelqueue.pulsar_transport import PulsarTransport
 from babelqueue.redis_transport import RedisTransport, _LegacyHandle
 from babelqueue.schema import validate_schema
 from babelqueue.sqs_transport import SqsTransport
-from babelqueue.transport import NON_NUMERIC_ATTEMPTS_ROUTE, PoisonRoute, ReceivedMessage
+from babelqueue.transport import NON_NUMERIC_ATTEMPTS_ROUTE, PoisonRoute, ReceivedMessage, Transport
 
 SUITE = Path(__file__).parent / "conformance"
 MANIFEST = json.loads((SUITE / "manifest.json").read_text(encoding="utf-8"))
@@ -1438,6 +1438,95 @@ def _eval_pulsar_exhaustion(case: Mapping[str, Any]) -> None:
             )
 
 
+_GATE_ROUTE = "babelqueue:unsupported-schema-version:2"
+
+
+class VersionGateRecorder(Transport):
+    """A transport that hands the runtime ONE version-gated delivery (the reserved route a gating
+    transport sets) and records every publish and ack. It has no ``NativeSettler`` capability, so it
+    models Pulsar and Artemis (which keep "acknowledge and log"). ``fail_dlq`` makes every write to a
+    ``.dlq`` queue fail."""
+
+    def __init__(self, body: str, native_attempts: int = 0, fail_dlq: bool = False) -> None:
+        self._pending: List[ReceivedMessage] = [
+            ReceivedMessage(body=body, queue="orders", route_urn=_GATE_ROUTE, native_attempts=native_attempts)
+        ]
+        self.fail_dlq = fail_dlq
+        self.published: List[Tuple[str, str]] = []
+        self.acks = 0
+
+    def publish(self, queue: str, body: str) -> None:
+        if self.fail_dlq and queue.endswith(".dlq"):
+            raise RuntimeError("dlq unavailable")
+        self.published.append((queue, body))
+
+    def pop(self, queue: str, timeout: float = 1.0) -> Optional[ReceivedMessage]:
+        return self._pending.pop(0) if self._pending else None
+
+    def ack(self, message: ReceivedMessage) -> None:
+        self.acks += 1
+
+
+def version_gate_app(case: Mapping[str, Any], transport: Any) -> Tuple[BabelQueue, List[str]]:
+    """The runtime configured by a ``version_gate_*`` row: ``dead_letter`` on/off and the
+    ``on_unknown_urn`` strategy (absent = ``fail``). The returned list collects handler calls."""
+    calls: List[str] = []
+    app = BabelQueue(
+        transport=transport,
+        queue="orders",
+        max_attempts=3,
+        dead_letter=case["dead_letter"] == "on",
+        on_unknown_urn=case.get("on_unknown_urn", "fail"),
+    )
+    app.register("urn:babelqueue:order.created", lambda data, meta: calls.append("called"))
+    return app, calls
+
+
+def _version_gate_bodies(section: str) -> List[Mapping[str, Any]]:
+    return MANIFEST[section]["incoming_bodies"]
+
+
+def _eval_version_gate_app(section: str) -> Callable[[Mapping[str, Any]], None]:
+    """``version_gate_pulsar`` / ``version_gate_artemis`` (ADR-0037 decision 1; broker-bindings
+    §5.7): the gating transport hands over the reserved route, so the rows run through the runtime
+    over a recording transport without the ``NativeSettler`` capability (those two bindings keep
+    "acknowledge and log"). Python has the ``on_unknown_urn`` option: every row runs."""
+
+    def evaluate(case: Mapping[str, Any]) -> None:
+        expect = case["expect"]
+        for incoming in _version_gate_bodies(section):
+            transport = VersionGateRecorder(
+                incoming["body"],
+                native_attempts=7 if "bq_attempts" in case else 0,
+                fail_dlq=case.get("dlq_write") == "fails",
+            )
+            app, calls = version_gate_app(case, transport)
+            app.consume("orders", max_messages=1, timeout=0.01, handle_signals=False)
+            label = f"{case['name']}/{incoming['name']}"
+            _ensure(calls == [], f"{label}: a handler ran for a version-gated delivery")
+            _ensure(
+                all(queue.endswith(".dlq") for queue, _ in transport.published),
+                f"{label}: published to {transport.published!r}: a gated delivery is never retried",
+            )
+            outcome = expect["outcome"]
+            if outcome == "ack":
+                _ensure(transport.acks == 1 and transport.published == [], f"{label}: want one ack and no write")
+            elif outcome == "dlq_raw":
+                _ensure(transport.acks == 1 and len(transport.published) == 1, f"{label}: want one write then one ack")
+                if expect.get("record") == "incoming_body":
+                    written = transport.published[0][1]
+                    _ensure(written == incoming["body"], f"{label}: record {written!r} != incoming body")
+            elif outcome == "unsettled":
+                _ensure(
+                    transport.acks == 0 and transport.published == [],
+                    f"{label}: want no ack and no write, got acks={transport.acks} published={transport.published!r}",
+                )
+            else:
+                raise AssertionError(f"{label}: unhandled expected outcome {outcome!r}")
+
+    return evaluate
+
+
 def _top_level_names(text: str) -> List[str]:
     """Every top-level member name of the JSON object ``text`` (duplicates kept, last-wins not applied)."""
     names: List[List[str]] = []
@@ -1563,8 +1652,8 @@ class JobTypeConformanceTest(unittest.TestCase):
 
 
 class RunnerCaseIdTest(unittest.TestCase):
-    #: ``section -> number of case ids`` of the vendored conformance 1.7.0 manifest.
-    EXPECTED_COUNTS = {"identity_verdict": 97, "pulsar_exhaustion": 29, "trim": 35, "job_type": 11, "traceparent": 14, "delay": 9, "backoff": 29, "redis_layout": 59, "redis_delay": 8, "retry_backoff": 18, "kafka_poison": 92, "poison_dlq": 43, "idempotency": 7, "redis": 1, "rabbitmq": 1}
+    #: ``section -> number of case ids`` of the vendored conformance 1.8.0 manifest.
+    EXPECTED_COUNTS = {"identity_verdict": 97, "pulsar_exhaustion": 29, "trim": 35, "job_type": 11, "traceparent": 14, "delay": 9, "backoff": 29, "redis_layout": 59, "redis_delay": 8, "retry_backoff": 18, "kafka_poison": 92, "poison_dlq": 43, "idempotency": 7, "redis": 1, "rabbitmq": 1, "version_gate_pulsar": 17, "version_gate_artemis": 17, "version_gate_sqs": 17, "version_gate_asb": 17}
 
     def test_case_id_counts_match_the_manifest(self) -> None:
         for section, count in self.EXPECTED_COUNTS.items():
@@ -1593,7 +1682,7 @@ class RunnerCaseIdTest(unittest.TestCase):
         self.assertEqual(sum(len(c) for c in KNOWN_GAPS.values()), len(keys))
 
     def test_there_are_no_known_gaps(self) -> None:
-        # Every conformance 1.7.0 case is implemented (r1 Faz 08; conformance 1.7.0, post-R1 Faz 06): the gap list stays empty, and a
+        # Every conformance 1.8.0 case is implemented (r1 Faz 08; conformance 1.8.0, post-R1 Faz 06, poison-shape-parity Faz 07): the gap list stays empty, and a
         # new entry is a deliberate, reviewed change to this test as well.
         self.assertEqual({}, KNOWN_GAPS)
 
@@ -1653,6 +1742,21 @@ class PulsarExhaustionConformanceTest(unittest.TestCase):
         # Python has the on_unknown_urn option: every row runs (a skip would be a pass by omission).
         rows = [c for _, c in iter_cases(MANIFEST, "pulsar_exhaustion") if "on_unknown_urn" in c]
         self.assertEqual(10, len(rows))
+
+
+class VersionGatePulsarConformanceTest(unittest.TestCase):
+    def test_version_gate_pulsar_cases(self) -> None:
+        _run_cases(self, "version_gate_pulsar", _eval_version_gate_app("version_gate_pulsar"))
+
+    def test_the_strategy_rows_are_not_skipped(self) -> None:
+        # Python has the on_unknown_urn option: every row runs (a skip would be a pass by omission).
+        rows = [c for _, c in iter_cases(MANIFEST, "version_gate_pulsar") if "on_unknown_urn" in c]
+        self.assertEqual(14, len(rows))
+
+
+class VersionGateArtemisConformanceTest(unittest.TestCase):
+    def test_version_gate_artemis_cases(self) -> None:
+        _run_cases(self, "version_gate_artemis", _eval_version_gate_app("version_gate_artemis"))
 
 
 class PoisonDlqConformanceTest(unittest.TestCase):

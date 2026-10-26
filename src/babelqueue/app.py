@@ -43,8 +43,11 @@ from .replay import HEADER_REPLAY_BYPASS, _replay_scope
 from .routing import UnknownUrnStrategy
 from .transport import (
     NON_NUMERIC_ATTEMPTS_ROUTE,
+    Abandoner,
+    DeadLetterNamer,
     DeadLetterWriter,
     HeaderPublisher,
+    NativeSettler,
     PoisonRoute,
     ReceivedMessage,
     Redeliverer,
@@ -109,7 +112,7 @@ class BabelQueue:
         max_attempts: int = 3,
         dead_letter: bool = False,
         dead_letter_queue: Optional[str] = None,
-        dead_letter_suffix: str = ".dlq",
+        dead_letter_suffix: Optional[str] = None,
         retry_backoff: float = 0.0,
         retry_backoff_multiplier: float = 1.0,
         retry_backoff_max: float = 0.0,
@@ -143,6 +146,8 @@ class BabelQueue:
         self.max_attempts = max_attempts
         self.dead_letter_enabled = bool(dead_letter)
         self.dead_letter_queue = dead_letter_queue
+        #: ``None`` = not set: the transport's :class:`~babelqueue.transport.DeadLetterNamer` default
+        #: (SQS: ``<queue>-dlq``) or else ``.dlq``. An explicit value is handed to the namer.
         self.dead_letter_suffix = dead_letter_suffix
         self.retry_backoff = float(retry_backoff)
         if retry_jitter not in RETRY_JITTERS:
@@ -383,7 +388,10 @@ class BabelQueue:
                         received.queue,
                         exc_info=exc,
                     )
-                    self._rewind_unsettled(received)
+                    if received.route_urn.startswith(_UNSUPPORTED_SCHEMA_ROUTE_PREFIX):
+                        self._abandon_unsettled(received)
+                    else:
+                        self._rewind_unsettled(received)
                     return
                 self._retry_or_dead_letter(received, envelope, exc)
             else:
@@ -527,6 +535,49 @@ class BabelQueue:
                 received.queue,
                 exc_info=True,
             )
+
+    def _settle_native(self, received: ReceivedMessage, reason: str, description: str) -> bool:
+        """Hand ``received`` to the transport's :class:`~babelqueue.transport.NativeSettler`
+        capability and report whether it did: ``False`` means the transport has none and the caller
+        keeps its previous settle. The event is logged and never retried by the SDK; a failing call
+        is logged too and leaves the message unacknowledged (the broker redelivers it)."""
+        if not isinstance(self.transport, NativeSettler):
+            return False
+        logger.warning(
+            "Left to the broker's native mechanism (not acknowledged, not retried): queue %r, "
+            "route %r, reason %s.",
+            received.queue, received.route_urn, reason,
+        )
+        try:
+            self.transport.settle_native(received, reason, description)
+        except Exception:  # noqa: BLE001 - reported, never kills the loop
+            logger.error(
+                "Native settle of a message on queue %r failed; it stays unacknowledged and will "
+                "be redelivered by the broker.",
+                received.queue,
+                exc_info=True,
+            )
+        return True
+
+    def _abandon_unsettled(self, received: ReceivedMessage) -> None:
+        """A version-gated delivery whose dead-letter write failed: a :class:`Rewinder` transport is
+        rewound (:meth:`_rewind_unsettled`); an :class:`~babelqueue.transport.Abandoner` transport
+        (Azure Service Bus) abandons its lock so the broker redelivers it at once, after the same
+        short pause. Any other transport leaves it to its lock or visibility timeout."""
+        if isinstance(self.transport, Rewinder) or not isinstance(self.transport, Abandoner):
+            self._rewind_unsettled(received)
+            return
+        try:
+            self.transport.abandon(received)
+        except Exception:  # noqa: BLE001 - reported, never kills the loop
+            logger.error(
+                "Failed to abandon an unsettled version-gated message (route %r) on queue %r.",
+                received.route_urn,
+                received.queue,
+                exc_info=True,
+            )
+            return
+        self._stop.wait(self._rewind_pause)
 
     def _rewind_unsettled(self, received: ReceivedMessage) -> None:
         """Make a deliberately unsettled message come back (cumulative-offset brokers such as Kafka
@@ -717,10 +768,15 @@ class BabelQueue:
         * with the DLQ on (``dead_letter`` or the DEAD_LETTER strategy) it is written to the DLQ as
           the ADR-0035 record with ``reason: "poison"`` (original body preserved) and acknowledged
           after the write, with no retry;
-        * with the DLQ off it takes the bounded FAIL path (``RELEASE`` is replaced by it, a poison
-          body would otherwise be released forever): re-published with ``attempts + 1`` up to
-          ``max_attempts``, then dropped. The count is the larger of the transport's own delivery
-          count and the ``attempts`` of the bare body a previous retry left behind.
+        * with the DLQ off, on a transport with a native mechanism (SQS, Azure Service Bus: the
+          :class:`~babelqueue.transport.NativeSettler` capability) it is settled natively on the first
+          delivery -- not acknowledged, not re-published, not retried, body unchanged (ADR-0037
+          decision 2);
+        * with the DLQ off on any other transport it takes the bounded FAIL path (``RELEASE`` is
+          replaced by it, a poison body would otherwise be released forever): re-published with
+          ``attempts + 1`` up to ``max_attempts``, then dropped. The count is the larger of the
+          transport's own delivery count and the ``attempts`` of the bare body a previous retry left
+          behind.
 
         A failed DLQ write propagates: :meth:`dispatch` leaves the delivery unacknowledged."""
         if self.on_unknown_urn == UnknownUrnStrategy.DELETE:
@@ -733,6 +789,11 @@ class BabelQueue:
         attempts = self._poison_attempts(received)
         if self.dead_letter_enabled or self.on_unknown_urn == UnknownUrnStrategy.DEAD_LETTER:
             self._settle_transport_poison(received, cause, attempts)
+            return
+        # DLQ off, strategy neither delete nor a writable dead_letter: a transport with a native
+        # mechanism (SQS, Azure Service Bus) settles the poison body natively on the first delivery
+        # (ADR-0037 decision 2, "Go and Python") instead of the bounded retry below.
+        if self._settle_native(received, "poison", "the body does not decode into a valid envelope: " + cause):
             return
         self._retry_or_dead_letter(
             received,
@@ -779,11 +840,20 @@ class BabelQueue:
         )
 
     def _dead_letter_target(self, received: ReceivedMessage) -> str:
-        """The queue a dead-lettered delivery is written to (configured DLQ or ``<queue><suffix>``)."""
-        return self.dead_letter_queue or (received.queue + self.dead_letter_suffix)
+        """The queue a dead-lettered delivery is written to: the configured ``dead_letter_queue``, else
+        the transport's :class:`~babelqueue.transport.DeadLetterNamer` name (SQS: ``<queue>-dlq``, FIFO
+        ``<queue>-dlq.fifo``, an explicit ``dead_letter_suffix`` placed before ``.fifo``; ADR-0037
+        decision 7), else ``<queue><dead_letter_suffix>`` (default ``.dlq``)."""
+        if self.dead_letter_queue:
+            return self.dead_letter_queue
+        if isinstance(self.transport, DeadLetterNamer):
+            return self.transport.dead_letter_queue_name(received.queue, self.dead_letter_suffix)
+        return received.queue + (".dlq" if self.dead_letter_suffix is None else self.dead_letter_suffix)
 
     def _settle_version_gated(self, received: ReceivedMessage, always: bool = False) -> None:
-        """Dead-letter a version-gated delivery directly (no retry); drop it when no DLQ is set.
+        """Dead-letter a version-gated delivery directly (no retry). With no DLQ set it is left to the
+        transport's native mechanism when the transport has the :class:`~babelqueue.transport.NativeSettler`
+        capability (SQS, Azure Service Bus; ADR-0037 decision 1 rule 3) and dropped otherwise.
 
         ``always`` writes the DLQ record in every configuration, ignoring ``dead_letter_enabled``.
         A Kafka poison record reaches it with the DLQ already on (:meth:`_route_poison`). The Redis
@@ -798,7 +868,15 @@ class BabelQueue:
         if always or self.dead_letter_enabled or self.on_unknown_urn == UnknownUrnStrategy.DEAD_LETTER:
             self._write_dead_letter(received, self._dead_letter_target(received), received.body)
             return
-        # No DLQ to hold it: the drop is deliberate, but it must not be silent.
+        # No DLQ to hold it (broker-bindings §5.7 rule 3). A transport with a native mechanism (SQS,
+        # Azure Service Bus) leaves it to that mechanism instead of dropping it (ADR-0037 decision 1).
+        if self._settle_native(
+            received,
+            "unsupported schema version",
+            "the message declares a schema version this consumer does not support",
+        ):
+            return
+        # Any other transport: the drop is deliberate, but it must not be silent.
         logger.warning(
             "Dropping an undeliverable message on queue %r (route %r, %d body characters): it can "
             "never be handled and no dead-letter queue is configured.",

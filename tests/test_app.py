@@ -466,3 +466,117 @@ class AppTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _AckRecordingTransport(InMemoryTransport):
+    """In-memory transport that records every ack; ``settle_native`` is added by a subclass."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.acks = 0
+
+    def ack(self, message: ReceivedMessage) -> None:
+        self.acks += 1
+
+
+class _NativeTransport(_AckRecordingTransport):
+    """The optional :class:`~babelqueue.transport.NativeSettler` capability (SQS, Azure Service Bus)."""
+
+    def __init__(self, fail: bool = False) -> None:
+        super().__init__()
+        self.natives: list = []
+        self._fail = fail
+
+    def settle_native(self, message: ReceivedMessage, reason: str, description: str) -> None:
+        self.natives.append(reason)
+        if self._fail:
+            raise RuntimeError("broker unavailable")
+
+
+class NativeSettleTest(unittest.TestCase):
+    """ADR-0037 decisions 1 and 2: with the DLQ off, a transport with a native mechanism gets
+    ``settle_native`` instead of an ack (version-gated) or the bounded retry (poison)."""
+
+    GATE = "babelqueue:unsupported-schema-version:2"
+    RAW = '{"job":"urn:babel:orders:created","data":{},"meta":{"schema_version":2}}'
+
+    def _app(self, transport, **kwargs) -> BabelQueue:
+        app = BabelQueue(transport=transport, queue="orders", max_attempts=5, **kwargs)
+        app.register("urn:babel:orders:created", lambda data, meta: None)
+        return app
+
+    def test_a_version_gated_delivery_is_left_to_the_native_mechanism(self) -> None:
+        for kwargs in ({}, {"on_unknown_urn": UnknownUrnStrategy.RELEASE}, {"on_unknown_urn": UnknownUrnStrategy.FAIL}):
+            with self.subTest(**kwargs):
+                transport = _NativeTransport()
+                app = self._app(transport, **kwargs)
+                with self.assertLogs("babelqueue.app", level="WARNING"):
+                    app.dispatch(ReceivedMessage(body=self.RAW, queue="orders", route_urn=self.GATE))
+                self.assertEqual(["unsupported schema version"], transport.natives)
+                self.assertEqual(0, transport.acks)
+                self.assertEqual(0, transport.size("orders"))
+                self.assertEqual(0, transport.size("orders.dlq"))
+
+    def test_delete_and_dead_lettering_keep_their_settle_for_a_gated_delivery(self) -> None:
+        transport = _NativeTransport()
+        app = self._app(transport, on_unknown_urn=UnknownUrnStrategy.DELETE)
+        app.dispatch(ReceivedMessage(body=self.RAW, queue="orders", route_urn=self.GATE))
+        self.assertEqual((0, 1), (len(transport.natives), transport.acks))
+
+        for kwargs in ({"dead_letter": True}, {"on_unknown_urn": UnknownUrnStrategy.DEAD_LETTER}):
+            with self.subTest(**kwargs):
+                transport = _NativeTransport()
+                app = self._app(transport, **kwargs)
+                app.dispatch(ReceivedMessage(body=self.RAW, queue="orders", route_urn=self.GATE))
+                self.assertEqual((0, 1), (len(transport.natives), transport.acks))
+                self.assertEqual(self.RAW, transport._queues["orders.dlq"][0])  # noqa: SLF001
+
+    def test_a_transport_without_the_capability_still_acks_and_drops_a_gated_delivery(self) -> None:
+        transport = _AckRecordingTransport()
+        app = self._app(transport)
+        with self.assertLogs("babelqueue.app", level="WARNING"):
+            app.dispatch(ReceivedMessage(body=self.RAW, queue="orders", route_urn=self.GATE))
+        self.assertEqual(1, transport.acks)
+
+    def test_a_poison_body_is_settled_natively_on_the_first_delivery(self) -> None:
+        for body in ("not json", '{"foo":1}', '{"job":"  ","attempts":0}', "[1]"):
+            for strategy in (UnknownUrnStrategy.FAIL, UnknownUrnStrategy.RELEASE):
+                with self.subTest(body=body, strategy=strategy):
+                    transport = _NativeTransport()
+                    app = self._app(transport, on_unknown_urn=strategy)
+                    with self.assertLogs("babelqueue.app", level="WARNING"):
+                        app.dispatch(ReceivedMessage(body=body, queue="orders"))
+                    self.assertEqual(["poison"], transport.natives)
+                    self.assertEqual(0, transport.acks)
+                    self.assertEqual(0, transport.size("orders"))  # nothing re-published
+                    self.assertEqual(0, transport.size("orders.dlq"))
+
+    def test_delete_and_dead_lettering_keep_their_settle_for_a_poison_body(self) -> None:
+        transport = _NativeTransport()
+        app = self._app(transport, on_unknown_urn=UnknownUrnStrategy.DELETE)
+        with self.assertLogs("babelqueue.app", level="WARNING"):
+            app.dispatch(ReceivedMessage(body="not json", queue="orders"))
+        self.assertEqual((0, 1), (len(transport.natives), transport.acks))
+
+        for kwargs in ({"dead_letter": True}, {"on_unknown_urn": UnknownUrnStrategy.DEAD_LETTER}):
+            with self.subTest(**kwargs):
+                transport = _NativeTransport()
+                app = self._app(transport, **kwargs)
+                app.dispatch(ReceivedMessage(body="not json", queue="orders"))
+                self.assertEqual((0, 1), (len(transport.natives), transport.acks))
+                self.assertEqual(1, transport.size("orders.dlq"))
+                self.assertEqual("poison", json.loads(transport._queues["orders.dlq"][0])["dead_letter"]["reason"])  # noqa: SLF001
+
+    def test_a_transport_without_the_capability_keeps_the_bounded_poison_retry(self) -> None:
+        transport = _AckRecordingTransport()
+        app = self._app(transport)
+        app.dispatch(ReceivedMessage(body="not json", queue="orders"))
+        self.assertEqual(1, transport.acks)  # the original is acknowledged ...
+        self.assertEqual(1, transport.size("orders"))  # ... and an empty envelope is re-published
+
+    def test_a_failing_native_settle_neither_acks_nor_retries(self) -> None:
+        transport = _NativeTransport(fail=True)
+        app = self._app(transport)
+        with self.assertLogs("babelqueue.app", level="ERROR"):
+            app.dispatch(ReceivedMessage(body="not json", queue="orders"))
+        self.assertEqual((["poison"], 0, 0), (transport.natives, transport.acks, transport.size("orders")))

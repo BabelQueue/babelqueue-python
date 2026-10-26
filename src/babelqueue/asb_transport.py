@@ -12,6 +12,10 @@ Consuming uses the PeekLock reservation model (``receive_messages`` -> process -
 ``DeliveryCount`` (1-based), reconciled onto the envelope as ``attempts = DeliveryCount - 1``.
 A message left un-acked has its lock expire and is redelivered (at-least-once).
 
+A version-gated message (``bq-schema-version`` the consumer does not support) or a poison body is, with
+dead-lettering off, not completed: :meth:`AsbTransport.settle_native` dead-letters it natively into
+``$DeadLetterQueue`` (ADR-0037).
+
 This implements §4 of the broker-bindings contract. The envelope is unchanged
 (``schema_version`` stays 1); Azure Service Bus is purely additive.
 
@@ -268,6 +272,39 @@ class AsbTransport(Transport):
         if message.handle is None:
             return
         self._receiver(message.queue).complete_message(message.handle)
+
+    def abandon(self, message: ReceivedMessage) -> None:
+        """:class:`~babelqueue.transport.Abandoner`: abandon the peek-lock on ``message`` so the
+        broker redelivers it right away (``AbandonMessage``) instead of when the lock lapses.
+        Nothing is completed or dead-lettered and the body is untouched. The runtime calls it only
+        when the dead-letter write of a version-gated message failed (broker-bindings 4.5, "A failed
+        write ``Abandon``s it"). This transport is deliberately **not** a
+        :class:`~babelqueue.transport.Rewinder`, so a graceful-shutdown release and a failed retry
+        re-publish keep their previous handling (copy re-publish and ``Complete``). A message
+        without a handle, or a receiver without ``abandon_message`` (a test fake), leaves the lock to
+        lapse."""
+        if message.handle is None:
+            return
+        abandon = getattr(self._receiver(message.queue), "abandon_message", None)
+        if abandon is not None:
+            abandon(message.handle)
+
+    def settle_native(self, message: ReceivedMessage, reason: str, description: str) -> None:
+        """Dead-letter ``message`` natively (:class:`~babelqueue.transport.NativeSettler`, ADR-0037
+        decisions 1 and 2): a version-gated delivery or a poison body that the runtime may neither
+        process nor drop, with dead-lettering off, is moved by an explicit ``DeadLetter`` (reason
+        ``"unsupported schema version"`` or ``"poison"``, plus the description) into the entity's
+        ``$DeadLetterQueue``. Nothing is completed, re-published or retried, and the body is
+        unchanged. A receiver without ``dead_letter_message`` abandons the lock instead (also a
+        conformant native settle: ``MaxDeliveryCount`` takes over)."""
+        if message.handle is None:
+            return
+        receiver = self._receiver(message.queue)
+        dead_letter = getattr(receiver, "dead_letter_message", None)
+        if dead_letter is not None:
+            dead_letter(message.handle, reason=reason, error_description=description)
+            return
+        self.abandon(message)
 
     def close(self) -> None:  # pragma: no cover - resource cleanup
         for resource in (*self._senders.values(), *self._receivers.values(), self._client):

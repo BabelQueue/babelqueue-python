@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "conformance_version": "1.7.0",
+  "conformance_version": "1.8.0",
   "sections": {
     "cases": {
       "scope": "core"
@@ -85,6 +85,18 @@
     },
     "pulsar_exhaustion": {
       "scope": "pulsar"
+    },
+    "version_gate_pulsar": {
+      "scope": "pulsar"
+    },
+    "version_gate_artemis": {
+      "scope": "artemis"
+    },
+    "version_gate_sqs": {
+      "scope": "sqs"
+    },
+    "version_gate_asb": {
+      "scope": "asb"
     }
   },
   "exceptions": [
@@ -6612,6 +6624,698 @@
         "dead_letter": false,
         "expect": {
           "outcome": "drop"
+        }
+      }
+    ]
+  },
+  "version_gate_pulsar": {
+    "description": "Version-gate settle rule for Apache Pulsar (broker-bindings.md section 5.7, property `bq-schema-version`) (ADR-0037 decision 1; broker-bindings.md section 5.7 \"Version-gate settle rule\"). Scope: `pulsar`. A pure function, no broker: for each case compute how the consumer settles a delivery whose schema-version property is present, not null, not blank and not the supported version, and assert `expect`. Which property values are version-gated is NOT decided here: the `schema_version_gate` block of this binding already locks the trigger. A runner feeds the delivery a property value that gates (any of that block's rejected values, for example `2`). Case `{name, on_unknown_urn?, dead_letter, dlq_write?, bq_attempts?, expect}`. `on_unknown_urn`: `fail` | `delete` | `release` | `dead_letter`; absent = `fail`. A row with any value other than `fail` applies only to an SDK whose consumer has the strategy option; the Java, .NET and Node Pulsar consumers have none (they behave as `fail`), so a runner for one of them reports those rows as `skip` citing ADR-0037, not as `pass`. `release` behaves as `fail` for a version-gated delivery (it is never released). The version gate reads only the explicitly configured `on_unknown_urn` strategy; with none configured it is `fail`. An `onUnknownUrn` hook, any strategy a hook implies (a hook-only Java or Node SQS consumer would otherwise be `delete`) and a hook's precedence over the strategy (the .NET SQS consumer) do not affect it: the hook is for an unknown URN only, so a hook-only consumer settles these rows as `fail`. `dead_letter`: `on` | `off` (dead-lettering on or off, each SDK's existing meaning; for the `dead_letter` strategy with `off` see `expect.outcome_no_writer`). `dlq_write`: `ok` | `fails`, whether the write of the raw record to `<queue>.dlq` succeeds; absent = `ok` (ADR-0037). It is read only on rows whose `expect.outcome` writes a record (`dlq_raw` or `unsettled`); it is present on those rows, and also on the `dead_letter` strategy rows with `dead_letter: off`, where an SDK with a writable DLQ target writes and an SDK without a writer asserts `outcome_no_writer` instead. `bq_attempts`: optional, the `bq-attempts` property as a string; present only to show that the outcome does not depend on it (the rule applies on the first delivery, with no retry, whatever the attempts, the native redelivery count or the max-attempts setting say). `expect.outcome`: `ack` | `dlq_raw` (the raw record is written to `<queue>.dlq`, then the delivery is acknowledged) | `unsettled` (the write failed: the delivery is neither acknowledged nor retried by the SDK and the failure is reported; negative acknowledgement). With dead-lettering off and a strategy other than `dead_letter` the outcome is `ack` (acknowledged and dropped, logged). `expect.record` (only on `dlq_raw` rows): `incoming_body`, the record written to `<queue>.dlq` has a body equal to the incoming body byte for byte and carries no `dead_letter` block (no re-encoding, no ADR-0035 wrapping). A runner checks it against every body of `incoming_bodies`, which are deliberately not in canonical form, so a writer that decodes and re-encodes fails. `expect.outcome_no_writer`: optional; a runner for an SDK in which `dead_letter: off` means NO DLQ writer exists (no publisher, sender or queue URL) asserts it instead of `expect.outcome`. It is present exactly on the rows with strategy `dead_letter` and `dead_letter: off`, where the two kinds differ (here: `ack`). Absent = both kinds assert `expect.outcome`. In every case the delivery is never decoded, no handler and no `onUnknownUrn` hook is called, and nothing is retried. The Laravel driver for this binding (if any) falls under the ADR-0037 decision 4 exception and reports every case of this section as `skip` with reason `ADR-0037 decision 4`; a package with no consumer for this binding (produce-only) follows the rule of the existing `sqs` / `artemis` binding sections (see README, \"Added in 1.8.0\"). Out of scope: Kafka (a version-gated record takes the section 6.5 poison path) and RabbitMQ.",
+    "incoming_bodies": [
+      {
+        "name": "pretty-printed-escaped",
+        "body": "{\n  \"job\": \"urn:babelqueue:order.created\",\n  \"data\": { \"name\": \"caf\\u00e9\", \"path\": \"a\\/b\" },\n  \"meta\": { \"schema_version\": 2 }\n}\n"
+      },
+      {
+        "name": "key-order-and-number-forms",
+        "body": "{\"meta\": {\"schema_version\": 2}, \"data\": {\"z\": 1, \"a\": 2, \"ratio\": 1.50, \"exp\": 1E2, \"big\": 12345678901234567890}, \"job\": \"urn:babelqueue:order.created\"}"
+      },
+      {
+        "name": "not-json",
+        "body": "plain text, not JSON  \t "
+      }
+    ],
+    "cases": [
+      {
+        "name": "default-dlq-on-write-ok",
+        "dead_letter": "on",
+        "dlq_write": "ok",
+        "expect": {
+          "outcome": "dlq_raw",
+          "record": "incoming_body"
+        }
+      },
+      {
+        "name": "default-dlq-on-write-fails",
+        "dead_letter": "on",
+        "dlq_write": "fails",
+        "expect": {
+          "outcome": "unsettled"
+        }
+      },
+      {
+        "name": "fail-dlq-on-write-ok",
+        "on_unknown_urn": "fail",
+        "dead_letter": "on",
+        "dlq_write": "ok",
+        "expect": {
+          "outcome": "dlq_raw",
+          "record": "incoming_body"
+        }
+      },
+      {
+        "name": "fail-dlq-on-write-fails",
+        "on_unknown_urn": "fail",
+        "dead_letter": "on",
+        "dlq_write": "fails",
+        "expect": {
+          "outcome": "unsettled"
+        }
+      },
+      {
+        "name": "fail-dlq-on-write-ok-bq-attempts-7",
+        "on_unknown_urn": "fail",
+        "dead_letter": "on",
+        "dlq_write": "ok",
+        "bq_attempts": "7",
+        "expect": {
+          "outcome": "dlq_raw",
+          "record": "incoming_body"
+        }
+      },
+      {
+        "name": "release-dlq-on-write-ok",
+        "on_unknown_urn": "release",
+        "dead_letter": "on",
+        "dlq_write": "ok",
+        "expect": {
+          "outcome": "dlq_raw",
+          "record": "incoming_body"
+        }
+      },
+      {
+        "name": "release-dlq-on-write-fails",
+        "on_unknown_urn": "release",
+        "dead_letter": "on",
+        "dlq_write": "fails",
+        "expect": {
+          "outcome": "unsettled"
+        }
+      },
+      {
+        "name": "delete-dlq-on-acks",
+        "on_unknown_urn": "delete",
+        "dead_letter": "on",
+        "expect": {
+          "outcome": "ack"
+        }
+      },
+      {
+        "name": "delete-dlq-off-acks",
+        "on_unknown_urn": "delete",
+        "dead_letter": "off",
+        "expect": {
+          "outcome": "ack"
+        }
+      },
+      {
+        "name": "dead-letter-dlq-on-write-ok",
+        "on_unknown_urn": "dead_letter",
+        "dead_letter": "on",
+        "dlq_write": "ok",
+        "expect": {
+          "outcome": "dlq_raw",
+          "record": "incoming_body"
+        }
+      },
+      {
+        "name": "dead-letter-dlq-on-write-fails",
+        "on_unknown_urn": "dead_letter",
+        "dead_letter": "on",
+        "dlq_write": "fails",
+        "expect": {
+          "outcome": "unsettled"
+        }
+      },
+      {
+        "name": "default-dlq-off-ack",
+        "dead_letter": "off",
+        "expect": {
+          "outcome": "ack"
+        }
+      },
+      {
+        "name": "fail-dlq-off-ack",
+        "on_unknown_urn": "fail",
+        "dead_letter": "off",
+        "expect": {
+          "outcome": "ack"
+        }
+      },
+      {
+        "name": "fail-dlq-off-ack-bq-attempts-7",
+        "on_unknown_urn": "fail",
+        "dead_letter": "off",
+        "bq_attempts": "7",
+        "expect": {
+          "outcome": "ack"
+        }
+      },
+      {
+        "name": "release-dlq-off-ack",
+        "on_unknown_urn": "release",
+        "dead_letter": "off",
+        "expect": {
+          "outcome": "ack"
+        }
+      },
+      {
+        "name": "dead-letter-dlq-off-write-ok",
+        "on_unknown_urn": "dead_letter",
+        "dead_letter": "off",
+        "dlq_write": "ok",
+        "expect": {
+          "outcome": "dlq_raw",
+          "record": "incoming_body",
+          "outcome_no_writer": "ack"
+        }
+      },
+      {
+        "name": "dead-letter-dlq-off-write-fails",
+        "on_unknown_urn": "dead_letter",
+        "dead_letter": "off",
+        "dlq_write": "fails",
+        "expect": {
+          "outcome": "unsettled",
+          "outcome_no_writer": "ack"
+        }
+      }
+    ]
+  },
+  "version_gate_artemis": {
+    "description": "Version-gate settle rule for Apache ActiveMQ Artemis (broker-bindings.md section 7.7, property `bq_schema_version`) (ADR-0037 decision 1; broker-bindings.md section 5.7 \"Version-gate settle rule\"). Scope: `artemis`. A pure function, no broker: for each case compute how the consumer settles a delivery whose schema-version property is present, not null, not blank and not the supported version, and assert `expect`. Which property values are version-gated is NOT decided here: the `schema_version_gate` block of this binding already locks the trigger. A runner feeds the delivery a property value that gates (any of that block's rejected values, for example `2`). Case `{name, on_unknown_urn?, dead_letter, dlq_write?, bq_attempts?, expect}`. `on_unknown_urn`: `fail` | `delete` | `release` | `dead_letter`; absent = `fail`. Every row is asserted: the Java, .NET, Node, Go and Python consumers of this binding have the strategy option, so none of its rows may be skipped for lack of it. `release` behaves as `fail` for a version-gated delivery (it is never released). The version gate reads only the explicitly configured `on_unknown_urn` strategy; with none configured it is `fail`. An `onUnknownUrn` hook, any strategy a hook implies (a hook-only Java or Node SQS consumer would otherwise be `delete`) and a hook's precedence over the strategy (the .NET SQS consumer) do not affect it: the hook is for an unknown URN only, so a hook-only consumer settles these rows as `fail`. `dead_letter`: `on` | `off` (dead-lettering on or off, each SDK's existing meaning; for the `dead_letter` strategy with `off` see `expect.outcome_no_writer`). `dlq_write`: `ok` | `fails`, whether the write of the raw record to `<queue>.dlq` succeeds; absent = `ok` (ADR-0037). It is read only on rows whose `expect.outcome` writes a record (`dlq_raw` or `unsettled`); it is present on those rows, and also on the `dead_letter` strategy rows with `dead_letter: off`, where an SDK with a writable DLQ target writes and an SDK without a writer asserts `outcome_no_writer` instead. `bq_attempts`: optional, the `bq-attempts` property as a string; present only to show that the outcome does not depend on it (the rule applies on the first delivery, with no retry, whatever the attempts, the native redelivery count or the max-attempts setting say). `expect.outcome`: `ack` | `dlq_raw` (the raw record is written to `<queue>.dlq`, then the delivery is acknowledged) | `unsettled` (the write failed: the delivery is neither acknowledged nor retried by the SDK and the failure is reported; JMS `session.recover()` / AMQP `released`). With dead-lettering off and a strategy other than `dead_letter` the outcome is `ack` (acknowledged and dropped, logged). `expect.record` (only on `dlq_raw` rows): `incoming_body`, the record written to `<queue>.dlq` has a body equal to the incoming body byte for byte and carries no `dead_letter` block (no re-encoding, no ADR-0035 wrapping). A runner checks it against every body of `incoming_bodies`, which are deliberately not in canonical form, so a writer that decodes and re-encodes fails. `expect.outcome_no_writer`: optional; a runner for an SDK in which `dead_letter: off` means NO DLQ writer exists (no publisher, sender or queue URL) asserts it instead of `expect.outcome`. It is present exactly on the rows with strategy `dead_letter` and `dead_letter: off`, where the two kinds differ (here: `ack`). Absent = both kinds assert `expect.outcome`. In every case the delivery is never decoded, no handler and no `onUnknownUrn` hook is called, and nothing is retried. The Laravel driver for this binding (if any) falls under the ADR-0037 decision 4 exception and reports every case of this section as `skip` with reason `ADR-0037 decision 4`; a package with no consumer for this binding (produce-only) follows the rule of the existing `sqs` / `artemis` binding sections (see README, \"Added in 1.8.0\"). Out of scope: Kafka (a version-gated record takes the section 6.5 poison path) and RabbitMQ.",
+    "incoming_bodies": [
+      {
+        "name": "pretty-printed-escaped",
+        "body": "{\n  \"job\": \"urn:babelqueue:order.created\",\n  \"data\": { \"name\": \"caf\\u00e9\", \"path\": \"a\\/b\" },\n  \"meta\": { \"schema_version\": 2 }\n}\n"
+      },
+      {
+        "name": "key-order-and-number-forms",
+        "body": "{\"meta\": {\"schema_version\": 2}, \"data\": {\"z\": 1, \"a\": 2, \"ratio\": 1.50, \"exp\": 1E2, \"big\": 12345678901234567890}, \"job\": \"urn:babelqueue:order.created\"}"
+      },
+      {
+        "name": "not-json",
+        "body": "plain text, not JSON  \t "
+      }
+    ],
+    "cases": [
+      {
+        "name": "default-dlq-on-write-ok",
+        "dead_letter": "on",
+        "dlq_write": "ok",
+        "expect": {
+          "outcome": "dlq_raw",
+          "record": "incoming_body"
+        }
+      },
+      {
+        "name": "default-dlq-on-write-fails",
+        "dead_letter": "on",
+        "dlq_write": "fails",
+        "expect": {
+          "outcome": "unsettled"
+        }
+      },
+      {
+        "name": "fail-dlq-on-write-ok",
+        "on_unknown_urn": "fail",
+        "dead_letter": "on",
+        "dlq_write": "ok",
+        "expect": {
+          "outcome": "dlq_raw",
+          "record": "incoming_body"
+        }
+      },
+      {
+        "name": "fail-dlq-on-write-fails",
+        "on_unknown_urn": "fail",
+        "dead_letter": "on",
+        "dlq_write": "fails",
+        "expect": {
+          "outcome": "unsettled"
+        }
+      },
+      {
+        "name": "fail-dlq-on-write-ok-bq-attempts-7",
+        "on_unknown_urn": "fail",
+        "dead_letter": "on",
+        "dlq_write": "ok",
+        "bq_attempts": "7",
+        "expect": {
+          "outcome": "dlq_raw",
+          "record": "incoming_body"
+        }
+      },
+      {
+        "name": "release-dlq-on-write-ok",
+        "on_unknown_urn": "release",
+        "dead_letter": "on",
+        "dlq_write": "ok",
+        "expect": {
+          "outcome": "dlq_raw",
+          "record": "incoming_body"
+        }
+      },
+      {
+        "name": "release-dlq-on-write-fails",
+        "on_unknown_urn": "release",
+        "dead_letter": "on",
+        "dlq_write": "fails",
+        "expect": {
+          "outcome": "unsettled"
+        }
+      },
+      {
+        "name": "delete-dlq-on-acks",
+        "on_unknown_urn": "delete",
+        "dead_letter": "on",
+        "expect": {
+          "outcome": "ack"
+        }
+      },
+      {
+        "name": "delete-dlq-off-acks",
+        "on_unknown_urn": "delete",
+        "dead_letter": "off",
+        "expect": {
+          "outcome": "ack"
+        }
+      },
+      {
+        "name": "dead-letter-dlq-on-write-ok",
+        "on_unknown_urn": "dead_letter",
+        "dead_letter": "on",
+        "dlq_write": "ok",
+        "expect": {
+          "outcome": "dlq_raw",
+          "record": "incoming_body"
+        }
+      },
+      {
+        "name": "dead-letter-dlq-on-write-fails",
+        "on_unknown_urn": "dead_letter",
+        "dead_letter": "on",
+        "dlq_write": "fails",
+        "expect": {
+          "outcome": "unsettled"
+        }
+      },
+      {
+        "name": "default-dlq-off-ack",
+        "dead_letter": "off",
+        "expect": {
+          "outcome": "ack"
+        }
+      },
+      {
+        "name": "fail-dlq-off-ack",
+        "on_unknown_urn": "fail",
+        "dead_letter": "off",
+        "expect": {
+          "outcome": "ack"
+        }
+      },
+      {
+        "name": "fail-dlq-off-ack-bq-attempts-7",
+        "on_unknown_urn": "fail",
+        "dead_letter": "off",
+        "bq_attempts": "7",
+        "expect": {
+          "outcome": "ack"
+        }
+      },
+      {
+        "name": "release-dlq-off-ack",
+        "on_unknown_urn": "release",
+        "dead_letter": "off",
+        "expect": {
+          "outcome": "ack"
+        }
+      },
+      {
+        "name": "dead-letter-dlq-off-write-ok",
+        "on_unknown_urn": "dead_letter",
+        "dead_letter": "off",
+        "dlq_write": "ok",
+        "expect": {
+          "outcome": "dlq_raw",
+          "record": "incoming_body",
+          "outcome_no_writer": "ack"
+        }
+      },
+      {
+        "name": "dead-letter-dlq-off-write-fails",
+        "on_unknown_urn": "dead_letter",
+        "dead_letter": "off",
+        "dlq_write": "fails",
+        "expect": {
+          "outcome": "unsettled",
+          "outcome_no_writer": "ack"
+        }
+      }
+    ]
+  },
+  "version_gate_sqs": {
+    "description": "Version-gate settle rule for Amazon SQS (broker-bindings.md section 3.7, message attribute `bq-schema-version`) (ADR-0037 decision 1; broker-bindings.md section 5.7 \"Version-gate settle rule\"). Scope: `sqs`. A pure function, no broker: for each case compute how the consumer settles a delivery whose schema-version property is present, not null, not blank and not the supported version, and assert `expect`. Which property values are version-gated is NOT decided here: the `schema_version_gate` block of this binding already locks the trigger. A runner feeds the delivery a property value that gates (any of that block's rejected values, for example `2`). Case `{name, on_unknown_urn?, dead_letter, dlq_write?, bq_attempts?, expect}`. `on_unknown_urn`: `fail` | `delete` | `release` | `dead_letter`; absent = `fail`. Every row is asserted: the Java, .NET, Node, Go and Python consumers of this binding have the strategy option, so none of its rows may be skipped for lack of it. `release` behaves as `fail` for a version-gated delivery (it is never released). The version gate reads only the explicitly configured `on_unknown_urn` strategy; with none configured it is `fail`. An `onUnknownUrn` hook, any strategy a hook implies (a hook-only Java or Node SQS consumer would otherwise be `delete`) and a hook's precedence over the strategy (the .NET SQS consumer) do not affect it: the hook is for an unknown URN only, so a hook-only consumer settles these rows as `fail`. `dead_letter`: `on` | `off` (dead-lettering on or off, each SDK's existing meaning; for the `dead_letter` strategy with `off` see `expect.outcome_no_writer`). `dlq_write`: `ok` | `fails`, whether the write of the raw record to `<queue>.dlq` succeeds; absent = `ok` (ADR-0037). It is read only on rows whose `expect.outcome` writes a record (`dlq_raw` or `unsettled`); it is present on those rows, and also on the `dead_letter` strategy rows with `dead_letter: off`, where an SDK with a writable DLQ target writes and an SDK without a writer asserts `outcome_no_writer` instead. `bq_attempts`: optional, the `bq-attempts` property as a string; present only to show that the outcome does not depend on it (the rule applies on the first delivery, with no retry, whatever the attempts, the native redelivery count or the max-attempts setting say). `expect.outcome`: `ack` | `dlq_raw` (the raw record is written to `<queue>.dlq`, then the delivery is acknowledged) | `unsettled` (the write failed: the delivery is neither acknowledged nor retried by the SDK and the failure is reported; no `DeleteMessage`). With dead-lettering off and a strategy other than `dead_letter` the outcome is `native` (the SDK does not settle it and leaves it to the broker's native mechanism: SQS no `DeleteMessage`, so visibility expiry redelivers it and the queue's `RedrivePolicy` / retention applies; it is reported, not retried by the SDK). `expect.record` (only on `dlq_raw` rows): `incoming_body`, the record written to `<queue>.dlq` has a body equal to the incoming body byte for byte and carries no `dead_letter` block (no re-encoding, no ADR-0035 wrapping). A runner checks it against every body of `incoming_bodies`, which are deliberately not in canonical form, so a writer that decodes and re-encodes fails. `expect.outcome_no_writer`: optional; a runner for an SDK in which `dead_letter: off` means NO DLQ writer exists (no publisher, sender or queue URL) asserts it instead of `expect.outcome`. It is present exactly on the rows with strategy `dead_letter` and `dead_letter: off`, where the two kinds differ (here: `native`). Absent = both kinds assert `expect.outcome`. In every case the delivery is never decoded, no handler and no `onUnknownUrn` hook is called, and nothing is retried. The Laravel driver for this binding (if any) falls under the ADR-0037 decision 4 exception and reports every case of this section as `skip` with reason `ADR-0037 decision 4`; a package with no consumer for this binding (produce-only) follows the rule of the existing `sqs` / `artemis` binding sections (see README, \"Added in 1.8.0\"). Out of scope: Kafka (a version-gated record takes the section 6.5 poison path) and RabbitMQ.",
+    "incoming_bodies": [
+      {
+        "name": "pretty-printed-escaped",
+        "body": "{\n  \"job\": \"urn:babelqueue:order.created\",\n  \"data\": { \"name\": \"caf\\u00e9\", \"path\": \"a\\/b\" },\n  \"meta\": { \"schema_version\": 2 }\n}\n"
+      },
+      {
+        "name": "key-order-and-number-forms",
+        "body": "{\"meta\": {\"schema_version\": 2}, \"data\": {\"z\": 1, \"a\": 2, \"ratio\": 1.50, \"exp\": 1E2, \"big\": 12345678901234567890}, \"job\": \"urn:babelqueue:order.created\"}"
+      },
+      {
+        "name": "not-json",
+        "body": "plain text, not JSON  \t "
+      }
+    ],
+    "cases": [
+      {
+        "name": "default-dlq-on-write-ok",
+        "dead_letter": "on",
+        "dlq_write": "ok",
+        "expect": {
+          "outcome": "dlq_raw",
+          "record": "incoming_body"
+        }
+      },
+      {
+        "name": "default-dlq-on-write-fails",
+        "dead_letter": "on",
+        "dlq_write": "fails",
+        "expect": {
+          "outcome": "unsettled"
+        }
+      },
+      {
+        "name": "fail-dlq-on-write-ok",
+        "on_unknown_urn": "fail",
+        "dead_letter": "on",
+        "dlq_write": "ok",
+        "expect": {
+          "outcome": "dlq_raw",
+          "record": "incoming_body"
+        }
+      },
+      {
+        "name": "fail-dlq-on-write-fails",
+        "on_unknown_urn": "fail",
+        "dead_letter": "on",
+        "dlq_write": "fails",
+        "expect": {
+          "outcome": "unsettled"
+        }
+      },
+      {
+        "name": "fail-dlq-on-write-ok-bq-attempts-7",
+        "on_unknown_urn": "fail",
+        "dead_letter": "on",
+        "dlq_write": "ok",
+        "bq_attempts": "7",
+        "expect": {
+          "outcome": "dlq_raw",
+          "record": "incoming_body"
+        }
+      },
+      {
+        "name": "release-dlq-on-write-ok",
+        "on_unknown_urn": "release",
+        "dead_letter": "on",
+        "dlq_write": "ok",
+        "expect": {
+          "outcome": "dlq_raw",
+          "record": "incoming_body"
+        }
+      },
+      {
+        "name": "release-dlq-on-write-fails",
+        "on_unknown_urn": "release",
+        "dead_letter": "on",
+        "dlq_write": "fails",
+        "expect": {
+          "outcome": "unsettled"
+        }
+      },
+      {
+        "name": "delete-dlq-on-acks",
+        "on_unknown_urn": "delete",
+        "dead_letter": "on",
+        "expect": {
+          "outcome": "ack"
+        }
+      },
+      {
+        "name": "delete-dlq-off-acks",
+        "on_unknown_urn": "delete",
+        "dead_letter": "off",
+        "expect": {
+          "outcome": "ack"
+        }
+      },
+      {
+        "name": "dead-letter-dlq-on-write-ok",
+        "on_unknown_urn": "dead_letter",
+        "dead_letter": "on",
+        "dlq_write": "ok",
+        "expect": {
+          "outcome": "dlq_raw",
+          "record": "incoming_body"
+        }
+      },
+      {
+        "name": "dead-letter-dlq-on-write-fails",
+        "on_unknown_urn": "dead_letter",
+        "dead_letter": "on",
+        "dlq_write": "fails",
+        "expect": {
+          "outcome": "unsettled"
+        }
+      },
+      {
+        "name": "default-dlq-off-native",
+        "dead_letter": "off",
+        "expect": {
+          "outcome": "native"
+        }
+      },
+      {
+        "name": "fail-dlq-off-native",
+        "on_unknown_urn": "fail",
+        "dead_letter": "off",
+        "expect": {
+          "outcome": "native"
+        }
+      },
+      {
+        "name": "fail-dlq-off-native-bq-attempts-7",
+        "on_unknown_urn": "fail",
+        "dead_letter": "off",
+        "bq_attempts": "7",
+        "expect": {
+          "outcome": "native"
+        }
+      },
+      {
+        "name": "release-dlq-off-native",
+        "on_unknown_urn": "release",
+        "dead_letter": "off",
+        "expect": {
+          "outcome": "native"
+        }
+      },
+      {
+        "name": "dead-letter-dlq-off-write-ok",
+        "on_unknown_urn": "dead_letter",
+        "dead_letter": "off",
+        "dlq_write": "ok",
+        "expect": {
+          "outcome": "dlq_raw",
+          "record": "incoming_body",
+          "outcome_no_writer": "native"
+        }
+      },
+      {
+        "name": "dead-letter-dlq-off-write-fails",
+        "on_unknown_urn": "dead_letter",
+        "dead_letter": "off",
+        "dlq_write": "fails",
+        "expect": {
+          "outcome": "unsettled",
+          "outcome_no_writer": "native"
+        }
+      }
+    ]
+  },
+  "version_gate_asb": {
+    "description": "Version-gate settle rule for Azure Service Bus (broker-bindings.md section 4.7, application property `bq-schema-version`) (ADR-0037 decision 1; broker-bindings.md section 5.7 \"Version-gate settle rule\"). Scope: `asb`. A pure function, no broker: for each case compute how the consumer settles a delivery whose schema-version property is present, not null, not blank and not the supported version, and assert `expect`. Which property values are version-gated is NOT decided here: the `schema_version_gate` block of this binding already locks the trigger. A runner feeds the delivery a property value that gates (any of that block's rejected values, for example `2`). Case `{name, on_unknown_urn?, dead_letter, dlq_write?, bq_attempts?, expect}`. `on_unknown_urn`: `fail` | `delete` | `release` | `dead_letter`; absent = `fail`. A row with any value other than `fail` applies only to an SDK whose consumer has the strategy option; the Java, .NET and Node Azure Service Bus consumers have only an `onUnknownUrn` callback and no strategy option (they behave as `fail`), so a runner for one of them reports those rows as `skip` citing ADR-0037, not as `pass`; the Go and Python consumers have the option and assert every row. `release` behaves as `fail` for a version-gated delivery (it is never released). The version gate reads only the explicitly configured `on_unknown_urn` strategy; with none configured it is `fail`. An `onUnknownUrn` hook, any strategy a hook implies (a hook-only Java or Node SQS consumer would otherwise be `delete`) and a hook's precedence over the strategy (the .NET SQS consumer) do not affect it: the hook is for an unknown URN only, so a hook-only consumer settles these rows as `fail`. `dead_letter`: `on` | `off` (dead-lettering on or off, each SDK's existing meaning; for the `dead_letter` strategy with `off` see `expect.outcome_no_writer`). `dlq_write`: `ok` | `fails`, whether the write of the raw record to `<queue>.dlq` succeeds; absent = `ok` (ADR-0037). It is read only on rows whose `expect.outcome` writes a record (`dlq_raw` or `unsettled`); it is present on those rows, and also on the `dead_letter` strategy rows with `dead_letter: off`, where an SDK with a writable DLQ target writes and an SDK without a writer asserts `outcome_no_writer` instead. `bq_attempts`: optional, the `bq-attempts` property as a string; present only to show that the outcome does not depend on it (the rule applies on the first delivery, with no retry, whatever the attempts, the native redelivery count or the max-attempts setting say). `expect.outcome`: `ack` | `dlq_raw` (the raw record is written to `<queue>.dlq`, then the delivery is acknowledged) | `unsettled` (the write failed: the delivery is neither acknowledged nor retried by the SDK and the failure is reported; `Abandon`). With dead-lettering off and a strategy other than `dead_letter` the outcome is `native` (the SDK does not settle it and leaves it to the broker's native mechanism: an explicit native `DeadLetter(...)` into `$DeadLetterQueue` or `Abandon` until `MaxDeliveryCount`; it is reported, not retried by the SDK). `expect.record` (only on `dlq_raw` rows): `incoming_body`, the record written to `<queue>.dlq` has a body equal to the incoming body byte for byte and carries no `dead_letter` block (no re-encoding, no ADR-0035 wrapping). A runner checks it against every body of `incoming_bodies`, which are deliberately not in canonical form, so a writer that decodes and re-encodes fails. `expect.outcome_no_writer`: optional; a runner for an SDK in which `dead_letter: off` means NO DLQ writer exists (no publisher, sender or queue URL) asserts it instead of `expect.outcome`. It is present exactly on the rows with strategy `dead_letter` and `dead_letter: off`, where the two kinds differ (here: `native`). Absent = both kinds assert `expect.outcome`. In every case the delivery is never decoded, no handler and no `onUnknownUrn` hook is called, and nothing is retried. The Laravel driver for this binding (if any) falls under the ADR-0037 decision 4 exception and reports every case of this section as `skip` with reason `ADR-0037 decision 4`; a package with no consumer for this binding (produce-only) follows the rule of the existing `sqs` / `artemis` binding sections (see README, \"Added in 1.8.0\"). Out of scope: Kafka (a version-gated record takes the section 6.5 poison path) and RabbitMQ.",
+    "incoming_bodies": [
+      {
+        "name": "pretty-printed-escaped",
+        "body": "{\n  \"job\": \"urn:babelqueue:order.created\",\n  \"data\": { \"name\": \"caf\\u00e9\", \"path\": \"a\\/b\" },\n  \"meta\": { \"schema_version\": 2 }\n}\n"
+      },
+      {
+        "name": "key-order-and-number-forms",
+        "body": "{\"meta\": {\"schema_version\": 2}, \"data\": {\"z\": 1, \"a\": 2, \"ratio\": 1.50, \"exp\": 1E2, \"big\": 12345678901234567890}, \"job\": \"urn:babelqueue:order.created\"}"
+      },
+      {
+        "name": "not-json",
+        "body": "plain text, not JSON  \t "
+      }
+    ],
+    "cases": [
+      {
+        "name": "default-dlq-on-write-ok",
+        "dead_letter": "on",
+        "dlq_write": "ok",
+        "expect": {
+          "outcome": "dlq_raw",
+          "record": "incoming_body"
+        }
+      },
+      {
+        "name": "default-dlq-on-write-fails",
+        "dead_letter": "on",
+        "dlq_write": "fails",
+        "expect": {
+          "outcome": "unsettled"
+        }
+      },
+      {
+        "name": "fail-dlq-on-write-ok",
+        "on_unknown_urn": "fail",
+        "dead_letter": "on",
+        "dlq_write": "ok",
+        "expect": {
+          "outcome": "dlq_raw",
+          "record": "incoming_body"
+        }
+      },
+      {
+        "name": "fail-dlq-on-write-fails",
+        "on_unknown_urn": "fail",
+        "dead_letter": "on",
+        "dlq_write": "fails",
+        "expect": {
+          "outcome": "unsettled"
+        }
+      },
+      {
+        "name": "fail-dlq-on-write-ok-bq-attempts-7",
+        "on_unknown_urn": "fail",
+        "dead_letter": "on",
+        "dlq_write": "ok",
+        "bq_attempts": "7",
+        "expect": {
+          "outcome": "dlq_raw",
+          "record": "incoming_body"
+        }
+      },
+      {
+        "name": "release-dlq-on-write-ok",
+        "on_unknown_urn": "release",
+        "dead_letter": "on",
+        "dlq_write": "ok",
+        "expect": {
+          "outcome": "dlq_raw",
+          "record": "incoming_body"
+        }
+      },
+      {
+        "name": "release-dlq-on-write-fails",
+        "on_unknown_urn": "release",
+        "dead_letter": "on",
+        "dlq_write": "fails",
+        "expect": {
+          "outcome": "unsettled"
+        }
+      },
+      {
+        "name": "delete-dlq-on-acks",
+        "on_unknown_urn": "delete",
+        "dead_letter": "on",
+        "expect": {
+          "outcome": "ack"
+        }
+      },
+      {
+        "name": "delete-dlq-off-acks",
+        "on_unknown_urn": "delete",
+        "dead_letter": "off",
+        "expect": {
+          "outcome": "ack"
+        }
+      },
+      {
+        "name": "dead-letter-dlq-on-write-ok",
+        "on_unknown_urn": "dead_letter",
+        "dead_letter": "on",
+        "dlq_write": "ok",
+        "expect": {
+          "outcome": "dlq_raw",
+          "record": "incoming_body"
+        }
+      },
+      {
+        "name": "dead-letter-dlq-on-write-fails",
+        "on_unknown_urn": "dead_letter",
+        "dead_letter": "on",
+        "dlq_write": "fails",
+        "expect": {
+          "outcome": "unsettled"
+        }
+      },
+      {
+        "name": "default-dlq-off-native",
+        "dead_letter": "off",
+        "expect": {
+          "outcome": "native"
+        }
+      },
+      {
+        "name": "fail-dlq-off-native",
+        "on_unknown_urn": "fail",
+        "dead_letter": "off",
+        "expect": {
+          "outcome": "native"
+        }
+      },
+      {
+        "name": "fail-dlq-off-native-bq-attempts-7",
+        "on_unknown_urn": "fail",
+        "dead_letter": "off",
+        "bq_attempts": "7",
+        "expect": {
+          "outcome": "native"
+        }
+      },
+      {
+        "name": "release-dlq-off-native",
+        "on_unknown_urn": "release",
+        "dead_letter": "off",
+        "expect": {
+          "outcome": "native"
+        }
+      },
+      {
+        "name": "dead-letter-dlq-off-write-ok",
+        "on_unknown_urn": "dead_letter",
+        "dead_letter": "off",
+        "dlq_write": "ok",
+        "expect": {
+          "outcome": "dlq_raw",
+          "record": "incoming_body",
+          "outcome_no_writer": "native"
+        }
+      },
+      {
+        "name": "dead-letter-dlq-off-write-fails",
+        "on_unknown_urn": "dead_letter",
+        "dead_letter": "off",
+        "dlq_write": "fails",
+        "expect": {
+          "outcome": "unsettled",
+          "outcome_no_writer": "native"
         }
       }
     ]

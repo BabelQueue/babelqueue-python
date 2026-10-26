@@ -30,10 +30,13 @@ from .exceptions import BabelQueueError, DecryptError, UnknownUrnError
 from .replay import HEADER_REPLAY_BYPASS, bypass_external_effects, is_replay
 from .routing import UnknownUrnStrategy
 from .transport import (
+    Abandoner,
     BatchPopper,
+    DeadLetterNamer,
     DeadLetterWriter,
     HeaderPublisher,
     InMemoryTransport,
+    NativeSettler,
     ReceivedMessage,
     Redeliverer,
     Rewinder,
@@ -42,7 +45,7 @@ from .transport import (
     Transport,
 )
 
-__version__ = "1.23.0"
+__version__ = "1.24.0"
 
 __all__ = [
     "BabelQueue",
@@ -55,9 +58,12 @@ __all__ = [
     "Transport",
     "InMemoryTransport",
     "ReceivedMessage",
+    "Abandoner",
     "BatchPopper",
+    "DeadLetterNamer",
     "DeadLetterWriter",
     "HeaderPublisher",
+    "NativeSettler",
     "Redeliverer",
     "Rewinder",
     "RoutedPublisher",
