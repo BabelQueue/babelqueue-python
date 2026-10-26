@@ -45,7 +45,7 @@ from .transport import (
     Transport,
 )
 
-__version__ = "1.23.0"
+__version__ = "1.24.0"
 
 __all__ = [
     "BabelQueue",

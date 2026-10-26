@@ -9,12 +9,13 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.24.0] - 2026-10-26
+
 Implements conformance **1.8.0** (vendored from the `v1.8.0` release asset, verified with
 `fetch.sh --check`; `BQ_CONFORMANCE_VERSION` is now `1.8.0` in `ci.yml` and `release.yml`). The
 envelope stays at `schema_version: 1`; nothing here touches the wire (ADR-0037). The new
 `version_gate_pulsar`, `version_gate_artemis`, `version_gate_sqs` and `version_gate_asb` sections run
-and pass (17 cases each; Python has the `on_unknown_urn` option, so no row is skipped). A MINOR; the
-version number is set at release time.
+and pass (17 cases each; Python has the `on_unknown_urn` option, so no row is skipped). A MINOR.
 
 ### Changed (behaviour)
 - **With the DLQ off, SQS and Azure Service Bus no longer drop a version-gated message or retry a
