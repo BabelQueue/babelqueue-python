@@ -32,6 +32,7 @@ from .routing import UnknownUrnStrategy
 from .transport import (
     Abandoner,
     BatchPopper,
+    DeadLetterNamer,
     DeadLetterWriter,
     HeaderPublisher,
     InMemoryTransport,
@@ -59,6 +60,7 @@ __all__ = [
     "ReceivedMessage",
     "Abandoner",
     "BatchPopper",
+    "DeadLetterNamer",
     "DeadLetterWriter",
     "HeaderPublisher",
     "NativeSettler",

@@ -369,6 +369,19 @@ class SqsTransport(Transport):
             QueueUrl=self._resolve_url(message.queue), ReceiptHandle=message.handle
         )
 
+    def dead_letter_queue_name(self, queue: str, suffix: Optional[str] = None) -> str:
+        """:class:`~babelqueue.transport.DeadLetterNamer`: the BabelQueue DLQ of an SQS queue is
+        ``<queue>-dlq`` by default and, for a FIFO queue, ``<queue>-dlq.fifo``. An explicit ``suffix``
+        (``dead_letter_suffix``; ``None``/empty = none) replaces ``-dlq`` and is placed before
+        ``.fifo`` as well: an SQS FIFO queue name must end in ``.fifo``, so ``orders.fifo`` + ``-x`` is
+        ``orders-x.fifo``, never ``orders.fifo-x``. An SQS queue name may hold only alphanumerics,
+        hyphens and underscores (plus that one ``.fifo`` suffix), so the runtime-wide ``<queue>.dlq``
+        cannot be created on SQS (ADR-0037 decision 7). An explicit ``dead_letter_queue`` overrides it."""
+        suffix = suffix or "-dlq"
+        if queue.endswith(".fifo"):
+            return queue[: -len(".fifo")] + suffix + ".fifo"
+        return queue + suffix
+
     def settle_native(self, message: ReceivedMessage, reason: str, description: str) -> None:
         """Leave ``message`` to SQS itself (:class:`~babelqueue.transport.NativeSettler`, ADR-0037
         decisions 1 and 2): a version-gated delivery or a poison body that the runtime may neither

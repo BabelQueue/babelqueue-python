@@ -44,6 +44,7 @@ from .routing import UnknownUrnStrategy
 from .transport import (
     NON_NUMERIC_ATTEMPTS_ROUTE,
     Abandoner,
+    DeadLetterNamer,
     DeadLetterWriter,
     HeaderPublisher,
     NativeSettler,
@@ -111,7 +112,7 @@ class BabelQueue:
         max_attempts: int = 3,
         dead_letter: bool = False,
         dead_letter_queue: Optional[str] = None,
-        dead_letter_suffix: str = ".dlq",
+        dead_letter_suffix: Optional[str] = None,
         retry_backoff: float = 0.0,
         retry_backoff_multiplier: float = 1.0,
         retry_backoff_max: float = 0.0,
@@ -145,6 +146,8 @@ class BabelQueue:
         self.max_attempts = max_attempts
         self.dead_letter_enabled = bool(dead_letter)
         self.dead_letter_queue = dead_letter_queue
+        #: ``None`` = not set: the transport's :class:`~babelqueue.transport.DeadLetterNamer` default
+        #: (SQS: ``<queue>-dlq``) or else ``.dlq``. An explicit value is handed to the namer.
         self.dead_letter_suffix = dead_letter_suffix
         self.retry_backoff = float(retry_backoff)
         if retry_jitter not in RETRY_JITTERS:
@@ -837,8 +840,15 @@ class BabelQueue:
         )
 
     def _dead_letter_target(self, received: ReceivedMessage) -> str:
-        """The queue a dead-lettered delivery is written to (configured DLQ or ``<queue><suffix>``)."""
-        return self.dead_letter_queue or (received.queue + self.dead_letter_suffix)
+        """The queue a dead-lettered delivery is written to: the configured ``dead_letter_queue``, else
+        the transport's :class:`~babelqueue.transport.DeadLetterNamer` name (SQS: ``<queue>-dlq``, FIFO
+        ``<queue>-dlq.fifo``, an explicit ``dead_letter_suffix`` placed before ``.fifo``; ADR-0037
+        decision 7), else ``<queue><dead_letter_suffix>`` (default ``.dlq``)."""
+        if self.dead_letter_queue:
+            return self.dead_letter_queue
+        if isinstance(self.transport, DeadLetterNamer):
+            return self.transport.dead_letter_queue_name(received.queue, self.dead_letter_suffix)
+        return received.queue + (".dlq" if self.dead_letter_suffix is None else self.dead_letter_suffix)
 
     def _settle_version_gated(self, received: ReceivedMessage, always: bool = False) -> None:
         """Dead-letter a version-gated delivery directly (no retry). With no DLQ set it is left to the

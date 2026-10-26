@@ -38,6 +38,21 @@ version number is set at release time.
     `RedrivePolicy` (SQS) or accepts them in `$DeadLetterQueue` (Azure Service Bus), or sets
     `dead_letter=True` / `on_unknown_urn=DELETE`.
 
+### Fixed
+- **SQS: the default dead-letter queue name is now `<queue>-dlq` (FIFO `<queue>-dlq.fifo`) (ADR-0037
+  decision 7).** The old default `<queue>.dlq` was never a valid Amazon SQS queue name (a name may hold only
+  alphanumerics, hyphens and underscores, plus one `.fifo` suffix), so a DLQ write by default could not find a
+  queue on real SQS. `dead_letter_suffix` now defaults to `None` ("not set"); unless `dead_letter_queue` is set
+  the runtime asks the transport's new optional `DeadLetterNamer` capability
+  (`dead_letter_queue_name(queue, suffix)`, exported from `babelqueue`), which `SqsTransport` implements. The
+  runtime also hands it an explicit `dead_letter_suffix`; on a FIFO queue the `.fifo` suffix always stays last,
+  an explicit suffix included: `orders.fifo` with `dead_letter_suffix="-x"` is `orders-x.fifo`, never
+  `orders.fifo-x` (an SQS FIFO name must end in `.fifo`; before, that explicit suffix produced the uncreatable
+  `orders.fifo-x`). An explicit queue name behaves as before; every other transport keeps `<queue>.dlq` (the
+  attribute `App.dead_letter_suffix` is `None` instead of `".dlq"` until set). Deployments
+  that relied on the SQS default must name the DLQ `<queue>-dlq`, or pass `dead_letter_suffix=".dlq"` /
+  `dead_letter_queue=` to keep the old name. An explicitly empty `dead_letter_suffix=""` now counts as "no suffix" on SQS (`-dlq`); before, it made the DLQ the source queue itself.
+
 ### Added
 - **`babelqueue.transport.NativeSettler`**, an optional `Transport` capability
   (`settle_native(message, reason, description)`). With the DLQ off the runtime calls it instead of

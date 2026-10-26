@@ -212,7 +212,7 @@ class SqsPoisonTest(unittest.TestCase):
                 app.register(URN, lambda data, meta: None)
                 app.consume("orders", max_messages=1, timeout=0, handle_signals=False)
                 record = self.fake.sent[-1]
-                self.assertEqual("http://fake/orders.dlq", record["QueueUrl"])
+                self.assertEqual("http://fake/orders-dlq", record["QueueUrl"])
                 assert_poison_record(self, record["MessageBody"], body)
                 self.assertEqual(1, len(self.fake.deleted))
                 self.assertEqual([], self.fake.visibility_changes)  # no retry

@@ -230,6 +230,21 @@ class Rewinder(Protocol):
 
 
 @runtime_checkable
+class DeadLetterNamer(Protocol):
+    """Optional :class:`Transport` capability: the name of the BabelQueue dead-letter queue for a
+    source queue, for a broker whose queue-name rules the runtime-wide ``<queue><suffix>`` shape cannot
+    satisfy. The runtime asks it whenever ``dead_letter_queue`` is not set, passing ``dead_letter_suffix``
+    (``None`` when not set). Amazon SQS implements it (a queue name cannot contain a dot and a FIFO name
+    must end in ``.fifo``): the default is ``<queue>-dlq``, FIFO ``<queue>-dlq.fifo``, and an explicit
+    suffix goes before ``.fifo`` too (``orders.fifo`` + ``-x`` -> ``orders-x.fifo``), never after it
+    (ADR-0037 decision 7). A transport without it keeps ``<queue><suffix>`` with the default ``.dlq``."""
+
+    def dead_letter_queue_name(self, queue: str, suffix: Optional[str] = None) -> str:
+        """The dead-letter queue name for ``queue`` (``suffix`` is the explicit one, or ``None``)."""
+        ...
+
+
+@runtime_checkable
 class Abandoner(Protocol):
     """Optional :class:`Transport` capability: hand an unsettled *version-gated* delivery back to the
     broker at once (Azure Service Bus ``Abandon``; broker-bindings.md section 4.5 "A failed write

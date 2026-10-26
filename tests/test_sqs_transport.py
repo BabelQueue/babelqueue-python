@@ -17,7 +17,7 @@ from unittest import mock
 
 from babelqueue import BabelQueue, EnvelopeCodec, UnknownUrnStrategy
 from babelqueue.sqs_transport import SqsTransport
-from babelqueue.transport import HeaderPublisher, ReceivedMessage, Redeliverer, make_transport
+from babelqueue.transport import DeadLetterNamer, HeaderPublisher, ReceivedMessage, Redeliverer, make_transport
 
 
 class FakeSQS:
@@ -465,7 +465,7 @@ class SqsTransportUnitTest(unittest.TestCase):
         app.publish("urn:babel:orders:created", {"order_id": 1})
         with self.assertLogs("babelqueue.app", level="ERROR"):
             app.consume("orders", max_messages=1, timeout=0)
-        dlq = [m for m in fake.sent if m["QueueUrl"].endswith("orders.dlq")]
+        dlq = [m for m in fake.sent if m["QueueUrl"].endswith("orders-dlq")]
         self.assertEqual(len(dlq), 1)  # dead-lettered exactly once
         self.assertEqual(fake.visibility_changes, [])  # and not released on top of that
 
@@ -654,7 +654,7 @@ class SqsSchemaVersionGateTest(unittest.TestCase):
                 self.assertEqual(fake.deleted, ["rh-gate"])
                 self.assertEqual(fake.visibility_changes, [])  # not released for a retry
                 self.assertEqual(len(fake.sent), 1)
-                self.assertEqual(fake.sent[0]["QueueUrl"], "http://fake/orders.dlq")
+                self.assertEqual(fake.sent[0]["QueueUrl"], "http://fake/orders-dlq")
                 # The gate rejects without decoding: the DLQ record is the incoming body,
                 # byte-identical, with no dead_letter block.
                 self.assertEqual(fake.sent[0]["MessageBody"], incoming)
@@ -793,3 +793,62 @@ class SqsLocalStackIntegrationTest(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class SqsDeadLetterNameTest(unittest.TestCase):
+    """ADR-0037 decision 7: the default BabelQueue DLQ of an SQS queue is ``<queue>-dlq``, FIFO
+    ``<queue>-dlq.fifo`` (an SQS queue name cannot contain a dot). An explicit ``dead_letter_queue`` or
+    ``dead_letter_suffix`` always wins; every other transport keeps ``<queue>.dlq``."""
+
+    def test_the_capability_names_the_default(self):
+        tr = SqsTransport("sqs://", client=FakeSQS(), queue_url_prefix="http://fake")
+        self.assertIsInstance(tr, DeadLetterNamer)
+        for queue, suffix, want in (
+            ("orders", None, "orders-dlq"),
+            ("orders_v2", None, "orders_v2-dlq"),
+            ("orders.fifo", None, "orders-dlq.fifo"),
+            ("my-orders.fifo", None, "my-orders-dlq.fifo"),
+            ("fifo", None, "fifo-dlq"),
+            ("orders", "-x", "orders-x"),
+            ("orders", "_failed", "orders_failed"),
+            ("orders.fifo", "-x", "orders-x.fifo"),
+            ("orders.fifo", "-dlq", "orders-dlq.fifo"),
+            ("orders.fifo", "_failed", "orders_failed.fifo"),
+        ):
+            with self.subTest(queue=queue, suffix=suffix):
+                self.assertEqual(tr.dead_letter_queue_name(queue, suffix), want)
+
+    def _dead_letter_target(self, queue: str, **kwargs) -> str:
+        fake = FakeSQS()
+        tr = SqsTransport("sqs://", client=fake, queue_url_prefix="http://fake", fifo=queue.endswith(".fifo"))
+        app = BabelQueue(transport=tr, queue=queue, max_attempts=3, dead_letter=True, **kwargs)
+        fake.seed("http://fake/" + queue, "not json at all", 1)
+        app.consume(queue, max_messages=1, timeout=0, handle_signals=False)
+        self.assertEqual(len(fake.sent), 1)
+        return fake.sent[0]["QueueUrl"]
+
+    def test_default_and_fifo(self):
+        self.assertEqual(self._dead_letter_target("orders"), "http://fake/orders-dlq")
+        self.assertEqual(self._dead_letter_target("orders.fifo"), "http://fake/orders-dlq.fifo")
+
+    def test_an_explicit_suffix_or_queue_wins(self):
+        self.assertEqual(self._dead_letter_target("orders", dead_letter_suffix="_failed"), "http://fake/orders_failed")
+        self.assertEqual(self._dead_letter_target("orders", dead_letter_suffix=".dlq"), "http://fake/orders.dlq")
+        # A FIFO name must end in ".fifo": an explicit suffix goes before it, never after it.
+        self.assertEqual(
+            self._dead_letter_target("orders.fifo", dead_letter_suffix="-x"), "http://fake/orders-x.fifo"
+        )
+        self.assertEqual(
+            self._dead_letter_target("orders.fifo", dead_letter_suffix="-dlq"), "http://fake/orders-dlq.fifo"
+        )
+        self.assertEqual(self._dead_letter_target("orders", dead_letter_queue="parking-lot"), "http://fake/parking-lot")
+        self.assertEqual(
+            self._dead_letter_target("orders", dead_letter_suffix="-x", dead_letter_queue="parking-lot"),
+            "http://fake/parking-lot",
+        )
+
+    def test_other_transports_keep_dot_dlq(self):
+        app = BabelQueue("memory://", queue="orders", dead_letter=True)
+        app.transport.publish("orders", "not json at all")
+        app.consume("orders", max_messages=1, timeout=0, handle_signals=False)
+        self.assertEqual(app.transport.size("orders.dlq"), 1)

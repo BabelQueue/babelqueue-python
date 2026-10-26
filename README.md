@@ -205,7 +205,7 @@ standard queue; a larger value, or any per-message delay on a FIFO queue, raises
 `BabelQueueError` instead of being truncated or dropped).
 
 **Poison bodies.** A body that does not decode, or has no identity, is never retried by the SDK
-(ADR-0037): `dead_letter=True` writes the ADR-0035 record to `<queue>.dlq` and then deletes it,
+(ADR-0037): `dead_letter=True` writes the ADR-0035 record to the DLQ (`<queue>-dlq` on SQS, `<queue>.dlq` elsewhere) and then deletes it,
 `on_unknown_urn=DELETE` deletes it, and with the DLQ off it is **not deleted and not re-sent**: the
 transport's `settle_native` capability leaves it to SQS on the first delivery (visibility expiry,
 then the queue's `RedrivePolicy`; the event is logged). Azure Service Bus does the same with a native
@@ -214,7 +214,7 @@ then the queue's `RedrivePolicy`; the event is logged). Azure Service Bus does t
 **Poison-loop risk:** a message that always fails is redelivered at once until
 `max_attempts` is reached. If the receive count is unavailable the SDK cannot
 advance attempts at all. **Configure a native `RedrivePolicy`**
-(`maxReceiveCount` ≥ `max_attempts`, pointing at `<queue>.dlq`) on every SQS
+(`maxReceiveCount` ≥ `max_attempts`, pointing at `<queue>-dlq`, the SQS default DLQ name: FIFO `<queue>-dlq.fifo`, because an SQS queue name cannot contain a dot; `dead_letter_queue` overrides it, and `dead_letter_suffix` replaces `-dlq`, placed before `.fifo` on a FIFO queue) on every SQS
 queue as the broker-side backstop, and set a non-zero `retry_backoff` if the
 handler's dependencies need time to recover.
 

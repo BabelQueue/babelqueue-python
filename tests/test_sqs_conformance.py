@@ -86,7 +86,7 @@ class SqsConformanceTest(unittest.TestCase):
 
 
 class _DlqFailsSQS(FakeSQS):
-    """FakeSQS whose ``SendMessage`` fails (the raw record cannot be written to ``<queue>.dlq``)."""
+    """FakeSQS whose ``SendMessage`` fails (the raw record cannot be written to ``<queue>-dlq``)."""
 
     def send_message(self, **kw):
         raise RuntimeError("dlq unavailable")
@@ -130,7 +130,7 @@ def _eval_version_gate_sqs(case: Mapping[str, Any]) -> None:
         _ensure(calls == [], f"{label}: a handler ran for a version-gated delivery")
         _ensure(fake.visibility_changes == [], f"{label}: a gated delivery is never released")
         _ensure(
-            all(sent["QueueUrl"] == "http://fake/orders.dlq" for sent in fake.sent),
+            all(sent["QueueUrl"] == "http://fake/orders-dlq" for sent in fake.sent),
             f"{label}: only the DLQ may be written",
         )
         outcome = expect["outcome"]
