@@ -1652,8 +1652,8 @@ class JobTypeConformanceTest(unittest.TestCase):
 
 
 class RunnerCaseIdTest(unittest.TestCase):
-    #: ``section -> number of case ids`` of the vendored conformance 1.8.0 manifest.
-    EXPECTED_COUNTS = {"identity_verdict": 97, "pulsar_exhaustion": 29, "trim": 35, "job_type": 11, "traceparent": 14, "delay": 9, "backoff": 29, "redis_layout": 59, "redis_delay": 8, "retry_backoff": 18, "kafka_poison": 92, "poison_dlq": 43, "idempotency": 7, "redis": 1, "rabbitmq": 1, "version_gate_pulsar": 17, "version_gate_artemis": 17, "version_gate_sqs": 17, "version_gate_asb": 17}
+    #: ``section -> number of case ids`` of the vendored conformance 1.9.0 manifest.
+    EXPECTED_COUNTS = {"identity_verdict": 97, "pulsar_exhaustion": 29, "trim": 35, "job_type": 11, "traceparent": 20, "delay": 9, "backoff": 29, "redis_layout": 59, "redis_delay": 8, "retry_backoff": 18, "kafka_poison": 92, "poison_dlq": 43, "idempotency": 7, "redis": 1, "rabbitmq": 1, "version_gate_pulsar": 17, "version_gate_artemis": 17, "version_gate_sqs": 17, "version_gate_asb": 17, "span-shape": 37, "trace-id": 43, "metrics": 29}
 
     def test_case_id_counts_match_the_manifest(self) -> None:
         for section, count in self.EXPECTED_COUNTS.items():

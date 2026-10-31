@@ -16,6 +16,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (  # noqa: E4
 from opentelemetry.trace import SpanKind  # noqa: E402
 
 from babelqueue import BabelQueue, EnvelopeCodec, otel  # noqa: E402
+from babelqueue.dead_letter import DeadLetterEvent  # noqa: E402
 from babelqueue.headers import _headers_scope  # noqa: E402
 from babelqueue.transport import InMemoryTransport  # noqa: E402
 
@@ -76,12 +77,21 @@ def test_wrap_handler_span_in_trace_with_attrs():
     spans = exporter.get_finished_spans()
     assert len(spans) == 1
     span = spans[0]
-    assert span.name == "process urn:babel:orders:created"
+    # ADR-0038: the name is "process <queue>", never the URN (unbounded cardinality)
+    assert span.name == "process orders"
     assert span.kind == SpanKind.CONSUMER
     assert span.context.trace_id == otel.trace_id_of(_TRACE_ID)
     assert span.attributes["messaging.message.conversation_id"] == _TRACE_ID
     assert span.attributes["messaging.message.id"] == "m1"
     assert span.attributes["messaging.destination.name"] == "orders"
+    assert span.attributes["babelqueue.urn"] == "urn:babel:orders:created"
+    assert span.attributes["messaging.operation.type"] == "process"
+    assert span.attributes["messaging.operation.name"] == "process"
+    assert span.attributes["messaging.system"] == "babelqueue"  # the deprecated default
+    assert span.attributes["babelqueue.attempts"] == 0
+    # transition MINOR: the deprecated keys are dual-emitted
+    assert span.attributes["messaging.operation"] == "process"
+    assert span.attributes["messaging.babelqueue.attempts"] == 0
 
 
 def test_wrap_handler_two_arg_inner():
@@ -111,7 +121,10 @@ def test_wrap_handler_records_error():
 
     span = exporter.get_finished_spans()[0]
     assert span.status.status_code.name == "ERROR"
-    assert len(span.events) >= 1  # the recorded exception
+    assert span.status.description == "boom"
+    assert span.attributes["error.type"] == "ValueError"
+    exceptions = [e for e in span.events if e.name == "exception"]
+    assert len(exceptions) == 1  # recorded once, not again by the SDK's own on-exception handling
 
 
 def test_publish_stamps_trace_id_from_span():
@@ -125,7 +138,9 @@ def test_publish_stamps_trace_id_from_span():
     assert len(spans) == 1
     span = spans[0]
     assert span.kind == SpanKind.PRODUCER
+    assert span.name == "send"  # a duck-typed app exposes no queue: the bare operation name
     assert span.attributes["messaging.message.id"] == "msg-123"
+    assert span.attributes["babelqueue.urn"] == "urn:babel:orders:created"
 
     stamped = app.calls[0]["trace_id"]
     # the published trace_id encodes the producer span's trace, so a consumer recovers it
@@ -261,3 +276,278 @@ def test_end_to_end_producer_to_consumer_parent_child():
     assert consumer.parent is not None
     assert consumer.parent.span_id == producer.context.span_id
     assert consumer.context.trace_id == producer.context.trace_id
+
+
+# ---------------------------------------------------------------------------
+# ADR-0038 span shape: system, consumer group, error recording, semconv pin.
+# ---------------------------------------------------------------------------
+
+
+class _CustomError(Exception):
+    pass
+
+
+def _consume(tracer, handler=None, **kwargs):
+    env = _envelope(attempts=2)
+    wrapped = otel.wrap_handler(tracer, handler or (lambda d, m, e: None), **kwargs)
+    wrapped(env["data"], env["meta"], env)
+
+
+def test_semconv_pin_constants():
+    assert otel.SEMCONV_VERSION == "1.44.0"
+    assert otel.SEMCONV_SCHEMA_URL == "https://opentelemetry.io/schemas/1.44.0"
+
+
+def test_system_and_consumer_group_are_written_as_given():
+    tracer, exporter = _recorder()
+    _consume(tracer, system="kafka", consumer_group="billing-workers")
+    span = exporter.get_finished_spans()[0]
+    assert span.attributes["messaging.system"] == "kafka"
+    assert span.attributes["messaging.consumer.group.name"] == "billing-workers"
+    assert span.attributes["babelqueue.attempts"] == 2
+    assert span.attributes["messaging.babelqueue.attempts"] == 2
+
+
+def test_no_consumer_group_option_writes_no_group_attribute():
+    tracer, exporter = _recorder()
+    _consume(tracer, system="kafka")
+    assert "messaging.consumer.group.name" not in exporter.get_finished_spans()[0].attributes
+
+
+def test_empty_system_counts_as_absent_and_warns_once_per_wrapper(caplog):
+    tracer, exporter = _recorder()
+    with caplog.at_level("WARNING", logger="babelqueue.otel"):
+        wrapped = otel.wrap_handler(tracer, lambda d, m, e: None, system="")
+        env = _envelope()
+        wrapped(env["data"], env["meta"], env)
+        wrapped(env["data"], env["meta"], env)
+    assert exporter.get_finished_spans()[0].attributes["messaging.system"] == "babelqueue"
+    assert len([r for r in caplog.records if "no system=" in r.getMessage()]) == 1
+
+
+def test_a_system_outside_the_documented_set_is_not_validated():
+    tracer, exporter = _recorder()
+    _consume(tracer, system="my-broker")
+    assert exporter.get_finished_spans()[0].attributes["messaging.system"] == "my-broker"
+
+
+def test_blank_or_missing_queue_gives_the_bare_name_and_no_destination():
+    tracer, exporter = _recorder()
+    wrapped = otel.wrap_handler(tracer, lambda d, m, e: None, system="redis")
+    env = _envelope()
+    wrapped(env["data"], {"id": "m1", "queue": "  "}, env)
+    wrapped(env["data"], {"id": "m1"}, env)
+    for span in exporter.get_finished_spans():
+        assert span.name == "process"
+        assert "messaging.destination.name" not in span.attributes
+
+
+def test_error_type_uses_the_module_qualified_class_name():
+    tracer, exporter = _recorder()
+
+    def handler(data, meta, envelope):
+        raise _CustomError("nope")
+
+    with pytest.raises(_CustomError):
+        _consume(tracer, handler, system="redis")
+    span = exporter.get_finished_spans()[0]
+    assert span.attributes["error.type"] == f"{__name__}._CustomError"
+    assert span.status.status_code.name == "ERROR"
+
+
+def test_a_successful_handler_leaves_status_unset_and_writes_no_error_type():
+    tracer, exporter = _recorder()
+    _consume(tracer, system="redis")
+    span = exporter.get_finished_spans()[0]
+    assert span.status.status_code.name == "UNSET"
+    assert "error.type" not in span.attributes
+
+
+def test_non_uuid_trace_id_is_preserved_hashed_and_warned_once(caplog):
+    tracer, exporter = _recorder()
+    env = _envelope(trace_id="opaque-request-9f2c")
+    wrapped = otel.wrap_handler(tracer, lambda d, m, e: None, system="redis")
+    with caplog.at_level("WARNING", logger="babelqueue.otel"):
+        wrapped(env["data"], env["meta"], env)
+        wrapped(env["data"], env["meta"], env)
+    spans = exporter.get_finished_spans()
+    assert [s.attributes["messaging.message.conversation_id"] for s in spans] == ["opaque-request-9f2c"] * 2
+    assert spans[0].context.trace_id == otel.trace_id_of("opaque-request-9f2c")
+    assert len([r for r in caplog.records if "not a UUID" in r.getMessage()]) == 1
+
+
+def test_a_uuid_trace_id_logs_no_warning(caplog):
+    tracer, _ = _recorder()
+    with caplog.at_level("WARNING", logger="babelqueue.otel"):
+        _consume(tracer, system="redis")
+    assert not [r for r in caplog.records if "not a UUID" in r.getMessage()]
+
+
+# ---------------------------------------------------------------------------
+# Producer: the real BabelQueue seam (publish_envelope), also on failure.
+# ---------------------------------------------------------------------------
+
+
+class _FailingTransport(InMemoryTransport):
+    def publish(self, queue, body):
+        raise ConnectionError("broker down")
+
+    def publish_with_headers(self, queue, body, headers):
+        raise ConnectionError("broker down")
+
+
+def test_publish_span_shape_on_a_real_app():
+    tracer, exporter = _recorder()
+    t = InMemoryTransport()
+    app = BabelQueue(transport=t, queue="orders")
+
+    message_id = otel.publish(tracer, app, "urn:babel:orders:created", {"n": 1}, system="redis")
+
+    span = exporter.get_finished_spans()[0]
+    produced = EnvelopeCodec.decode(t.pop("orders", 0).body)
+    assert span.name == "send orders"
+    assert span.kind == SpanKind.PRODUCER
+    assert span.attributes["messaging.system"] == "redis"
+    assert span.attributes["messaging.operation.type"] == "send"
+    assert span.attributes["messaging.operation.name"] == "send"
+    assert span.attributes["messaging.operation"] == "publish"
+    assert span.attributes["messaging.destination.name"] == "orders"
+    assert span.attributes["messaging.message.id"] == message_id == produced["meta"]["id"]
+    assert span.attributes["messaging.message.conversation_id"] == produced["trace_id"]
+    assert span.attributes["babelqueue.urn"] == "urn:babel:orders:created"
+    assert span.attributes["babelqueue.schema_version"] == 1
+    assert span.status.status_code.name == "UNSET"
+
+
+def test_publish_with_an_explicit_queue_names_the_span_after_it():
+    tracer, exporter = _recorder()
+    app = BabelQueue(transport=InMemoryTransport(), queue="orders")
+    otel.publish(tracer, app, "urn:babel:orders:created", {"n": 1}, queue="billing", system="redis")
+    span = exporter.get_finished_spans()[0]
+    assert span.name == "send billing"
+    assert span.attributes["messaging.destination.name"] == "billing"
+
+
+def test_publish_failure_keeps_the_produced_identity_and_reraises_the_same_error():
+    tracer, exporter = _recorder()
+    app = BabelQueue(transport=_FailingTransport(), queue="orders")
+
+    with pytest.raises(ConnectionError, match="broker down") as raised:
+        otel.publish(tracer, app, "urn:babel:orders:created", {"n": 1}, system="rabbitmq")
+
+    span = exporter.get_finished_spans()[0]
+    assert span.status.status_code.name == "ERROR"
+    assert span.status.description == "broker down"
+    assert span.attributes["error.type"] == "ConnectionError"
+    assert span.attributes["messaging.message.id"]  # the envelope was handed to the transport
+    assert span.attributes["messaging.message.conversation_id"] == otel.uuid_of(span.context.trace_id)
+    assert len([e for e in span.events if e.name == "exception"]) == 1
+    assert isinstance(raised.value, ConnectionError)
+
+
+def test_publish_failure_before_the_envelope_is_built_has_no_identity():
+    tracer, exporter = _recorder()
+    app = BabelQueue(transport=InMemoryTransport(), queue="orders")
+
+    with pytest.raises(TypeError):
+        otel.publish(tracer, app, "urn:babel:orders:created", {"x": object()}, system="redis")
+
+    span = exporter.get_finished_spans()[0]
+    assert span.status.status_code.name == "ERROR"
+    assert "messaging.message.id" not in span.attributes
+    assert "messaging.message.conversation_id" not in span.attributes
+    assert span.attributes["error.type"] == "TypeError"
+
+
+def test_a_duck_typed_app_that_raises_is_recorded_and_reraised():
+    tracer, exporter = _recorder()
+
+    class Broken(FakeApp):
+        def publish(self, urn, data, *, queue=None, trace_id=None):
+            raise RuntimeError("down")
+
+    with pytest.raises(RuntimeError, match="down"):
+        otel.publish(tracer, Broken(), "urn:babel:orders:created", {}, system="redis")
+    span = exporter.get_finished_spans()[0]
+    assert span.status.status_code.name == "ERROR"
+    assert span.attributes["error.type"] == "RuntimeError"
+
+
+# ---------------------------------------------------------------------------
+# Metrics (ADR-0039): opt-in through meter=, instruments created once.
+# ---------------------------------------------------------------------------
+
+
+def _meter():
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+    reader = InMemoryMetricReader()
+    return MeterProvider(metric_readers=[reader]).get_meter("test"), reader
+
+
+def _points(reader):
+    out = {}
+    data = reader.get_metrics_data()
+    for resource in (data.resource_metrics if data else []):
+        for scope in resource.scope_metrics:
+            for metric in scope.metrics:
+                out[metric.name] = metric.data.data_points
+    return out
+
+
+def test_publish_called_twice_with_one_meter_aggregates_into_one_series():
+    tracer, _ = _recorder()
+    meter, reader = _meter()
+    app = BabelQueue(transport=InMemoryTransport(), queue="orders")
+    for _ in range(2):
+        otel.publish(tracer, app, "urn:babel:orders:created", {"n": 1}, system="redis", meter=meter)
+    (point,) = _points(reader)["messaging.client.sent.messages"]
+    assert point.value == 2
+    assert dict(point.attributes) == {
+        "messaging.system": "redis",
+        "messaging.operation.name": "send",
+        "messaging.destination.name": "orders",
+    }
+
+
+def test_no_meter_records_nothing():
+    tracer, _ = _recorder()
+    meter, reader = _meter()
+    app = BabelQueue(transport=InMemoryTransport(), queue="orders")
+    otel.publish(tracer, app, "urn:babel:orders:created", {"n": 1}, system="redis")
+    _consume(tracer, system="redis")
+    assert _points(reader) == {}
+
+
+def test_dead_letter_observer_without_a_meter_is_a_no_op():
+    observer = otel.dead_letter_observer(None)
+    observer(DeadLetterEvent(queue="orders", dead_letter_queue="orders.dlq", reason="failed"))
+
+
+def test_the_dead_letter_counter_counts_a_real_runtime_dead_letter():
+    tracer, _ = _recorder()
+    meter, reader = _meter()
+    t = InMemoryTransport()
+    app = BabelQueue(
+        transport=t, queue="orders", max_attempts=1, dead_letter=True,
+        dead_letter_observer=otel.dead_letter_observer(meter, system="redis"),
+    )
+    app.register("urn:babel:orders:created", otel.wrap_handler(tracer, _always_fails, system="redis", meter=meter))
+    app.publish("urn:babel:orders:created", {"n": 1})
+
+    assert app.consume("orders", max_messages=1, timeout=0, handle_signals=False) == 1
+
+    points = _points(reader)
+    (dlq,) = points["babelqueue.dlq.messages"]
+    assert dlq.value == 1
+    assert dict(dlq.attributes) == {
+        "messaging.system": "redis",
+        "messaging.operation.name": "process",
+        "messaging.destination.name": "orders",
+    }
+    assert t.size("orders.dlq") == 1
+
+
+def _always_fails(data, meta):
+    raise RuntimeError("always")
