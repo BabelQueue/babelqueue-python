@@ -358,5 +358,73 @@ class ArtemisPublishTest(unittest.TestCase):
         self.assertEqual(URN, EnvelopeCodec.decode(message.body)["job"])
 
 
+
+TRACEPARENT = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+
+
+class ArtemisTraceparentConsumeTest(unittest.TestCase):
+    def test_pop_surfaces_out_of_band_properties_without_the_bq_projection(self) -> None:
+        props = {
+            "bq_schema_version": "1",
+            "bq_source_lang": "python",
+            "bq_attempts": "0",
+            "bq_app_id": "babelqueue",
+            "traceparent": TRACEPARENT,
+            "bq-replay-bypass": "1",
+        }
+        receiver = FakeReceiver([FakeMessage(body(0), properties=props)])
+        transport = ArtemisTransport(connection=FakeConnection(receiver=receiver))
+
+        message = transport.pop("orders")
+
+        self.assertEqual({"traceparent": TRACEPARENT, "bq-replay-bypass": "1"}, message.headers)
+
+    def test_pop_without_properties_has_no_headers(self) -> None:
+        receiver = FakeReceiver([FakeMessage(body(0), properties=None)])
+        transport = ArtemisTransport(connection=FakeConnection(receiver=receiver))
+        self.assertEqual({}, transport.pop("orders").headers)
+
+
+@unittest.skipUnless(HAVE_PROTON, "python-qpid-proton not installed")
+class ArtemisTraceparentPublishTest(unittest.TestCase):
+    def test_publish_with_headers_adds_application_properties_beside_the_projection(self) -> None:
+        raw = body(attempts=0, trace_id="trace-xyz")
+        plain_sender, sender = FakeSender(), FakeSender()
+        ArtemisTransport(connection=FakeConnection(sender=plain_sender)).publish("orders", raw)
+        ArtemisTransport(connection=FakeConnection(sender=sender)).publish_with_headers(
+            "orders",
+            raw,
+            {"traceparent": TRACEPARENT, "bq_attempts": "99", "bq-replay-bypass": "1"},
+        )
+
+        message, plain = sender.sent[0], plain_sender.sent[0]
+        self.assertEqual(TRACEPARENT, message.properties["traceparent"])
+        self.assertEqual("1", message.properties["bq-replay-bypass"])
+        self.assertEqual("0", message.properties["bq_attempts"])  # the projection wins a collision
+        self.assertEqual(plain.body, message.body)  # body byte-identical
+        self.assertEqual(plain.correlation_id, message.correlation_id)
+        contract = {
+            k: v for k, v in message.properties.items() if k not in ("traceparent", "bq-replay-bypass")
+        }
+        self.assertEqual(dict(plain.properties), contract)
+
+    def test_round_trip_through_the_runtime(self) -> None:
+        from babelqueue import BabelQueue, headers_from_context
+
+        sender = FakeSender()
+        app = BabelQueue(transport=ArtemisTransport(connection=FakeConnection(sender=sender)), queue="orders")
+        app.publish_with_headers(URN, {"order_id": 1}, {"traceparent": TRACEPARENT})
+        sent = sender.sent[0]
+        received = FakeMessage(sent.body, properties=dict(sent.properties))
+        seen: dict = {}
+        app2 = BabelQueue(
+            transport=ArtemisTransport(connection=FakeConnection(receiver=FakeReceiver([received]))),
+            queue="orders",
+        )
+        app2.register(URN, lambda data, meta: seen.update(headers=dict(headers_from_context())))
+        app2.consume("orders", max_messages=1, timeout=0)
+        self.assertEqual({"traceparent": TRACEPARENT}, seen["headers"])
+
+
 if __name__ == "__main__":
     unittest.main()

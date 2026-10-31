@@ -1851,6 +1851,146 @@ class KafkaSchemeTest(unittest.TestCase):
         self.assertIsInstance(tr, KafkaTransport)
 
 
+
+TRACEPARENT = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+
+
+class KafkaTraceparentTest(unittest.TestCase):
+    def test_publish_with_headers_adds_record_headers_beside_the_projection(self):
+        raw = body()
+        plain, framed = FakeProducer(), FakeProducer()
+        transport(producer=plain).publish("orders", raw)
+        transport(producer=framed).publish_with_headers(
+            "orders",
+            raw,
+            {
+                "traceparent": TRACEPARENT,
+                "tracestate": "a=1",
+                "bq-replay-bypass": "1",
+                "bq-job": "urn:evil",  # a contract key: the projection wins
+            },
+        )
+
+        rec = framed.produced[0]
+        headers = header_map(rec["headers"])
+        self.assertEqual(headers["traceparent"], TRACEPARENT)
+        self.assertEqual(headers["tracestate"], "a=1")
+        self.assertEqual(headers["bq-replay-bypass"], "1")
+        self.assertEqual(headers["bq-job"], URN)
+        self.assertEqual([k for k, _ in rec["headers"]].count("bq-job"), 1)
+        for _key, value in rec["headers"]:
+            self.assertIsInstance(value, bytes)
+        # value, key and timestamp are exactly what a plain publish writes
+        self.assertEqual(rec["value"], plain.produced[0]["value"])
+        self.assertEqual(rec["value"], raw.encode("utf-8"))
+        self.assertEqual(rec["timestamp"], plain.produced[0]["timestamp"])
+        self.assertEqual(rec["headers"][: len(plain.produced[0]["headers"])], plain.produced[0]["headers"])
+
+    def test_publish_with_empty_headers_equals_publish(self):
+        raw = body()
+        plain, framed = FakeProducer(), FakeProducer()
+        transport(producer=plain).publish("orders", raw)
+        transport(producer=framed).publish_with_headers("orders", raw, {})
+        self.assertEqual(framed.produced, plain.produced)
+
+    def test_pop_surfaces_out_of_band_headers_without_the_bq_projection(self):
+        headers = KafkaTransport._projection(body()) + [
+            ("traceparent", TRACEPARENT.encode("utf-8")),
+            ("bq-replay-bypass", b"1"),
+        ]
+        message = FakeMessage(body().encode("utf-8"), headers=headers)
+
+        msg = transport(consumer=FakeConsumer([message])).pop("orders")
+
+        self.assertEqual(msg.headers, {"traceparent": TRACEPARENT, "bq-replay-bypass": "1"})
+
+    def test_pop_without_headers_has_none(self):
+        msg = transport(consumer=FakeConsumer([FakeMessage(body().encode("utf-8"))])).pop("orders")
+        self.assertEqual(msg.headers, {})
+
+    def test_round_trip_reaches_the_handler_through_the_context(self):
+        from babelqueue import headers_from_context
+
+        producer = FakeProducer()
+        tr = transport(producer=producer)
+        app = BabelQueue(transport=tr, queue="orders")
+        app.publish_with_headers(URN, {"order_id": 1}, {"traceparent": TRACEPARENT})
+        rec = producer.produced[0]
+        tr2 = transport(consumer=FakeConsumer([FakeMessage(rec["value"], headers=rec["headers"])]))
+        seen = {}
+        app2 = BabelQueue(transport=tr2, queue="orders")
+        app2.register(URN, lambda data, meta: seen.update(headers=dict(headers_from_context())))
+        app2.consume("orders", max_messages=1, timeout=0)
+        self.assertEqual(seen["headers"], {"traceparent": TRACEPARENT})
+
+
+
+class KafkaRedriveBypassTest(unittest.TestCase):
+    """``redrive(bypass=True)`` stamps ``bq-replay-bypass`` and still behaves like the ordinary redrive
+    write: the broker must confirm it before the DLQ record is committed, and the DLQ record key is
+    carried unchanged. A header-capable Kafka transport must not turn the confirmed settle write into
+    a fire-and-forget one (a lost write would drop the message from both topics)."""
+
+    KEYS = (b"order-1042", b"", None)
+
+    def _dead(self, key):
+        dead = dead_letter.annotate(EnvelopeCodec.decode(body()), "failed", "orders", 3, error="boom")
+        return OffsetMessage(EnvelopeCodec.encode(dead).encode(), [], offset=0, topic="orders.dlq", key=key)
+
+    def _redrive(self, producer, key=b"k"):
+        from babelqueue import redrive
+
+        consumer = OffsetConsumer([self._dead(key)])
+        try:
+            result = redrive.redrive(transport(producer, consumer), "orders.dlq", timeout=0, bypass=True)
+        except KafkaDeliveryError as exc:
+            return exc, consumer
+        return result, consumer
+
+    def test_bypass_write_is_confirmed_stamped_and_keeps_the_key(self):
+        for key in self.KEYS:
+            with self.subTest(key=key):
+                producer = ReportingProducer()
+                result, consumer = self._redrive(producer, key)
+                self.assertEqual(result.redriven, 1)
+                self.assertTrue(result.items[0].bypassed)
+                (record,) = producer.produced
+                self.assertEqual(producer.confirmed, ["orders"])  # waited for the delivery report
+                self.assertEqual(record["topic"], "orders")
+                self.assertEqual(record["key"], key)
+                self.assertEqual(header_map(record["headers"])["bq-replay-bypass"], "1")
+                self.assertEqual(consumer.commits, [0])
+
+    def test_a_null_key_is_not_synthesised_on_the_bypass_write(self):
+        producer = ReportingProducer()
+        self._redrive(producer, None)
+        self.assertIsNone(producer.produced[0]["key"])
+
+    def test_a_failed_bypass_write_restores_the_dlq_record_before_the_commit(self):
+        for outcome in ("error", "timeout"):
+            with self.subTest(outcome=outcome):
+                producer = ReportingProducer([outcome])  # the redriven write fails, the restore is fine
+                err, consumer = self._redrive(producer, b"order-1042")
+                self.assertIsInstance(err, KafkaDeliveryError)
+                self.assertEqual([r["topic"] for r in producer.produced], ["orders", "orders.dlq"])
+                restore = producer.produced[1]
+                self.assertEqual(restore["key"], b"order-1042")
+                self.assertEqual(EnvelopeCodec.decode(restore["value"].decode())["dead_letter"]["reason"], "failed")
+                self.assertEqual(consumer.commits, [0])  # committed only after the restore was confirmed
+
+    def test_when_the_restore_also_fails_the_dlq_record_is_not_committed(self):
+        producer = ReportingProducer(["error", "error"])
+        err, consumer = self._redrive(producer)
+        self.assertIsInstance(err, KafkaDeliveryError)
+        self.assertEqual(consumer.commits, [])  # still in the DLQ: nothing was lost
+
+    def test_publish_with_headers_stays_a_plain_publish(self):
+        # the user-facing header publish is not a settle write: fire-and-forget like ``publish``
+        producer = ReportingProducer()
+        transport(producer).publish_with_headers("orders", body(), {"traceparent": "00-x"})
+        self.assertEqual(producer.confirmed, [])
+
+
 if __name__ == "__main__":
     unittest.main()
 

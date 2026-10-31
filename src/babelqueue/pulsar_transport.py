@@ -31,6 +31,12 @@ and a retry / dead-letter re-publish writes that ``bq-job`` (or, when the delive
 body's job) and the original raw ``bq-schema-version`` back — never the sentinel — so a redrive
 meets the same gate.
 
+Out-of-band transport headers (a W3C ``traceparent`` for cross-hop span linkage, ADR-0028) ride as
+extra message properties beside the ``bq-*`` projection: :meth:`PulsarTransport.publish_with_headers`
+writes them (the projection wins a collision) and :meth:`~PulsarTransport.pop` surfaces every
+non-projection property on :attr:`~babelqueue.transport.ReceivedMessage.headers`; the ``bq-*``
+projection keys are not leaked. The payload is untouched (GR-1).
+
 This implements §5 of the broker-bindings contract. The envelope is unchanged
 (``schema_version`` stays 1); Apache Pulsar is purely additive.
 
@@ -48,6 +54,7 @@ from urllib.parse import quote, unquote
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from .codec import ASCII_WHITESPACE, SCHEMA_VERSION, EnvelopeCodec, parse_envelope
+from .headers import out_of_band_headers
 from .transport import ReceivedMessage, Transport
 
 #: ``bq-attempts`` is valid only as a run of ASCII digits (no sign, no whitespace) ...
@@ -348,6 +355,29 @@ class PulsarTransport(Transport):
             body.encode("utf-8"), properties=self._projection(body, route_urn)
         )
 
+    def publish_with_headers(self, queue: str, body: str, headers: Dict[str, str]) -> None:
+        """:meth:`publish` with out-of-band ``headers`` (a W3C ``traceparent``, the replay-bypass
+        marker ...) written as extra message properties beside the ``bq-*`` projection
+        (:class:`~babelqueue.transport.HeaderPublisher`, ADR-0028, broker-bindings 5.2). The
+        projection wins a key collision and the payload is byte-identical to :meth:`publish`."""
+        self.publish_redriven(queue, body, headers)
+
+    def publish_redriven(
+        self,
+        queue: str,
+        body: str,
+        headers: Dict[str, str],
+        route_urn: str = "",
+        key: Optional[bytes] = None,
+    ) -> None:
+        """:class:`~babelqueue.transport.RedrivePublisher`: :meth:`publish_with_headers` with
+        ``bq-job`` pinned to ``route_urn`` as :meth:`publish_routed` does, so a ``redrive(bypass=True)``
+        keeps the dead-lettered delivery's routing property (a blank ``route_urn`` derives it from the
+        body). Pulsar has no record key here, so ``key`` is unused."""
+        properties = out_of_band_headers(headers)
+        properties.update(self._projection(body, route_urn))
+        self._producer(queue).send(body.encode("utf-8"), properties=properties)
+
     def pop(self, queue: str, timeout: float = 1.0) -> Optional[ReceivedMessage]:
         wait = self._receive_timeout_millis
         if timeout and timeout > 0:
@@ -388,6 +418,7 @@ class PulsarTransport(Transport):
             queue=queue,
             handle=message,
             route_urn=route_urn,
+            headers=out_of_band_headers(properties),
             # The §5.5 reconciled count without a body: what a poison body (no envelope to carry
             # ``attempts``) is counted by (ADR-0036 decision 2).
             native_attempts=self._native_attempts(self._redelivery_count(message), properties),

@@ -483,5 +483,140 @@ class AsbPublishTest(unittest.TestCase):
         self.assertIn(b"bq-schema-version\x54\x01", bytes(out))
 
 
+
+TRACEPARENT = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+
+
+class AsbTraceparentConsumeTest(unittest.TestCase):
+    def test_pop_surfaces_out_of_band_properties_without_the_bq_projection(self):
+        props = {
+            "bq-schema-version": "1",
+            "bq-source-lang": "python",
+            "bq-created-at": 1761900000000,
+            b"traceparent": TRACEPARENT.encode("utf-8"),  # the AMQP client may hand bytes over
+            "bq-replay-bypass": "1",
+        }
+        received = FakeReceived(body(), application_properties=props)
+        tr = AsbTransport(client=FakeClient(receiver=FakeReceiver([received])))
+
+        msg = tr.pop("orders")
+
+        self.assertEqual(msg.headers, {"traceparent": TRACEPARENT, "bq-replay-bypass": "1"})
+
+    def test_pop_without_properties_has_no_headers(self):
+        tr = AsbTransport(client=FakeClient(receiver=FakeReceiver([FakeReceived(body())])))
+        self.assertEqual(tr.pop("orders").headers, {})
+
+
+@unittest.skipUnless(HAVE_ASB, "azure-servicebus not installed")
+class AsbTraceparentPublishTest(unittest.TestCase):
+    def test_publish_with_headers_adds_application_properties_beside_the_projection(self):
+        raw = body()
+        plain_sender, sender = FakeSender(), FakeSender()
+        AsbTransport(client=FakeClient(sender=plain_sender)).publish("orders", raw)
+        AsbTransport(client=FakeClient(sender=sender)).publish_with_headers(
+            "orders",
+            raw,
+            {"traceparent": TRACEPARENT, "bq-source-lang": "evil", "bq-replay-bypass": "1"},
+        )
+
+        sent, plain = sender.sent[0], plain_sender.sent[0]
+        self.assertEqual(sent.application_properties["traceparent"], TRACEPARENT)
+        self.assertEqual(sent.application_properties["bq-replay-bypass"], "1")
+        self.assertEqual(
+            sent.application_properties["bq-source-lang"],
+            plain.application_properties["bq-source-lang"],
+        )  # the projection wins a collision
+        self.assertEqual(str(sent), str(plain))  # body byte-identical
+        self.assertEqual(str(sent), raw)
+        self.assertEqual(sent.subject, plain.subject)
+        self.assertEqual(sent.correlation_id, plain.correlation_id)
+        self.assertEqual(sent.message_id, plain.message_id)
+
+    def test_publish_with_headers_keeps_ms_created_at_an_amqp_long(self):
+        from azure.servicebus._pyamqp import _encode
+
+        sender = FakeSender()
+        AsbTransport(client=FakeClient(sender=sender)).publish_with_headers(
+            "orders", body(), {"traceparent": TRACEPARENT}
+        )
+        out = bytearray()
+        _encode.encode_value(out, _encode.encode_application_properties(sender.sent[0].application_properties))
+        self.assertIn(b"bq-created-at\x81", bytes(out))
+
+    def test_round_trip_through_the_runtime(self):
+        from babelqueue import BabelQueue, headers_from_context
+
+        sender = FakeSender()
+        app = BabelQueue(transport=AsbTransport(client=FakeClient(sender=sender)), queue="orders")
+        app.publish_with_headers(URN, {"order_id": 1}, {"traceparent": TRACEPARENT})
+        sent = sender.sent[0]
+        received = FakeReceived(str(sent), application_properties=dict(sent.application_properties))
+        seen = {}
+        app2 = BabelQueue(
+            transport=AsbTransport(client=FakeClient(receiver=FakeReceiver([received]))), queue="orders"
+        )
+        app2.register(URN, lambda data, meta: seen.update(headers=dict(headers_from_context())))
+        app2.consume("orders", max_messages=1, timeout=0)
+        self.assertEqual(seen["headers"], {"traceparent": TRACEPARENT})
+
+
+class AsbNativeDeadLetterVariantTest(unittest.TestCase):
+    """``settle_native_dead_letter`` (ADR-0039 section 5.1): same settle as ``settle_native``, plus
+    whether the message really went to ``$DeadLetterQueue``."""
+
+    def test_returns_true_when_dead_letter_message_was_called(self):
+        received = FakeReceived(body())
+        receiver = FakeReceiver([received])
+        tr = AsbTransport(client=FakeClient(receiver=receiver))
+        msg = tr.pop("orders")
+
+        self.assertIs(tr.settle_native_dead_letter(msg, "poison", "bad body"), True)
+
+        self.assertEqual(receiver.dead_lettered, [(received, "poison", "bad body")])
+        self.assertEqual(receiver.abandoned, [])
+        self.assertEqual(receiver.completed, [])
+
+    def test_returns_false_when_it_fell_back_to_abandon(self):
+        class AbandonOnlyReceiver:
+            def __init__(self, messages):
+                self._messages = list(messages)
+                self.abandoned = []
+
+            def receive_messages(self, max_message_count=1, max_wait_time=None):
+                batch, self._messages = self._messages[:max_message_count], self._messages[max_message_count:]
+                return batch
+
+            def abandon_message(self, message):
+                self.abandoned.append(message)
+
+        received = FakeReceived(body())
+        receiver = AbandonOnlyReceiver([received])
+        tr = AsbTransport(client=FakeClient(receiver=receiver))
+        msg = tr.pop("orders")
+
+        self.assertIs(tr.settle_native_dead_letter(msg, "poison", "bad body"), False)
+
+        self.assertEqual(receiver.abandoned, [received])
+
+    def test_returns_false_without_a_handle_and_settles_nothing(self):
+        receiver = FakeReceiver()
+        tr = AsbTransport(client=FakeClient(receiver=receiver))
+        msg = ReceivedMessage(body="", queue="orders", handle=None)
+
+        self.assertIs(tr.settle_native_dead_letter(msg, "poison", "x"), False)
+
+        self.assertEqual((receiver.dead_lettered, receiver.abandoned), ([], []))
+
+    def test_settle_native_is_unchanged(self):
+        received = FakeReceived(body())
+        receiver = FakeReceiver([received])
+        tr = AsbTransport(client=FakeClient(receiver=receiver))
+
+        self.assertIsNone(tr.settle_native(tr.pop("orders"), "poison", "bad body"))
+
+        self.assertEqual(receiver.dead_lettered, [(received, "poison", "bad body")])
+
+
 if __name__ == "__main__":
     unittest.main()

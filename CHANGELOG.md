@@ -9,6 +9,35 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+- **W3C `traceparent` / `tracestate` on the Kafka, Pulsar, Artemis and Azure Service Bus
+  transports (ADR-0028; broker-bindings 4.3, 5.2, 6.3, 7.2).** Each transport now implements the
+  `HeaderPublisher` capability: `publish_with_headers(queue, body, headers)` carries the headers
+  out of band beside the `bq-*` / `bq_*` projection (Kafka record headers, Pulsar message
+  properties, Artemis AMQP 1.0 application-properties, Azure Service Bus application properties).
+  The projection wins a key collision, and the body is byte-identical to a plain `publish`.
+  `pop` surfaces every non-projection header on `ReceivedMessage.headers` (so
+  `babelqueue.otel.wrap_handler` links the consumer span to the producer's across these brokers);
+  the projection keys themselves are never leaked, and `bq-replay-bypass` (ADR-0027) passes
+  through. A Kafka retry parks the consumed record's `traceparent` / `tracestate` on the tier topic
+  (the re-inject consumer already keeps every header except `bq-delay` / `bq-original-topic`), so
+  a retried message stays in the original trace. Retry tier names, `retry_tiers_ms` and the
+  poison / DLQ shapes are unchanged. `babelqueue.headers.out_of_band_headers` is the shared helper.
+- **`RedrivePublisher` capability and `redrive(bypass=True)` on the header-capable transports.**
+  Kafka, Pulsar, Artemis and Azure Service Bus becoming `HeaderPublisher`s means
+  `redrive(..., bypass=True)` now really stamps the `bq-replay-bypass` marker on them
+  (`RedriveItem.bypassed` is `True`; it was `False` before, because the transports could not carry
+  headers), and the write goes through the transport's header-carrying path. So that this path
+  loses nothing the ordinary redrive write keeps, `Kafka` and `Pulsar` implement the new optional
+  `publish_redriven(queue, body, headers, route_urn, key)`: Kafka's is the broker-confirmed settle
+  write (a delivery failure raises `KafkaDeliveryError`, the DLQ record is restored and not
+  committed past) and carries the DLQ record key unchanged; Pulsar's pins `bq-job` to the
+  dead-lettered delivery's routing property. `redrive` uses it when the transport has it.
+- **`AsbTransport.settle_native_dead_letter(message, reason, description) -> bool`** (ADR-0039
+  section 5.1): the optional native-settle variant that reports what it did. It performs the same
+  settle as `settle_native` (which is unchanged) and returns `True` when the receiver's
+  `dead_letter_message` ran, `False` when it only abandoned the lock or had no handle.
+
 ## [1.24.0] - 2026-10-26
 
 Implements conformance **1.8.0** (vendored from the `v1.8.0` release asset, verified with

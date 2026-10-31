@@ -110,3 +110,21 @@ def test_publish_with_headers_falls_back_when_transport_cannot_carry():
     msg = t.pop("orders", 0)
     assert msg is not None and msg.headers == {}
     assert isinstance(msg, ReceivedMessage)
+
+
+def test_out_of_band_headers_drops_projection_keys_and_decodes_bytes():
+    from babelqueue.headers import out_of_band_headers
+
+    raw = [
+        ("bq-job", b"urn:babel:orders:created"),
+        ("bq-delay", b"5000"),
+        (b"traceparent", b"00-abc"),
+        ("bq-replay-bypass", "1"),
+        ("traceparent", b"00-second"),  # a repeated key: the first one wins
+        ("blank", b""),
+        ("none", None),
+    ]
+    assert out_of_band_headers(raw) == {"traceparent": "00-abc", "bq-replay-bypass": "1"}
+    assert out_of_band_headers({"bq_attempts": "1", "tracestate": "a=1"}) == {"tracestate": "a=1"}
+    assert out_of_band_headers(None) == {} and out_of_band_headers([]) == {}
+    assert out_of_band_headers(42) == {}

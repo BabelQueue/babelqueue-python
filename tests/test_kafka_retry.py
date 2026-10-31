@@ -441,5 +441,63 @@ class HelpersTest(unittest.TestCase):
         self.assertTrue(issubclass(KafkaDeliveryError, BabelQueueError))
 
 
+
+class TraceparentRetryChainTest(unittest.TestCase):
+    """The W3C trace context survives the retry chain: work topic -> tier topic -> re-inject ->
+    work topic (broker-bindings 6.3 / 6.4)."""
+
+    TRACEPARENT = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+
+    def test_a_retry_parks_the_traceparent_on_the_tier_topic_and_reinject_keeps_it(self):
+        headers = [
+            ("traceparent", self.TRACEPARENT.encode("utf-8")),
+            ("tracestate", b"a=1"),
+            ("bq-replay-bypass", b"1"),
+        ]
+        consumer = OffsetConsumer([OffsetMessage(body(0).encode("utf-8"), headers, offset=0)])
+        producer = FakeProducer()
+        kafka = _tier_transport(producer, consumer)
+        message = kafka.pop("orders", timeout=0)
+        self.assertEqual(message.headers["traceparent"], self.TRACEPARENT)
+
+        kafka.redeliver(message, message.body, 0)
+
+        (parked,) = producer.produced
+        tier_headers = header_map(parked["headers"])
+        self.assertEqual(parked["topic"], "orders.retry.1")
+        self.assertEqual(tier_headers["traceparent"], self.TRACEPARENT)
+        self.assertEqual(tier_headers["tracestate"], "a=1")
+        self.assertNotIn("bq-replay-bypass", tier_headers)  # only the trace context is forwarded
+        self.assertEqual([k for k, _ in parked["headers"]].count("traceparent"), 1)
+        self.assertEqual(tier_headers["bq-delay"], "5000")  # the tier bookkeeping is unchanged
+
+        # the re-inject consumer drops bq-delay / bq-original-topic and keeps the trace context
+        reinject_producer = FakeProducer()
+        record = _TierMessage(parked["value"], parked["headers"], key=None, ts_ms=100_000)
+        reinjector = _reinjector(_ReinjectConsumer([record]), reinject_producer, _Clock(106))
+        reinjector.run_once(0)
+        (back,) = reinject_producer.produced
+        self.assertEqual(back["topic"], "orders")
+        back_headers = header_map(back["headers"])
+        self.assertEqual(back_headers["traceparent"], self.TRACEPARENT)
+        self.assertEqual(back_headers["tracestate"], "a=1")
+        self.assertNotIn("bq-delay", back_headers)
+        self.assertNotIn("bq-original-topic", back_headers)
+
+    def test_a_retry_without_trace_context_adds_no_extra_header(self):
+        consumer = OffsetConsumer([OffsetMessage(body(0).encode("utf-8"), [], offset=0)])
+        producer = FakeProducer()
+        kafka = _tier_transport(producer, consumer)
+        message = kafka.pop("orders", timeout=0)
+        kafka.redeliver(message, message.body, 0)
+        self.assertEqual(
+            sorted(header_map(producer.produced[0]["headers"])),
+            sorted(
+                ["bq-job", "bq-trace-id", "bq-message-id", "bq-schema-version", "bq-source-lang",
+                 "bq-attempts", "bq-delay", "bq-original-topic"]
+            ),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
