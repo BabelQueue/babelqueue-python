@@ -42,6 +42,7 @@ from .transport import (
     HeaderPublisher,
     PoisonRoute,
     ReceivedMessage,
+    RedrivePublisher,
     Transport,
     publish_keeping_route,
 )
@@ -193,10 +194,17 @@ def _publish_redriven(
     :class:`~babelqueue.transport.RoutedPublisher` when the transport implements it, and the DLQ
     record's ``key`` (:attr:`ReceivedMessage.key`; Kafka, contract §6.5 "Record key on republish")
     is carried byte-for-byte through :class:`~babelqueue.transport.SettlePublisher` — a null key
-    stays null, an empty key stays empty. The bypass-header path carries no record key (as in the
-    Go reference)."""
+    stays null, an empty key stays empty. The bypass-header path does the same through
+    :class:`~babelqueue.transport.RedrivePublisher` when the transport implements it; a transport
+    that is only a :class:`~babelqueue.transport.HeaderPublisher` has no route or key to keep."""
     if bypass and isinstance(transport, HeaderPublisher):
-        transport.publish_with_headers(queue, body, {HEADER_REPLAY_BYPASS: "1"})
+        headers = {HEADER_REPLAY_BYPASS: "1"}
+        if isinstance(transport, RedrivePublisher):
+            # A transport with a route, a record key or a confirmed settle write keeps all three
+            # on the bypass write too (Kafka: confirmed + key; Pulsar: the ``bq-job`` route).
+            transport.publish_redriven(queue, body, headers, route_urn, key)
+        else:
+            transport.publish_with_headers(queue, body, headers)
         return True
     publish_keeping_route(transport, queue, body, route_urn, key)
     return False

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
-from typing import Dict, Iterator, Mapping, Optional
+from typing import Any, Dict, Iterator, Mapping, Optional
 
 #: The delivered message's out-of-band transport headers, for the span of one dispatch.
 #: Defaults to an empty mapping so :func:`headers_from_context` is always nil-safe.
@@ -67,4 +67,74 @@ def merge_headers(*sources: Optional[Mapping[str, str]]) -> Dict[str, str]:
             if not key or value is None or value == "":
                 continue
             out[str(key)] = str(value)
+    return out
+
+
+#: The contract projection keys the broker transports write beside the body (broker-bindings
+#: sections 4.3, 5.2, 6.3 and 7.2): the routable view of the envelope plus the Kafka retry-topic
+#: bookkeeping. They are the transport's own, so they are never surfaced as out-of-band headers
+#: on consume and never accepted from a caller on publish (a ``bq-*`` / ``bq_*`` contract key
+#: wins a collision). Anything else, ``bq-replay-bypass`` (ADR-0027) and ``traceparent`` /
+#: ``tracestate`` (ADR-0028) included, is out-of-band metadata and passes through.
+CONTRACT_HEADER_KEYS = frozenset(
+    {
+        "bq-job",
+        "bq-trace-id",
+        "bq-message-id",
+        "bq-schema-version",
+        "bq-source-lang",
+        "bq-attempts",
+        "bq-created-at",
+        "bq-delay",
+        "bq-original-topic",
+        # Artemis: JMS property names must be valid Java identifiers, so underscores (ADR-0017).
+        "bq_schema_version",
+        "bq_source_lang",
+        "bq_attempts",
+        "bq_app_id",
+    }
+)
+
+#: The W3C trace-context headers (ADR-0028) a retry re-publish forwards.
+TRACE_CONTEXT_HEADER_KEYS = ("traceparent", "tracestate")
+
+
+def _text(value: Any) -> Optional[str]:
+    """``value`` as text: ``bytes`` decode as UTF-8, ``None`` stays ``None``."""
+    if value is None:
+        return None
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", "replace")
+    return str(value)
+
+
+def out_of_band_headers(raw: Any) -> Dict[str, str]:
+    """The out-of-band headers in ``raw``: a mapping or a ``[(key, value), ...]`` sequence (the
+    shape of Kafka record headers), whose keys and values may be ``bytes``.
+
+    Keys and values are decoded as UTF-8; blank keys, ``None`` / blank values and the transport's
+    own :data:`CONTRACT_HEADER_KEYS` projection keys are dropped, and the first occurrence of a
+    repeated key wins (Kafka allows duplicates). Returns a fresh ``dict``. Used on both sides of
+    a header-carrying transport: to surface a delivery's headers on
+    :attr:`~babelqueue.transport.ReceivedMessage.headers` (without leaking the projection), and
+    to sanitise the headers a caller passes to ``publish_with_headers`` before they are merged
+    with the projection.
+    """
+    if not raw:
+        return {}
+    try:
+        items = list(raw.items()) if hasattr(raw, "items") else list(raw)
+    except (TypeError, ValueError):
+        return {}
+    out: Dict[str, str] = {}
+    for item in items:
+        try:
+            key, value = item
+        except (TypeError, ValueError):
+            continue
+        name = _text(key)
+        text = _text(value)
+        if not name or not text or name in CONTRACT_HEADER_KEYS or name in out:
+            continue
+        out[name] = text
     return out

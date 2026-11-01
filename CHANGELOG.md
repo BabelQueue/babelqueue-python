@@ -9,6 +9,93 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.25.0] - 2026-11-01
+
+### Changed (dashboard-breaking) — `babelqueue.otel` follows the OpenTelemetry messaging semantic conventions v1.44.0 (ADR-0038)
+- **Span names change with no overlap:** `publish <urn>` becomes `send <queue>` and
+  `process <urn>` becomes `process <queue>` (the bare `send` / `process` when there is no queue).
+  The URN is never in the span name now (it is unbounded); it is the `babelqueue.urn` attribute.
+  The producer's `messaging.destination.name` is the queue the message is published to (it was the
+  URN), so a producer span and its consumer span share one destination. **Saved queries and
+  dashboards that filter on the old span names or on the producer destination must be updated.**
+- **`messaging.system` is now the broker when you pass it.** `wrap_handler(..., system="kafka")` and
+  `publish(..., system="kafka")` (`redis`, `rabbitmq`, `aws_sqs`, `servicebus`, `pulsar`, `kafka`,
+  `activemq`; any other value is written as given). **Omitting `system` keeps `babelqueue`, which is
+  deprecated** (a one-time warning is logged); what an absent `system` means after the deprecation
+  window is not decided yet, so pass it now.
+- New span attributes: `messaging.operation.type` / `messaging.operation.name` (`send` or
+  `process`), `babelqueue.urn`, `babelqueue.schema_version`, `babelqueue.attempts` and, on a failure,
+  `error.type` (`module.QualName` of the exception, the bare name for builtins) with an explicit
+  `ERROR` status whose description is the exception message. `consumer_group="..."` on
+  `wrap_handler` writes `messaging.consumer.group.name`.
+- **Dual-emit for this MINOR only:** the deprecated `messaging.operation` (`publish` / `process`) and
+  `messaging.babelqueue.attempts` are still written next to their replacements. **The next MINOR
+  removes both.**
+- `babelqueue.otel.SEMCONV_VERSION` (`1.44.0`) and `SEMCONV_SCHEMA_URL` (`https://opentelemetry.io/schemas/1.44.0`)
+  are public; create the tracer and meter with the schema URL
+  (`trace.get_tracer("orders", schema_url=otel.SEMCONV_SCHEMA_URL)`).
+- A `trace_id` that is not a UUID is still preserved byte for byte and hashed for the OTel TraceID
+  (`trace_id_of` is unchanged); `wrap_handler` now logs a warning once per distinct value
+  (message-envelope.md 5.1, ADR-0038 section 7). Nothing is rejected or regenerated.
+
+### Added
+- **Standard metrics (ADR-0039), opt-in.** Pass `meter=` to `wrap_handler` and `publish` to record
+  `messaging.process.duration` (histogram, `s`, semconv bucket advice where the API supports it),
+  `messaging.client.consumed.messages`, `messaging.client.sent.messages` and `babelqueue.retries`
+  (counters, `{message}`; `retries` counts a delivery with `attempts > 0`). The attributes are
+  `messaging.system`, `messaging.operation.name`, `messaging.destination.name` (when known) and
+  `error.type` (on failure); never the URN, an id, the attempt count or a dead-letter reason. With no
+  `meter` nothing is recorded.
+- **`babelqueue.dlq.messages` and the dead-letter observer seam (ADR-0039 section 5).**
+  `BabelQueue(..., dead_letter_observer=callback)` calls `callback(DeadLetterEvent(queue,
+  dead_letter_queue, reason))` once per dead-letter the runtime carried out, after the DLQ write is
+  confirmed (`BabelQueue._write_dead_letter`, the one chokepoint for exhausted retries, an unknown
+  URN, a poison body and a version-gated raw body) or after an SDK-initiated native dead-letter. A
+  failed write, a native no-op (SQS) and a broker-side dead-letter are not reported; an exception
+  raised by the observer is logged and never changes how the message is settled.
+  `otel.dead_letter_observer(meter, system=...)` is the observer that counts the metric.
+  New exports: `DeadLetterEvent`, `DeadLetterObserver`, and the `NativeDeadLetterSettler` protocol.
+- **`NativeDeadLetterSettler`**: the optional native-settle variant
+  `settle_native_dead_letter(message, reason, description) -> bool` next to `NativeSettler`
+  (unchanged). When a transport implements it the runtime prefers it and reports a dead-letter only
+  on `True`; `AsbTransport` implements it, the SQS no-op does not.
+- **`BabelQueue.publish_envelope(urn, data, *, queue=None, trace_id=None, headers=None)`** returns a
+  `PublishResult(envelope, error)` pair instead of raising. After a transport failure it still
+  carries the envelope that was handed to the transport (so `otel.publish` can put `meta.id` and
+  `trace_id` on a failed span); after a `make` or `encode` failure `envelope` is `None`. `publish`
+  and `publish_with_headers` delegate to it and behave exactly as before (an empty `queue` still
+  resolves to the default queue). `otel.publish` falls back to a duck-typed `app.publish(...)` for
+  objects that do not have it.
+- Conformance **1.9.0** is vendored; the `span-shape`, `trace-id` and `metrics` sections (and the six
+  new `traceparent` cases) run and pass.
+- **W3C `traceparent` / `tracestate` on the Kafka, Pulsar, Artemis and Azure Service Bus
+  transports (ADR-0028; broker-bindings 4.3, 5.2, 6.3, 7.2).** Each transport now implements the
+  `HeaderPublisher` capability: `publish_with_headers(queue, body, headers)` carries the headers
+  out of band beside the `bq-*` / `bq_*` projection (Kafka record headers, Pulsar message
+  properties, Artemis AMQP 1.0 application-properties, Azure Service Bus application properties).
+  The projection wins a key collision, and the body is byte-identical to a plain `publish`.
+  `pop` surfaces every non-projection header on `ReceivedMessage.headers` (so
+  `babelqueue.otel.wrap_handler` links the consumer span to the producer's across these brokers);
+  the projection keys themselves are never leaked, and `bq-replay-bypass` (ADR-0027) passes
+  through. A Kafka retry parks the consumed record's `traceparent` / `tracestate` on the tier topic
+  (the re-inject consumer already keeps every header except `bq-delay` / `bq-original-topic`), so
+  a retried message stays in the original trace. Retry tier names, `retry_tiers_ms` and the
+  poison / DLQ shapes are unchanged. `babelqueue.headers.out_of_band_headers` is the shared helper.
+- **`RedrivePublisher` capability and `redrive(bypass=True)` on the header-capable transports.**
+  Kafka, Pulsar, Artemis and Azure Service Bus becoming `HeaderPublisher`s means
+  `redrive(..., bypass=True)` now really stamps the `bq-replay-bypass` marker on them
+  (`RedriveItem.bypassed` is `True`; it was `False` before, because the transports could not carry
+  headers), and the write goes through the transport's header-carrying path. So that this path
+  loses nothing the ordinary redrive write keeps, `Kafka` and `Pulsar` implement the new optional
+  `publish_redriven(queue, body, headers, route_urn, key)`: Kafka's is the broker-confirmed settle
+  write (a delivery failure raises `KafkaDeliveryError`, the DLQ record is restored and not
+  committed past) and carries the DLQ record key unchanged; Pulsar's pins `bq-job` to the
+  dead-lettered delivery's routing property. `redrive` uses it when the transport has it.
+- **`AsbTransport.settle_native_dead_letter(message, reason, description) -> bool`** (ADR-0039
+  section 5.1): the optional native-settle variant that reports what it did. It performs the same
+  settle as `settle_native` (which is unchanged) and returns `True` when the receiver's
+  `dead_letter_message` ran, `False` when it only abandoned the lock or had no handle.
+
 ## [1.24.0] - 2026-10-26
 
 Implements conformance **1.8.0** (vendored from the `v1.8.0` release asset, verified with

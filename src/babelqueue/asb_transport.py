@@ -16,6 +16,13 @@ A version-gated message (``bq-schema-version`` the consumer does not support) or
 dead-lettering off, not completed: :meth:`AsbTransport.settle_native` dead-letters it natively into
 ``$DeadLetterQueue`` (ADR-0037).
 
+Out-of-band transport headers (a W3C ``traceparent`` for cross-hop span linkage, ADR-0028) ride as
+extra application properties (string-valued) beside the ``bq-*`` projection:
+:meth:`AsbTransport.publish_with_headers` writes them (the projection wins a collision) and
+:meth:`~AsbTransport.pop` surfaces every non-projection application property on
+:attr:`~babelqueue.transport.ReceivedMessage.headers`; the ``bq-*`` projection keys are not leaked.
+The body is untouched (GR-1).
+
 This implements §4 of the broker-bindings contract. The envelope is unchanged
 (``schema_version`` stays 1); Azure Service Bus is purely additive.
 
@@ -33,6 +40,7 @@ from typing import Any, Dict, Optional
 from urllib.parse import quote, urlsplit
 
 from .codec import ASCII_WHITESPACE, SCHEMA_VERSION, EnvelopeCodec, parse_envelope
+from .headers import out_of_band_headers
 from .transport import ReceivedMessage, Transport, truncate_declared_version
 
 _logger = logging.getLogger("babelqueue.asb")
@@ -228,11 +236,23 @@ class AsbTransport(Transport):
     # -- Transport ----------------------------------------------------------
 
     def publish(self, queue: str, body: str) -> None:
+        self._send(queue, body, None)
+
+    def publish_with_headers(self, queue: str, body: str, headers: Dict[str, str]) -> None:
+        """:meth:`publish` with out-of-band ``headers`` (a W3C ``traceparent``, the replay-bypass
+        marker ...) carried as extra string-valued application properties beside the ``bq-*``
+        projection (:class:`~babelqueue.transport.HeaderPublisher`, ADR-0028, broker-bindings 4.3).
+        The projection wins a key collision and the body is byte-identical to :meth:`publish`."""
+        self._send(queue, body, headers)
+
+    def _send(self, queue: str, body: str, headers: Optional[Dict[str, str]]) -> None:
         from azure.servicebus import ServiceBusMessage
 
         kwargs = self._projection(body)
-        if kwargs.get("application_properties"):
-            kwargs["application_properties"] = _amqp_typed(kwargs["application_properties"])
+        properties: Dict[str, Any] = dict(out_of_band_headers(headers))
+        properties.update(kwargs.get("application_properties") or {})
+        if properties:
+            kwargs["application_properties"] = _amqp_typed(properties)
         message = ServiceBusMessage(body, **kwargs)
         self._sender(queue).send_messages(message)
 
@@ -266,7 +286,12 @@ class AsbTransport(Transport):
                 route_urn=UNSUPPORTED_SCHEMA_ROUTE_PREFIX + quote(unsupported, safe=""),
             )
         body = self._reconcile(str(message), getattr(message, "delivery_count", None))
-        return ReceivedMessage(body=body, queue=queue, handle=message)
+        return ReceivedMessage(
+            body=body,
+            queue=queue,
+            handle=message,
+            headers=out_of_band_headers(getattr(message, "application_properties", None)),
+        )
 
     def ack(self, message: ReceivedMessage) -> None:
         if message.handle is None:
@@ -297,14 +322,26 @@ class AsbTransport(Transport):
         ``$DeadLetterQueue``. Nothing is completed, re-published or retried, and the body is
         unchanged. A receiver without ``dead_letter_message`` abandons the lock instead (also a
         conformant native settle: ``MaxDeliveryCount`` takes over)."""
+        self.settle_native_dead_letter(message, reason, description)
+
+    def settle_native_dead_letter(
+        self, message: ReceivedMessage, reason: str, description: str
+    ) -> bool:
+        """:meth:`settle_native` that also reports what it did (the optional native-settle variant
+        of ADR-0039 section 5.1): ``True`` when the receiver's ``dead_letter_message`` was called,
+        so the message really went to ``$DeadLetterQueue``, and ``False`` when it only abandoned
+        the lock (a receiver without ``dead_letter_message``) or had no handle to settle. The
+        runtime prefers it over :meth:`settle_native` and counts a dead-letter only on ``True``.
+        The settle itself is identical to :meth:`settle_native`, which stays as it was."""
         if message.handle is None:
-            return
+            return False
         receiver = self._receiver(message.queue)
         dead_letter = getattr(receiver, "dead_letter_message", None)
         if dead_letter is not None:
             dead_letter(message.handle, reason=reason, error_description=description)
-            return
+            return True
         self.abandon(message)
+        return False
 
     def close(self) -> None:  # pragma: no cover - resource cleanup
         for resource in (*self._senders.values(), *self._receivers.values(), self._client):

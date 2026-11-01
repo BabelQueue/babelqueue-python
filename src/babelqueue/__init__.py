@@ -15,6 +15,7 @@ from . import dead_letter, gdpr, headers, idempotency, outbox, redrive, replay
 from .app import BabelQueue
 from .codec import SCHEMA_VERSION, SOURCE_LANG, EnvelopeCodec
 from .contracts import HasTraceId, PolyglotMessage
+from .dead_letter import DeadLetterEvent, DeadLetterObserver, NativeDeadLetterSettler
 from .gdpr import Cipher, protect, unprotect
 from .headers import headers_from_context
 from .idempotency import IdempotencyStore, InMemoryStore
@@ -39,13 +40,14 @@ from .transport import (
     NativeSettler,
     ReceivedMessage,
     Redeliverer,
+    RedrivePublisher,
     Rewinder,
     RoutedPublisher,
     SettlePublisher,
     Transport,
 )
 
-__version__ = "1.24.0"
+__version__ = "1.25.0"
 
 __all__ = [
     "BabelQueue",
@@ -64,7 +66,11 @@ __all__ = [
     "DeadLetterWriter",
     "HeaderPublisher",
     "NativeSettler",
+    "NativeDeadLetterSettler",
+    "DeadLetterEvent",
+    "DeadLetterObserver",
     "Redeliverer",
+    "RedrivePublisher",
     "Rewinder",
     "RoutedPublisher",
     "SettlePublisher",

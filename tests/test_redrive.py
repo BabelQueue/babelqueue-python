@@ -216,3 +216,11 @@ def test_redrive_on_a_non_keyed_transport_is_unchanged():
     _dead_letter(t, "dlq", "urn:babel:orders:created", "orders")
     assert redrive(t, "dlq").redriven == 1
     assert len(_drain(t, "orders")) == 1
+
+
+def test_redrive_publisher_is_exported_from_the_package_root():
+    import babelqueue
+    from babelqueue.transport import RedrivePublisher
+
+    assert babelqueue.RedrivePublisher is RedrivePublisher
+    assert "RedrivePublisher" in babelqueue.__all__

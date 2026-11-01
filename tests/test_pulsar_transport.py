@@ -667,5 +667,106 @@ class PulsarSchemeTest(unittest.TestCase):
             make_transport("pulsar://localhost:6650")
 
 
+
+TRACEPARENT = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+
+
+class PulsarTraceparentTest(unittest.TestCase):
+    def test_publish_with_headers_adds_properties_beside_the_projection(self):
+        raw = body()
+        plain, framed = FakeProducer(), FakeProducer()
+        PulsarTransport(client=FakeClient(producer=plain)).publish("orders", raw)
+        PulsarTransport(client=FakeClient(producer=framed)).publish_with_headers(
+            "orders",
+            raw,
+            {"traceparent": TRACEPARENT, "bq-replay-bypass": "1", "bq-job": "urn:evil"},
+        )
+
+        content, props = framed.sent[0]
+        self.assertEqual(content, plain.sent[0][0])  # payload byte-identical
+        self.assertEqual(content, raw.encode("utf-8"))
+        self.assertEqual(props["traceparent"], TRACEPARENT)
+        self.assertEqual(props["bq-replay-bypass"], "1")
+        self.assertEqual(props["bq-job"], URN)  # the projection wins a collision
+        contract = {k: v for k, v in props.items() if k not in ("traceparent", "bq-replay-bypass")}
+        self.assertEqual(contract, plain.sent[0][1])
+
+    def test_publish_with_empty_headers_equals_publish(self):
+        raw = body()
+        plain, framed = FakeProducer(), FakeProducer()
+        PulsarTransport(client=FakeClient(producer=plain)).publish("orders", raw)
+        PulsarTransport(client=FakeClient(producer=framed)).publish_with_headers("orders", raw, {})
+        self.assertEqual(framed.sent, plain.sent)
+
+    def test_pop_surfaces_out_of_band_properties_without_the_bq_projection(self):
+        props = dict(PulsarTransport._projection(body()))
+        props["traceparent"] = TRACEPARENT
+        props["bq-replay-bypass"] = "1"
+        message = FakeMessage(body(), properties=props)
+        tr = PulsarTransport(client=FakeClient(consumer=FakeConsumer([message])))
+
+        msg = tr.pop("orders")
+
+        self.assertEqual(msg.headers, {"traceparent": TRACEPARENT, "bq-replay-bypass": "1"})
+
+    def test_pop_without_properties_has_no_headers(self):
+        message = FakeMessage(body(), properties=None)
+        tr = PulsarTransport(client=FakeClient(consumer=FakeConsumer([message])))
+        self.assertEqual(tr.pop("orders").headers, {})
+
+    def test_round_trip_through_the_runtime(self):
+        from babelqueue import BabelQueue, headers_from_context
+
+        producer = FakeProducer()
+        app = BabelQueue(transport=PulsarTransport(client=FakeClient(producer=producer)), queue="orders")
+        app.publish_with_headers(URN, {"order_id": 1}, {"traceparent": TRACEPARENT})
+        content, props = producer.sent[0]
+        consumer = FakeConsumer([FakeMessage(content.decode("utf-8"), properties=props)])
+        seen = {}
+        app2 = BabelQueue(transport=PulsarTransport(client=FakeClient(consumer=consumer)), queue="orders")
+        app2.register(URN, lambda data, meta: seen.update(headers=dict(headers_from_context())))
+        app2.consume("orders", max_messages=1, timeout=0)
+        self.assertEqual(seen["headers"], {"traceparent": TRACEPARENT})
+
+
+
+class PulsarRedriveBypassTest(unittest.TestCase):
+    """``redrive(bypass=True)`` keeps the dead-lettered delivery's routing property (``bq-job``)
+    exactly like the ordinary redrive write does (broker-bindings 5.2 / 5.7)."""
+
+    ROUTED = "urn:babel:other:thing"
+
+    def _redrive(self, bypass):
+        from babelqueue import dead_letter, redrive
+
+        dead = dead_letter.annotate(EnvelopeCodec.decode(body()), "failed", "orders", 3, error="boom")
+        raw = EnvelopeCodec.encode(dead)
+        props = dict(PulsarTransport._projection(raw))
+        props["bq-job"] = self.ROUTED  # the property names a different URN than the body (5.2: it wins)
+        producer = FakeProducer()
+        consumer = FakeConsumer([FakeMessage(raw, properties=props)])
+        tr = PulsarTransport(client=FakeClient(producer=producer, consumer=consumer))
+        result = redrive.redrive(tr, "orders.dlq", timeout=0, bypass=bypass)
+        self.assertEqual(result.redriven, 1)
+        return result, producer.sent[0][1]
+
+    def test_bypass_redrive_keeps_the_route_and_stamps_the_marker(self):
+        result, props = self._redrive(bypass=True)
+        self.assertTrue(result.items[0].bypassed)
+        self.assertEqual(props["bq-job"], self.ROUTED)
+        self.assertEqual(props["bq-replay-bypass"], "1")
+
+    def test_both_redrive_modes_route_the_same(self):
+        _, plain = self._redrive(bypass=False)
+        _, bypassed = self._redrive(bypass=True)
+        self.assertEqual(plain["bq-job"], bypassed["bq-job"])
+        self.assertEqual(set(bypassed) - {"bq-replay-bypass"}, set(plain))
+
+    def test_publish_with_headers_derives_the_route_from_the_body(self):
+        producer = FakeProducer()
+        PulsarTransport(client=FakeClient(producer=producer)).publish_with_headers("orders", body(), {})
+        self.assertEqual(producer.sent[0][1]["bq-job"], URN)
+
+
 if __name__ == "__main__":
     unittest.main()

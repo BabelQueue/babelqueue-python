@@ -32,10 +32,11 @@ import random
 import signal
 import threading
 from types import FrameType
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, Mapping, NamedTuple, Optional
 
 from . import dead_letter
 from .codec import EnvelopeCodec, has_forbidden_keys, parse_envelope
+from .dead_letter import DeadLetterEvent, DeadLetterObserver, NativeDeadLetterSettler
 from ._poison_record import build_poison_record
 from .exceptions import BabelQueueError, UnknownUrnError
 from .headers import _headers_scope
@@ -101,6 +102,19 @@ class _ShutdownDeadline(BaseException):
     A ``BaseException`` so the dispatch-level ``except Exception`` does not swallow it."""
 
 
+class PublishResult(NamedTuple):
+    """The outcome of :meth:`BabelQueue.publish_envelope`: ``(envelope, error)``.
+
+    ``envelope`` is the envelope that was handed to the transport (``None`` when building or
+    encoding it failed, so nothing was ever handed over); ``error`` is the exception that stopped
+    the publish (``None`` on success). A failed transport publish therefore still yields the
+    envelope that was attempted, which is what an observability wrapper needs.
+    """
+
+    envelope: Optional[Dict[str, Any]]
+    error: Optional[Exception]
+
+
 class BabelQueue:
     def __init__(
         self,
@@ -119,6 +133,7 @@ class BabelQueue:
         retry_jitter: str = "none",
         unknown_urn_release_delay: float = 0.0,
         shutdown_timeout: float = 30.0,
+        dead_letter_observer: Optional[DeadLetterObserver] = None,
     ) -> None:
         """
         ``retry_backoff`` / ``unknown_urn_release_delay`` are the seconds a released message
@@ -139,6 +154,12 @@ class BabelQueue:
         before releasing its message. Keep it above your longest handler run: a released
         message is redelivered and its handler runs again, and on brokers that count
         deliveries (SQS ``ApproximateReceiveCount``) the release also consumes an attempt.
+
+        ``dead_letter_observer`` (ADR-0039 section 5.1) is an optional callback
+        :data:`~babelqueue.dead_letter.DeadLetterObserver` the runtime calls once per dead-letter it
+        carried out itself, after the DLQ write (or the native dead-letter) is confirmed. A failed
+        write, a native no-op and a broker-side dead-letter are not reported. An exception it
+        raises is logged and never changes how the message is settled.
         """
         self.transport = transport if transport is not None else make_transport(broker_url)
         self.queue = queue
@@ -157,6 +178,7 @@ class BabelQueue:
         self.retry_jitter = retry_jitter
         self.unknown_urn_release_delay = float(unknown_urn_release_delay)
         self.shutdown_timeout = float(shutdown_timeout)
+        self.dead_letter_observer = dead_letter_observer
         self._handlers: Dict[str, Handler] = {}
         self._stop = threading.Event()
         self._rewind_pause = 1.0  # seconds to wait before a rewound gated message is re-polled
@@ -178,10 +200,7 @@ class BabelQueue:
         trace_id: Optional[str] = None,
     ) -> str:
         """Publish a message; returns its id (``meta.id``)."""
-        target = queue or self.queue
-        envelope = EnvelopeCodec.make(urn, data, queue=target, trace_id=trace_id)
-        self.transport.publish(target, EnvelopeCodec.encode(envelope))
-        return envelope["meta"]["id"]
+        return self._published_id(self.publish_envelope(urn, data, queue=queue, trace_id=trace_id))
 
     def publish_with_headers(
         self,
@@ -205,14 +224,60 @@ class BabelQueue:
         exactly as :func:`~babelqueue.redrive.redrive` degrades. Passing empty headers is
         equivalent to :meth:`publish`, so callers need not branch on transport capability.
         """
+        return self._published_id(
+            self.publish_envelope(urn, data, queue=queue, trace_id=trace_id, headers=headers)
+        )
+
+    def publish_envelope(
+        self,
+        urn: str,
+        data: Mapping[str, Any],
+        *,
+        queue: Optional[str] = None,
+        trace_id: Optional[str] = None,
+        headers: Optional[Mapping[str, str]] = None,
+    ) -> PublishResult:
+        """Publish like :meth:`publish` / :meth:`publish_with_headers`, but **return** the outcome
+        instead of raising: a :class:`PublishResult` ``(envelope, error)`` pair.
+
+        It is the one place that builds and sends the envelope. The two plain publish methods
+        delegate to it and re-raise ``error``, so their behaviour is unchanged (an empty ``queue``
+        resolves to :attr:`queue`, exactly as there). The difference is what a failure leaves
+        behind:
+
+        * ``make`` or ``encode`` failed (e.g. a blank URN, or ``data`` that is not JSON
+          serializable): ``envelope`` is ``None``, because nothing was ever handed to the
+          transport; ``error`` is the exception.
+        * the transport failed: ``envelope`` is the envelope that was handed to it (``meta.id``,
+          ``trace_id`` and ``meta.queue`` are readable), and ``error`` is the exception.
+        * success: ``(envelope, None)``.
+
+        ``headers`` are the out-of-band transport headers of :meth:`publish_with_headers`
+        (empty or ``None`` means a plain publish). The observability wrapper
+        :func:`babelqueue.otel.publish` uses it to read the produced identity on the failure path.
+        Only ``Exception`` is captured; ``KeyboardInterrupt`` and friends propagate.
+        """
         target = queue or self.queue
-        envelope = EnvelopeCodec.make(urn, data, queue=target, trace_id=trace_id)
-        body = EnvelopeCodec.encode(envelope)
-        if headers and isinstance(self.transport, HeaderPublisher):
-            self.transport.publish_with_headers(target, body, dict(headers))
-        else:
-            self.transport.publish(target, body)
-        return envelope["meta"]["id"]
+        try:
+            envelope = EnvelopeCodec.make(urn, data, queue=target, trace_id=trace_id)
+            body = EnvelopeCodec.encode(envelope)
+        except Exception as exc:  # noqa: BLE001 - returned to the caller, which re-raises it
+            return PublishResult(None, exc)
+        try:
+            if headers and isinstance(self.transport, HeaderPublisher):
+                self.transport.publish_with_headers(target, body, dict(headers))
+            else:
+                self.transport.publish(target, body)
+        except Exception as exc:  # noqa: BLE001 - returned to the caller, which re-raises it
+            return PublishResult(envelope, exc)
+        return PublishResult(envelope, None)
+
+    @staticmethod
+    def _published_id(result: PublishResult) -> str:
+        if result.error is not None:
+            raise result.error
+        assert result.envelope is not None  # no error means the envelope was built and sent
+        return result.envelope["meta"]["id"]
 
     # -- Register handlers --------------------------------------------------
 
@@ -504,16 +569,46 @@ class BabelQueue:
         mismatch does not flip to the body URN on the next attempt or in the DLQ."""
         publish_keeping_route(self.transport, queue, body, received.route_urn, received.key)
 
-    def _write_dead_letter(self, received: ReceivedMessage, queue: str, body: str) -> None:
+    def _write_dead_letter(
+        self,
+        received: ReceivedMessage,
+        queue: str,
+        body: str,
+        *,
+        source_queue: Optional[str] = None,
+        reason: str = "",
+    ) -> None:
         """Write the dead-letter record ``body`` to ``queue`` and settle ``received``.
 
         A :class:`~babelqueue.transport.DeadLetterWriter` transport does both as one guarded step
-        (a failed write propagates, never acks); otherwise publish, then acknowledge."""
+        (a failed write propagates, never acks); otherwise publish, then acknowledge.
+
+        The single chokepoint of every BabelQueue DLQ write (ADR-0039 section 5.2): once the write
+        is confirmed the dead-letter observer is told (``source_queue`` defaults to the queue
+        ``received`` came from, ``reason`` is empty for a raw body). A failed write raises before
+        that, so the observer is never called for it."""
         if isinstance(self.transport, DeadLetterWriter):
             self.transport.dead_letter(received, queue, body)
+        else:
+            self._publish_for(received, queue, body)
+            self._ack_settled(received)
+        self._notify_dead_letter(source_queue or received.queue, queue, reason)
+
+    def _notify_dead_letter(self, queue: str, dead_letter_queue: str, reason: str) -> None:
+        """Tell :attr:`dead_letter_observer` about a confirmed dead-letter. A raising observer is
+        logged and swallowed: it must never change the settle outcome (ADR-0039 section 5.1)."""
+        observer = self.dead_letter_observer
+        if observer is None:
             return
-        self._publish_for(received, queue, body)
-        self._ack_settled(received)
+        try:
+            observer(DeadLetterEvent(queue=queue, dead_letter_queue=dead_letter_queue, reason=reason))
+        except Exception:  # noqa: BLE001 - an observer must never affect settlement
+            logger.error(
+                "The dead-letter observer failed for a message from queue %r; the dead-letter "
+                "itself was already settled and is unaffected.",
+                queue,
+                exc_info=True,
+            )
 
     def _ack_settled(self, received: ReceivedMessage) -> None:
         """Acknowledge a message whose outcome is already final (handled, dead-lettered,
@@ -540,8 +635,13 @@ class BabelQueue:
         """Hand ``received`` to the transport's :class:`~babelqueue.transport.NativeSettler`
         capability and report whether it did: ``False`` means the transport has none and the caller
         keeps its previous settle. The event is logged and never retried by the SDK; a failing call
-        is logged too and leaves the message unacknowledged (the broker redelivers it)."""
-        if not isinstance(self.transport, NativeSettler):
+        is logged too and leaves the message unacknowledged (the broker redelivers it).
+
+        A transport that also implements :class:`~babelqueue.dead_letter.NativeDeadLetterSettler`
+        is settled through that variant instead, and the dead-letter observer is told only when it
+        returns ``True`` (a native dead-letter the SDK carried out, ADR-0039 section 5.1)."""
+        transport = self.transport
+        if not isinstance(transport, (NativeDeadLetterSettler, NativeSettler)):
             return False
         logger.warning(
             "Left to the broker's native mechanism (not acknowledged, not retried): queue %r, "
@@ -549,7 +649,14 @@ class BabelQueue:
             received.queue, received.route_urn, reason,
         )
         try:
-            self.transport.settle_native(received, reason, description)
+            if isinstance(transport, NativeDeadLetterSettler):
+                # The optional variant (ADR-0039 section 5.1) says whether the broker really
+                # dead-lettered the message: only a literal ``True`` is a dead-letter the SDK
+                # carried out (an abandon, or the SQS-style no-op, is not).
+                if transport.settle_native_dead_letter(received, reason, description) is True:
+                    self._notify_dead_letter(received.queue, "", "")
+            else:
+                transport.settle_native(received, reason, description)
         except Exception:  # noqa: BLE001 - reported, never kills the loop
             logger.error(
                 "Native settle of a message on queue %r failed; it stays unacknowledged and will "
@@ -735,7 +842,7 @@ class BabelQueue:
             self._ack_settled(received)
             return
         if self.dead_letter_enabled or self.on_unknown_urn == UnknownUrnStrategy.DEAD_LETTER:
-            self._settle_version_gated(received, always=True)
+            self._settle_version_gated(received, always=True, reason="poison")
             return
         if self._retry_tiers_unavailable():
             # broker-bindings §6.5 / ADR-0036 decision 5: no retry tier, no dead-lettering and not
@@ -836,7 +943,10 @@ class BabelQueue:
             exception=BabelQueueError.__name__,
         )["dead_letter"]
         self._write_dead_letter(
-            received, self._dead_letter_target(received), build_poison_record(received.body, block)
+            received,
+            self._dead_letter_target(received),
+            build_poison_record(received.body, block),
+            reason="poison",
         )
 
     def _dead_letter_target(self, received: ReceivedMessage) -> str:
@@ -850,10 +960,15 @@ class BabelQueue:
             return self.transport.dead_letter_queue_name(received.queue, self.dead_letter_suffix)
         return received.queue + (".dlq" if self.dead_letter_suffix is None else self.dead_letter_suffix)
 
-    def _settle_version_gated(self, received: ReceivedMessage, always: bool = False) -> None:
+    def _settle_version_gated(
+        self, received: ReceivedMessage, always: bool = False, reason: str = ""
+    ) -> None:
         """Dead-letter a version-gated delivery directly (no retry). With no DLQ set it is left to the
         transport's native mechanism when the transport has the :class:`~babelqueue.transport.NativeSettler`
         capability (SQS, Azure Service Bus; ADR-0037 decision 1 rule 3) and dropped otherwise.
+
+        ``reason`` is what the dead-letter observer is told (``""`` for a raw version-gated body;
+        ``"poison"`` for a Kafka poison record, whose DLQ record the transport wraps with that reason).
 
         ``always`` writes the DLQ record in every configuration, ignoring ``dead_letter_enabled``.
         A Kafka poison record reaches it with the DLQ already on (:meth:`_route_poison`). The Redis
@@ -866,7 +981,9 @@ class BabelQueue:
         (see :meth:`dispatch`), never retried.
         """
         if always or self.dead_letter_enabled or self.on_unknown_urn == UnknownUrnStrategy.DEAD_LETTER:
-            self._write_dead_letter(received, self._dead_letter_target(received), received.body)
+            self._write_dead_letter(
+                received, self._dead_letter_target(received), received.body, reason=reason
+            )
             return
         # No DLQ to hold it (broker-bindings §5.7 rule 3). A transport with a native mechanism (SQS,
         # Azure Service Bus) leaves it to that mechanism instead of dropping it (ADR-0037 decision 1).
@@ -927,7 +1044,11 @@ class BabelQueue:
             exception=(type(exc).__name__ if exc is not None else None),
         )
         self._write_dead_letter(
-            received, self._dead_letter_target(received), EnvelopeCodec.encode(annotated)
+            received,
+            self._dead_letter_target(received),
+            EnvelopeCodec.encode(annotated),
+            source_queue=original_queue,
+            reason=reason,
         )
 
 

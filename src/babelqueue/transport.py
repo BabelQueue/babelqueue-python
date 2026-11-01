@@ -156,6 +156,30 @@ class SettlePublisher(Protocol):
         ...
 
 
+@runtime_checkable
+class RedrivePublisher(Protocol):
+    """Optional :class:`Transport` capability: the redrive write that stamps out-of-band headers
+    (``bq-replay-bypass``, ADR-0027) *and* keeps what a plain redrive write keeps: the dead-lettered
+    message's routing property (:attr:`ReceivedMessage.route_urn`) and its record key
+    (:attr:`ReceivedMessage.key`). A transport that is a :class:`HeaderPublisher` but not a
+    :class:`RoutedPublisher` / :class:`SettlePublisher` does not need it; one that is both must
+    implement it, or a bypass redrive would lose the route, the key or the broker confirmation
+    that the ordinary redrive write has. Like :class:`SettlePublisher` it must raise when the write
+    is not confirmed, so the caller restores the message to the DLQ instead of acknowledging it."""
+
+    def publish_redriven(
+        self,
+        queue: str,
+        body: str,
+        headers: Dict[str, str],
+        route_urn: str = "",
+        key: Optional[bytes] = None,
+    ) -> None:
+        """Append ``body`` to ``queue`` with out-of-band ``headers``, pinning ``route_urn`` and
+        writing ``key`` unchanged."""
+        ...
+
+
 def publish_keeping_route(
     transport: "Transport",
     queue: str,

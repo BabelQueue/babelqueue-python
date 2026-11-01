@@ -21,6 +21,13 @@ deliveries. (The Java JMS binding reads ``JMSXDeliveryCount`` which is 1-based a
 arriving at the same 0-based ``attempts``.) A message left un-accepted is redelivered
 (at-least-once).
 
+Out-of-band transport headers (a W3C ``traceparent`` for cross-hop span linkage, ADR-0028) ride as
+extra AMQP 1.0 application-properties (string-valued, hyphen-free names) beside the ``bq_*`` projection:
+:meth:`ArtemisTransport.publish_with_headers` writes them (the projection wins a collision) and
+:meth:`~ArtemisTransport.pop` surfaces every non-projection application-property on
+:attr:`~babelqueue.transport.ReceivedMessage.headers`; the ``bq_*`` projection keys are not leaked. The
+body is untouched (GR-1).
+
 This implements §7 of the broker-bindings contract. The envelope is unchanged
 (``schema_version`` stays 1); Apache ActiveMQ Artemis is purely additive.
 
@@ -38,6 +45,7 @@ from typing import Any, Dict, Optional
 from urllib.parse import quote
 
 from .codec import ASCII_WHITESPACE, SCHEMA_VERSION, EnvelopeCodec, parse_envelope
+from .headers import out_of_band_headers
 from .transport import ReceivedMessage, Transport, truncate_declared_version
 
 _logger = logging.getLogger("babelqueue.artemis")
@@ -157,12 +165,14 @@ class ArtemisTransport(Transport):
         except (TypeError, ValueError):  # pragma: no cover - defensive
             return None
 
-    def _message(self, body: str) -> Any:
-        """Build the proton Message projecting the §7 JMS-readable metadata."""
+    def _message(self, body: str, headers: Optional[Dict[str, str]] = None) -> Any:
+        """Build the proton Message projecting the §7 JMS-readable metadata. ``headers`` are
+        out-of-band application-properties (ADR-0028) merged *under* the ``bq_*`` projection."""
         from proton import Message, symbol
 
         message: Any = Message(body=body)
-        props = self._projection(body)
+        props = out_of_band_headers(headers)
+        props.update(self._projection(body))
         if props:
             message.properties = props
         correlation_id = self._correlation_id(body)
@@ -242,6 +252,13 @@ class ArtemisTransport(Transport):
     def publish(self, queue: str, body: str) -> None:
         self._sender(queue).send(self._message(body))
 
+    def publish_with_headers(self, queue: str, body: str, headers: Dict[str, str]) -> None:
+        """:meth:`publish` with out-of-band ``headers`` (a W3C ``traceparent``, the replay-bypass
+        marker ...) carried as extra AMQP 1.0 application-properties beside the ``bq_*`` projection
+        (:class:`~babelqueue.transport.HeaderPublisher`, ADR-0028, broker-bindings 7.2). The
+        projection wins a key collision and the body is byte-identical to :meth:`publish`."""
+        self._sender(queue).send(self._message(body, headers))
+
     def pop(self, queue: str, timeout: float = 1.0) -> Optional[ReceivedMessage]:
         wait = self._receive_timeout_millis / 1000.0
         if timeout and timeout > 0:
@@ -276,7 +293,12 @@ class ArtemisTransport(Transport):
                 route_urn=UNSUPPORTED_SCHEMA_ROUTE_PREFIX + quote(unsupported, safe=""),
             )
         body = self._reconcile(self._payload(message), self._delivery_count(message))
-        return ReceivedMessage(body=body, queue=queue, handle=receiver)
+        return ReceivedMessage(
+            body=body,
+            queue=queue,
+            handle=receiver,
+            headers=out_of_band_headers(getattr(message, "properties", None)),
+        )
 
     def ack(self, message: ReceivedMessage) -> None:
         if message.handle is None:

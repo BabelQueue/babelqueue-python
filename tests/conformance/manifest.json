@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "conformance_version": "1.8.0",
+  "conformance_version": "1.9.0",
   "sections": {
     "cases": {
       "scope": "core"
@@ -97,6 +97,15 @@
     },
     "version_gate_asb": {
       "scope": "asb"
+    },
+    "span-shape": {
+      "scope": "otel"
+    },
+    "trace-id": {
+      "scope": "otel"
+    },
+    "metrics": {
+      "scope": "otel"
     }
   },
   "exceptions": [
@@ -2256,7 +2265,7 @@
     ]
   },
   "traceparent": {
-    "description": "W3C `traceparent` out-of-band propagation (ADR-0028, ADR-0025). Scope: `otel` (ADR-0032 section 2): `otel` is not a broker but the optional W3C `traceparent` extract/inject code of ADR-0028 (in the core of Node and .NET; a separate module for Go, Python, Java and PHP), so only a package that carries it lists `otel` in `bindings` and runs this section. `mode: extract` cases give the delivered header value (`traceparent`, or null when the transport delivered none) and the envelope's `trace_id`; the consumer-side extraction MUST yield `expect`: `source: traceparent` with the header's 32-hex `trace_id_hex`, 16-hex `parent_span_id` and 2-hex `flags`, or `source: trace_id` (the v0.1 fallback, ADR-0025) with `trace_id_hex` = the envelope `trace_id` without hyphens. A malformed header is ignored (it never raises) and behaves exactly like no header. Only the structure `00-<32hex>-<16hex>-<2hex>` is pinned; the finer W3C validity rules (all-zero ids, version ff, upper case) are not part of this section. Pinning the producer side (that the header rides in the transport's own metadata channel beside the envelope, never inside it) needs a real transport and is left to the R1 OTel plan, as are the finer W3C rules.",
+    "description": "W3C `traceparent` out-of-band propagation (ADR-0028, ADR-0025). Scope: `otel` (ADR-0032 section 2): `otel` is not a broker but the optional W3C `traceparent` extract/inject code of ADR-0028 (in the core of Node and .NET; a separate module for Go, Python, Java and PHP), so only a package that carries it lists `otel` in `bindings` and runs this section. `mode: extract` cases give the delivered header value (`traceparent`, or null when the transport delivered none) and the envelope's `trace_id`; the consumer-side extraction MUST yield `expect`: `source: traceparent` with the header's 32-hex `trace_id_hex`, 16-hex `parent_span_id` and 2-hex `flags`, or `source: trace_id` (the v0.1 fallback, ADR-0025) with `trace_id_hex` = the envelope `trace_id` without hyphens. A malformed header is ignored (it never raises) and behaves exactly like no header. The structure `00-<32hex>-<16hex>-<2hex>` is pinned, and so are the finer W3C validity rules: a header is ignored (and behaves like no header) when its version is `ff`, when its trace-id or parent-id is all zero, or when any hex field is upper case (hex is lower case only). Only version `00` is pinned: the treatment of future versions (`01` to `fe`) and of reserved flag bits (for example `0a`, which some propagators reject for version `00`) is not pinned by this section. Pinning the producer side (that the header rides in the transport's own metadata channel beside the envelope, never inside it) needs a real transport and is covered by each SDK's own transport tests (R1 OTel plan, transport phases), not by this section.",
     "cases": [
       {
         "name": "valid-sampled",
@@ -2404,6 +2413,72 @@
           "source": "trace_id",
           "trace_id_hex": "7b3f9c2ae41d4f889b2a1c0d5e6f7a8b"
         }
+      },
+      {
+        "name": "version-ff-ignored",
+        "mode": "extract",
+        "traceparent": "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "expect": {
+          "source": "trace_id",
+          "trace_id_hex": "7b3f9c2ae41d4f889b2a1c0d5e6f7a8b"
+        },
+        "description": "Version `ff` is invalid per W3C Trace Context: the header is ignored and behaves like no header."
+      },
+      {
+        "name": "zero-trace-id-ignored",
+        "mode": "extract",
+        "traceparent": "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "expect": {
+          "source": "trace_id",
+          "trace_id_hex": "7b3f9c2ae41d4f889b2a1c0d5e6f7a8b"
+        },
+        "description": "An all-zero trace-id is invalid per W3C Trace Context: the header is ignored."
+      },
+      {
+        "name": "zero-parent-id-ignored",
+        "mode": "extract",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "expect": {
+          "source": "trace_id",
+          "trace_id_hex": "7b3f9c2ae41d4f889b2a1c0d5e6f7a8b"
+        },
+        "description": "An all-zero parent-id is invalid per W3C Trace Context: the header is ignored."
+      },
+      {
+        "name": "uppercase-trace-id-ignored",
+        "mode": "extract",
+        "traceparent": "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "expect": {
+          "source": "trace_id",
+          "trace_id_hex": "7b3f9c2ae41d4f889b2a1c0d5e6f7a8b"
+        },
+        "description": "W3C Trace Context allows lower-case hex only: an upper-case trace-id makes the header invalid."
+      },
+      {
+        "name": "uppercase-parent-id-ignored",
+        "mode": "extract",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00F067AA0BA902B7-01",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "expect": {
+          "source": "trace_id",
+          "trace_id_hex": "7b3f9c2ae41d4f889b2a1c0d5e6f7a8b"
+        },
+        "description": "An upper-case parent-id makes the header invalid."
+      },
+      {
+        "name": "uppercase-flags-ignored",
+        "mode": "extract",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0A",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "expect": {
+          "source": "trace_id",
+          "trace_id_hex": "7b3f9c2ae41d4f889b2a1c0d5e6f7a8b"
+        },
+        "description": "Upper-case flags make the header invalid."
       }
     ]
   },
@@ -7317,6 +7392,2264 @@
           "outcome": "unsettled",
           "outcome_no_writer": "native"
         }
+      }
+    ]
+  },
+  "span-shape": {
+    "description": "OpenTelemetry span shape (ADR-0038, semantic conventions v1.44.0). Scope: `otel` (ADR-0032 section 2). Every case has `mode: span` and describes one producer span (`operation: send`) or one consumer span (`operation: process`) for one message. Inputs: `operation`; `system` (the `system` option; absent or empty means `babelqueue`); `queue` (send: the queue/topic given to `make`, which becomes `meta.queue` of the produced envelope, and when it is absent `make` writes `default`; process: `meta.queue` of the delivered envelope; empty or blank under the ASCII whitespace set means no destination, and so does an absent `meta.queue` on a delivered envelope); `urn` (the `job`); `consumer_group` (the option, process only); for `process` cases `trace_id`, `message_id` (`meta.id`), `attempts` and `schema_version` (the delivered envelope's `trace_id`, `meta.id`, top-level `attempts` and `meta.schema_version`); `outcome` (`ok`, or `error` for a failing publish or handler); `envelope_built: false` (send only: no envelope is ever handed to the transport, because the build or the encode failed; an envelope counts as built only once it has been handed to the transport). A runner builds the span through the SDK's `otel` wrapper (with an in-memory exporter) and compares. PRODUCER VALUES: a producer does not control `meta.id` (each SDK generates it) and stamps the active trace's id into `trace_id` (ADR-0028, ADR-0038 section 4), so `send` cases carry no `message_id` or `trace_id` input. Their expectations use the placeholders `$produced.meta.id` and `$produced.trace_id` for `messaging.message.id` and `messaging.message.conversation_id`, and, where the case gives no usable queue (absent, empty or blank), `$produced.meta.queue` for `messaging.destination.name` and the span name suffix (when the produced `meta.queue` is empty or blank the attribute is absent and the name is the bare `send`): the runner reads the produced envelope (the envelope handed to the transport, also when that publish fails), substitutes the placeholders and compares the rest literally. The `meta.id` and `trace_id` values MUST be present and equal the produced envelope's. Where a `process` case fixes the delivered envelope, the runner builds the delivered envelope itself and may bypass the decoder for the cases that omit fields the envelope schema requires (an absent or empty `meta.queue`, an absent `meta.id`). `expect.span_name` and `expect.span_kind` are exact; `expect.span_name_one_of` replaces `span_name` where the case does not pin the name. ATTRIBUTES: every key of `expect.attributes` MUST be present with exactly the given value (strings; integers for `babelqueue.schema_version`, `babelqueue.attempts` and `messaging.babelqueue.attempts`). The ADR-0038 section 4 table keys are `messaging.system`, `messaging.operation.type`, `messaging.operation.name`, `messaging.destination.name`, `messaging.message.id`, `messaging.message.conversation_id`, `messaging.consumer.group.name`, `babelqueue.urn`, `babelqueue.schema_version`, `babelqueue.attempts`, `error.type`, and the deprecated transition keys `messaging.operation` and `messaging.babelqueue.attempts`. A table key that `expect.attributes` does not list MUST NOT be on the span, except those in `expect.optional_attributes`, which may be present or absent; when an optional attribute is present it MUST equal the value the case input implies (for `messaging.destination.name` the queue given to the producer) and the span name MUST agree with it. Any `babelqueue.*` key outside the table MUST NOT be on the span. A semconv-defined attribute outside the table (for example `messaging.destination.partition.id`) MAY be present: the suite asserts only the tables (ADR-0038 section 4, last note). The attributes include the deprecated transition keys, which ADR-0038 section 5 dual-emits for one MINOR; the conformance version that follows their removal drops them from every case. `expect.status` is `unset` or `error`. On `error` cases `expect.error_type` is `present`: the span MUST carry a non-empty string `error.type` (its value is a language-specific type name and is not asserted) and `attributes` omits `error.type`; on `ok` cases the span MUST NOT carry `error.type`. The URN is never in the span name. `messaging.system` values outside the ADR-0038 section 3 set are written as given.",
+    "cases": [
+      {
+        "name": "send-default-system",
+        "mode": "span",
+        "operation": "send",
+        "queue": "orders",
+        "urn": "urn:acme:order.created",
+        "outcome": "ok",
+        "expect": {
+          "span_name": "send orders",
+          "span_kind": "PRODUCER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "babelqueue",
+            "messaging.operation.type": "send",
+            "messaging.operation.name": "send",
+            "messaging.destination.name": "orders",
+            "messaging.message.id": "$produced.meta.id",
+            "messaging.message.conversation_id": "$produced.trace_id",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "messaging.operation": "publish"
+          }
+        },
+        "description": "No `system` option: `messaging.system` is `babelqueue` (the deprecated default, ADR-0038 section 5). Span name is `send <queue>`, never the URN."
+      },
+      {
+        "name": "send-system-redis",
+        "mode": "span",
+        "operation": "send",
+        "system": "redis",
+        "queue": "orders",
+        "urn": "urn:acme:order.created",
+        "outcome": "ok",
+        "expect": {
+          "span_name": "send orders",
+          "span_kind": "PRODUCER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "redis",
+            "messaging.operation.type": "send",
+            "messaging.operation.name": "send",
+            "messaging.destination.name": "orders",
+            "messaging.message.id": "$produced.meta.id",
+            "messaging.message.conversation_id": "$produced.trace_id",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "messaging.operation": "publish"
+          }
+        }
+      },
+      {
+        "name": "send-system-rabbitmq",
+        "mode": "span",
+        "operation": "send",
+        "system": "rabbitmq",
+        "queue": "orders",
+        "urn": "urn:acme:order.created",
+        "outcome": "ok",
+        "expect": {
+          "span_name": "send orders",
+          "span_kind": "PRODUCER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "rabbitmq",
+            "messaging.operation.type": "send",
+            "messaging.operation.name": "send",
+            "messaging.destination.name": "orders",
+            "messaging.message.id": "$produced.meta.id",
+            "messaging.message.conversation_id": "$produced.trace_id",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "messaging.operation": "publish"
+          }
+        }
+      },
+      {
+        "name": "send-system-aws_sqs",
+        "mode": "span",
+        "operation": "send",
+        "system": "aws_sqs",
+        "queue": "orders",
+        "urn": "urn:acme:order.created",
+        "outcome": "ok",
+        "expect": {
+          "span_name": "send orders",
+          "span_kind": "PRODUCER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "aws_sqs",
+            "messaging.operation.type": "send",
+            "messaging.operation.name": "send",
+            "messaging.destination.name": "orders",
+            "messaging.message.id": "$produced.meta.id",
+            "messaging.message.conversation_id": "$produced.trace_id",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "messaging.operation": "publish"
+          }
+        }
+      },
+      {
+        "name": "send-system-servicebus",
+        "mode": "span",
+        "operation": "send",
+        "system": "servicebus",
+        "queue": "orders",
+        "urn": "urn:acme:order.created",
+        "outcome": "ok",
+        "expect": {
+          "span_name": "send orders",
+          "span_kind": "PRODUCER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "servicebus",
+            "messaging.operation.type": "send",
+            "messaging.operation.name": "send",
+            "messaging.destination.name": "orders",
+            "messaging.message.id": "$produced.meta.id",
+            "messaging.message.conversation_id": "$produced.trace_id",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "messaging.operation": "publish"
+          }
+        }
+      },
+      {
+        "name": "send-system-pulsar",
+        "mode": "span",
+        "operation": "send",
+        "system": "pulsar",
+        "queue": "orders",
+        "urn": "urn:acme:order.created",
+        "outcome": "ok",
+        "expect": {
+          "span_name": "send orders",
+          "span_kind": "PRODUCER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "pulsar",
+            "messaging.operation.type": "send",
+            "messaging.operation.name": "send",
+            "messaging.destination.name": "orders",
+            "messaging.message.id": "$produced.meta.id",
+            "messaging.message.conversation_id": "$produced.trace_id",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "messaging.operation": "publish"
+          }
+        }
+      },
+      {
+        "name": "send-system-kafka",
+        "mode": "span",
+        "operation": "send",
+        "system": "kafka",
+        "queue": "orders.events",
+        "urn": "urn:acme:order.created",
+        "outcome": "ok",
+        "expect": {
+          "span_name": "send orders.events",
+          "span_kind": "PRODUCER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "kafka",
+            "messaging.operation.type": "send",
+            "messaging.operation.name": "send",
+            "messaging.destination.name": "orders.events",
+            "messaging.message.id": "$produced.meta.id",
+            "messaging.message.conversation_id": "$produced.trace_id",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "messaging.operation": "publish"
+          }
+        }
+      },
+      {
+        "name": "send-system-activemq",
+        "mode": "span",
+        "operation": "send",
+        "system": "activemq",
+        "queue": "orders",
+        "urn": "urn:acme:order.created",
+        "outcome": "ok",
+        "expect": {
+          "span_name": "send orders",
+          "span_kind": "PRODUCER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "activemq",
+            "messaging.operation.type": "send",
+            "messaging.operation.name": "send",
+            "messaging.destination.name": "orders",
+            "messaging.message.id": "$produced.meta.id",
+            "messaging.message.conversation_id": "$produced.trace_id",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "messaging.operation": "publish"
+          }
+        }
+      },
+      {
+        "name": "send-system-custom-not-validated",
+        "mode": "span",
+        "operation": "send",
+        "system": "my-broker",
+        "queue": "orders",
+        "urn": "urn:acme:order.created",
+        "outcome": "ok",
+        "expect": {
+          "span_name": "send orders",
+          "span_kind": "PRODUCER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "my-broker",
+            "messaging.operation.type": "send",
+            "messaging.operation.name": "send",
+            "messaging.destination.name": "orders",
+            "messaging.message.id": "$produced.meta.id",
+            "messaging.message.conversation_id": "$produced.trace_id",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "messaging.operation": "publish"
+          }
+        },
+        "description": "A `system` outside the ADR-0038 section 3 set is written as given: no error, no warning, no normalisation."
+      },
+      {
+        "name": "send-empty-system-counts-as-absent",
+        "mode": "span",
+        "operation": "send",
+        "system": "",
+        "queue": "orders",
+        "urn": "urn:acme:order.created",
+        "outcome": "ok",
+        "expect": {
+          "span_name": "send orders",
+          "span_kind": "PRODUCER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "babelqueue",
+            "messaging.operation.type": "send",
+            "messaging.operation.name": "send",
+            "messaging.destination.name": "orders",
+            "messaging.message.id": "$produced.meta.id",
+            "messaging.message.conversation_id": "$produced.trace_id",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "messaging.operation": "publish"
+          }
+        },
+        "description": "An empty `system` counts as absent (ADR-0038 section 3): `messaging.system` is `babelqueue`."
+      },
+      {
+        "name": "send-empty-queue-follows-produced-meta-queue",
+        "mode": "span",
+        "operation": "send",
+        "queue": "",
+        "urn": "urn:acme:order.created",
+        "outcome": "ok",
+        "expect": {
+          "span_name": "send $produced.meta.queue",
+          "span_kind": "PRODUCER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "babelqueue",
+            "messaging.operation.type": "send",
+            "messaging.operation.name": "send",
+            "messaging.destination.name": "$produced.meta.queue",
+            "messaging.message.id": "$produced.meta.id",
+            "messaging.message.conversation_id": "$produced.trace_id",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "messaging.operation": "publish"
+          }
+        },
+        "description": "An empty queue is given to the producer. What the produced envelope then carries is the SDK's business (Python and Go fall back to the app's default queue, others may keep the empty string), and ADR-0038 section 4 makes the destination `meta.queue` of the produced envelope. So the expectation uses the placeholder `$produced.meta.queue`: if the produced `meta.queue` is empty or blank, `messaging.destination.name` is not written and the span name is the bare `send`; otherwise the attribute equals it and the span name is `send <meta.queue>`. `babelqueue.urn` is always written."
+      },
+      {
+        "name": "send-absent-queue-follows-produced-meta-queue",
+        "mode": "span",
+        "operation": "send",
+        "urn": "urn:acme:order.created",
+        "outcome": "ok",
+        "expect": {
+          "span_name": "send $produced.meta.queue",
+          "span_kind": "PRODUCER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "babelqueue",
+            "messaging.operation.type": "send",
+            "messaging.operation.name": "send",
+            "messaging.destination.name": "$produced.meta.queue",
+            "messaging.message.id": "$produced.meta.id",
+            "messaging.message.conversation_id": "$produced.trace_id",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "messaging.operation": "publish"
+          }
+        },
+        "description": "No queue given to the producer: the envelope carries the SDK's default (`default` from `make`, or the app's configured default queue), and the producer destination equals `meta.queue` of the produced envelope (ADR-0038 section 4). The expectation uses the placeholder `$produced.meta.queue` with the same rule as the empty-queue case."
+      },
+      {
+        "name": "send-failure-after-envelope-built",
+        "mode": "span",
+        "operation": "send",
+        "system": "rabbitmq",
+        "queue": "orders",
+        "urn": "urn:acme:order.created",
+        "outcome": "error",
+        "expect": {
+          "span_name": "send orders",
+          "span_kind": "PRODUCER",
+          "status": "error",
+          "error_type": "present",
+          "attributes": {
+            "messaging.system": "rabbitmq",
+            "messaging.operation.type": "send",
+            "messaging.operation.name": "send",
+            "messaging.destination.name": "orders",
+            "messaging.message.id": "$produced.meta.id",
+            "messaging.message.conversation_id": "$produced.trace_id",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "messaging.operation": "publish"
+          }
+        },
+        "description": "The publish fails after the envelope was handed to the transport (so it exists and the runner can read it): status Error, `error.type` present and non-empty (its value is language-specific and not asserted, ADR-0038 section 6). `error.type` is therefore not in `attributes`; every other attribute is unchanged."
+      },
+      {
+        "name": "send-failure-before-envelope-built",
+        "mode": "span",
+        "operation": "send",
+        "queue": "orders",
+        "urn": "urn:acme:order.created",
+        "envelope_built": false,
+        "outcome": "error",
+        "expect": {
+          "span_name_one_of": [
+            "send",
+            "send orders"
+          ],
+          "span_kind": "PRODUCER",
+          "status": "error",
+          "error_type": "present",
+          "attributes": {
+            "messaging.system": "babelqueue",
+            "messaging.operation.type": "send",
+            "messaging.operation.name": "send",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "messaging.operation": "publish"
+          },
+          "optional_attributes": [
+            "messaging.destination.name"
+          ]
+        },
+        "description": "The build or the encode fails (for example a `data` payload the encoder rejects, which in Go and Python is an encode failure after a successful `make`), so no envelope is handed to the transport and none exists for the span: `messaging.message.id` and `messaging.message.conversation_id` are not written (ADR-0038 section 4: once the envelope exists; an envelope that was built but never handed to the transport does not count). The producer SHOULD resolve the queue before it starts the span but MAY learn it only after the build (ADR-0038 section 4), so the case does not pin the destination: `messaging.destination.name` is optional (`expect.optional_attributes`; when present it MUST equal the queue given to the producer, here `orders`, and then the span name is `send orders`, otherwise the bare `send`) and the span name is either of `expect.span_name_one_of`. The runner makes the envelope build fail by an SDK-specific means (for example a `data` payload the encoder rejects)."
+      },
+      {
+        "name": "process-default-system",
+        "mode": "span",
+        "operation": "process",
+        "queue": "orders",
+        "urn": "urn:acme:order.created",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "message_id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+        "attempts": 0,
+        "schema_version": 1,
+        "outcome": "ok",
+        "expect": {
+          "span_name": "process orders",
+          "span_kind": "CONSUMER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "babelqueue",
+            "messaging.operation.type": "process",
+            "messaging.operation.name": "process",
+            "messaging.destination.name": "orders",
+            "messaging.message.id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+            "messaging.message.conversation_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "babelqueue.attempts": 0,
+            "messaging.operation": "process",
+            "messaging.babelqueue.attempts": 0
+          }
+        },
+        "description": "No `system` option: `messaging.system` is `babelqueue`. Span name is `process <queue>`, never the URN; the URN is `babelqueue.urn`."
+      },
+      {
+        "name": "process-system-redis",
+        "mode": "span",
+        "operation": "process",
+        "system": "redis",
+        "queue": "orders",
+        "urn": "urn:acme:order.created",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "message_id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+        "attempts": 0,
+        "schema_version": 1,
+        "outcome": "ok",
+        "expect": {
+          "span_name": "process orders",
+          "span_kind": "CONSUMER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "redis",
+            "messaging.operation.type": "process",
+            "messaging.operation.name": "process",
+            "messaging.destination.name": "orders",
+            "messaging.message.id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+            "messaging.message.conversation_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "babelqueue.attempts": 0,
+            "messaging.operation": "process",
+            "messaging.babelqueue.attempts": 0
+          }
+        }
+      },
+      {
+        "name": "process-system-rabbitmq",
+        "mode": "span",
+        "operation": "process",
+        "system": "rabbitmq",
+        "queue": "orders",
+        "urn": "urn:acme:order.created",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "message_id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+        "attempts": 0,
+        "schema_version": 1,
+        "outcome": "ok",
+        "expect": {
+          "span_name": "process orders",
+          "span_kind": "CONSUMER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "rabbitmq",
+            "messaging.operation.type": "process",
+            "messaging.operation.name": "process",
+            "messaging.destination.name": "orders",
+            "messaging.message.id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+            "messaging.message.conversation_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "babelqueue.attempts": 0,
+            "messaging.operation": "process",
+            "messaging.babelqueue.attempts": 0
+          }
+        }
+      },
+      {
+        "name": "process-system-aws_sqs",
+        "mode": "span",
+        "operation": "process",
+        "system": "aws_sqs",
+        "queue": "orders",
+        "urn": "urn:acme:order.created",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "message_id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+        "attempts": 0,
+        "schema_version": 1,
+        "outcome": "ok",
+        "expect": {
+          "span_name": "process orders",
+          "span_kind": "CONSUMER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "aws_sqs",
+            "messaging.operation.type": "process",
+            "messaging.operation.name": "process",
+            "messaging.destination.name": "orders",
+            "messaging.message.id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+            "messaging.message.conversation_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "babelqueue.attempts": 0,
+            "messaging.operation": "process",
+            "messaging.babelqueue.attempts": 0
+          }
+        }
+      },
+      {
+        "name": "process-system-servicebus",
+        "mode": "span",
+        "operation": "process",
+        "system": "servicebus",
+        "queue": "orders",
+        "urn": "urn:acme:order.created",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "message_id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+        "attempts": 0,
+        "schema_version": 1,
+        "outcome": "ok",
+        "expect": {
+          "span_name": "process orders",
+          "span_kind": "CONSUMER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "servicebus",
+            "messaging.operation.type": "process",
+            "messaging.operation.name": "process",
+            "messaging.destination.name": "orders",
+            "messaging.message.id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+            "messaging.message.conversation_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "babelqueue.attempts": 0,
+            "messaging.operation": "process",
+            "messaging.babelqueue.attempts": 0
+          }
+        }
+      },
+      {
+        "name": "process-system-pulsar",
+        "mode": "span",
+        "operation": "process",
+        "system": "pulsar",
+        "queue": "orders",
+        "urn": "urn:acme:order.created",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "message_id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+        "attempts": 0,
+        "schema_version": 1,
+        "outcome": "ok",
+        "expect": {
+          "span_name": "process orders",
+          "span_kind": "CONSUMER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "pulsar",
+            "messaging.operation.type": "process",
+            "messaging.operation.name": "process",
+            "messaging.destination.name": "orders",
+            "messaging.message.id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+            "messaging.message.conversation_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "babelqueue.attempts": 0,
+            "messaging.operation": "process",
+            "messaging.babelqueue.attempts": 0
+          }
+        }
+      },
+      {
+        "name": "process-system-kafka",
+        "mode": "span",
+        "operation": "process",
+        "system": "kafka",
+        "queue": "orders.events",
+        "urn": "urn:acme:order.created",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "message_id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+        "attempts": 0,
+        "schema_version": 1,
+        "outcome": "ok",
+        "expect": {
+          "span_name": "process orders.events",
+          "span_kind": "CONSUMER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "kafka",
+            "messaging.operation.type": "process",
+            "messaging.operation.name": "process",
+            "messaging.destination.name": "orders.events",
+            "messaging.message.id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+            "messaging.message.conversation_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "babelqueue.attempts": 0,
+            "messaging.operation": "process",
+            "messaging.babelqueue.attempts": 0
+          }
+        }
+      },
+      {
+        "name": "process-system-activemq",
+        "mode": "span",
+        "operation": "process",
+        "system": "activemq",
+        "queue": "orders",
+        "urn": "urn:acme:order.created",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "message_id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+        "attempts": 0,
+        "schema_version": 1,
+        "outcome": "ok",
+        "expect": {
+          "span_name": "process orders",
+          "span_kind": "CONSUMER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "activemq",
+            "messaging.operation.type": "process",
+            "messaging.operation.name": "process",
+            "messaging.destination.name": "orders",
+            "messaging.message.id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+            "messaging.message.conversation_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "babelqueue.attempts": 0,
+            "messaging.operation": "process",
+            "messaging.babelqueue.attempts": 0
+          }
+        }
+      },
+      {
+        "name": "process-system-custom-not-validated",
+        "mode": "span",
+        "operation": "process",
+        "system": "my-broker",
+        "queue": "orders",
+        "urn": "urn:acme:order.created",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "message_id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+        "attempts": 0,
+        "schema_version": 1,
+        "outcome": "ok",
+        "expect": {
+          "span_name": "process orders",
+          "span_kind": "CONSUMER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "my-broker",
+            "messaging.operation.type": "process",
+            "messaging.operation.name": "process",
+            "messaging.destination.name": "orders",
+            "messaging.message.id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+            "messaging.message.conversation_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "babelqueue.attempts": 0,
+            "messaging.operation": "process",
+            "messaging.babelqueue.attempts": 0
+          }
+        },
+        "description": "A `system` outside the ADR-0038 section 3 set is written as given."
+      },
+      {
+        "name": "process-empty-system-counts-as-absent",
+        "mode": "span",
+        "operation": "process",
+        "system": "",
+        "queue": "orders",
+        "urn": "urn:acme:order.created",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "message_id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+        "attempts": 0,
+        "schema_version": 1,
+        "outcome": "ok",
+        "expect": {
+          "span_name": "process orders",
+          "span_kind": "CONSUMER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "babelqueue",
+            "messaging.operation.type": "process",
+            "messaging.operation.name": "process",
+            "messaging.destination.name": "orders",
+            "messaging.message.id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+            "messaging.message.conversation_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "babelqueue.attempts": 0,
+            "messaging.operation": "process",
+            "messaging.babelqueue.attempts": 0
+          }
+        },
+        "description": "An empty `system` counts as absent (ADR-0038 section 3)."
+      },
+      {
+        "name": "process-kafka-consumer-group",
+        "mode": "span",
+        "operation": "process",
+        "system": "kafka",
+        "queue": "orders.events",
+        "urn": "urn:acme:order.created",
+        "consumer_group": "billing-workers",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "message_id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+        "attempts": 0,
+        "schema_version": 1,
+        "outcome": "ok",
+        "expect": {
+          "span_name": "process orders.events",
+          "span_kind": "CONSUMER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "kafka",
+            "messaging.operation.type": "process",
+            "messaging.operation.name": "process",
+            "messaging.destination.name": "orders.events",
+            "messaging.message.id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+            "messaging.message.conversation_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+            "messaging.consumer.group.name": "billing-workers",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "babelqueue.attempts": 0,
+            "messaging.operation": "process",
+            "messaging.babelqueue.attempts": 0
+          }
+        },
+        "description": "Kafka with the `consumer_group` option: `messaging.consumer.group.name` is written."
+      },
+      {
+        "name": "process-consumer-group-on-non-kafka-system",
+        "mode": "span",
+        "operation": "process",
+        "system": "rabbitmq",
+        "queue": "orders",
+        "urn": "urn:acme:order.created",
+        "consumer_group": "billing-workers",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "message_id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+        "attempts": 0,
+        "schema_version": 1,
+        "outcome": "ok",
+        "expect": {
+          "span_name": "process orders",
+          "span_kind": "CONSUMER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "rabbitmq",
+            "messaging.operation.type": "process",
+            "messaging.operation.name": "process",
+            "messaging.destination.name": "orders",
+            "messaging.message.id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+            "messaging.message.conversation_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+            "messaging.consumer.group.name": "billing-workers",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "babelqueue.attempts": 0,
+            "messaging.operation": "process",
+            "messaging.babelqueue.attempts": 0
+          }
+        },
+        "description": "`consumer_group` is intended for Kafka but is written whenever given (ADR-0038 section 2)."
+      },
+      {
+        "name": "process-no-consumer-group-option",
+        "mode": "span",
+        "operation": "process",
+        "system": "kafka",
+        "queue": "orders.events",
+        "urn": "urn:acme:order.created",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "message_id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+        "attempts": 0,
+        "schema_version": 1,
+        "outcome": "ok",
+        "expect": {
+          "span_name": "process orders.events",
+          "span_kind": "CONSUMER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "kafka",
+            "messaging.operation.type": "process",
+            "messaging.operation.name": "process",
+            "messaging.destination.name": "orders.events",
+            "messaging.message.id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+            "messaging.message.conversation_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "babelqueue.attempts": 0,
+            "messaging.operation": "process",
+            "messaging.babelqueue.attempts": 0
+          }
+        },
+        "description": "Kafka without the `consumer_group` option: `messaging.consumer.group.name` is not written."
+      },
+      {
+        "name": "process-empty-queue",
+        "mode": "span",
+        "operation": "process",
+        "queue": "",
+        "urn": "urn:acme:order.created",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "message_id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+        "attempts": 0,
+        "schema_version": 1,
+        "outcome": "ok",
+        "expect": {
+          "span_name": "process",
+          "span_kind": "CONSUMER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "babelqueue",
+            "messaging.operation.type": "process",
+            "messaging.operation.name": "process",
+            "messaging.message.id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+            "messaging.message.conversation_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "babelqueue.attempts": 0,
+            "messaging.operation": "process",
+            "messaging.babelqueue.attempts": 0
+          }
+        },
+        "description": "`meta.queue` is empty: span name is the bare `process`, `messaging.destination.name` is not written, `babelqueue.urn` is."
+      },
+      {
+        "name": "process-absent-queue",
+        "mode": "span",
+        "operation": "process",
+        "urn": "urn:acme:order.created",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "message_id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+        "attempts": 0,
+        "schema_version": 1,
+        "outcome": "ok",
+        "expect": {
+          "span_name": "process",
+          "span_kind": "CONSUMER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "babelqueue",
+            "messaging.operation.type": "process",
+            "messaging.operation.name": "process",
+            "messaging.message.id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+            "messaging.message.conversation_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "babelqueue.attempts": 0,
+            "messaging.operation": "process",
+            "messaging.babelqueue.attempts": 0
+          }
+        },
+        "description": "`meta.queue` is absent: same as an empty queue."
+      },
+      {
+        "name": "process-blank-queue",
+        "mode": "span",
+        "operation": "process",
+        "queue": "   ",
+        "urn": "urn:acme:order.created",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "message_id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+        "attempts": 0,
+        "schema_version": 1,
+        "outcome": "ok",
+        "expect": {
+          "span_name": "process",
+          "span_kind": "CONSUMER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "babelqueue",
+            "messaging.operation.type": "process",
+            "messaging.operation.name": "process",
+            "messaging.message.id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+            "messaging.message.conversation_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "babelqueue.attempts": 0,
+            "messaging.operation": "process",
+            "messaging.babelqueue.attempts": 0
+          }
+        },
+        "description": "`meta.queue` is blank under the ASCII whitespace set (ADR-0038 section 4: absent or blank): treated as no destination."
+      },
+      {
+        "name": "process-absent-message-id",
+        "mode": "span",
+        "operation": "process",
+        "queue": "orders",
+        "urn": "urn:acme:order.created",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "attempts": 0,
+        "schema_version": 1,
+        "outcome": "ok",
+        "expect": {
+          "span_name": "process orders",
+          "span_kind": "CONSUMER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "babelqueue",
+            "messaging.operation.type": "process",
+            "messaging.operation.name": "process",
+            "messaging.destination.name": "orders",
+            "messaging.message.conversation_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "babelqueue.attempts": 0,
+            "messaging.operation": "process",
+            "messaging.babelqueue.attempts": 0
+          }
+        },
+        "description": "`meta.id` is absent: `messaging.message.id` is not written (ADR-0038 section 4: when present)."
+      },
+      {
+        "name": "process-attempts-zero",
+        "mode": "span",
+        "operation": "process",
+        "queue": "orders",
+        "urn": "urn:acme:order.created",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "message_id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+        "attempts": 0,
+        "schema_version": 1,
+        "outcome": "ok",
+        "expect": {
+          "span_name": "process orders",
+          "span_kind": "CONSUMER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "babelqueue",
+            "messaging.operation.type": "process",
+            "messaging.operation.name": "process",
+            "messaging.destination.name": "orders",
+            "messaging.message.id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+            "messaging.message.conversation_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "babelqueue.attempts": 0,
+            "messaging.operation": "process",
+            "messaging.babelqueue.attempts": 0
+          }
+        },
+        "description": "`attempts` 0: `babelqueue.attempts` and the deprecated `messaging.babelqueue.attempts` are both written, with 0."
+      },
+      {
+        "name": "process-attempts-positive",
+        "mode": "span",
+        "operation": "process",
+        "queue": "orders",
+        "urn": "urn:acme:order.created",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "message_id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+        "attempts": 3,
+        "schema_version": 1,
+        "outcome": "ok",
+        "expect": {
+          "span_name": "process orders",
+          "span_kind": "CONSUMER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "babelqueue",
+            "messaging.operation.type": "process",
+            "messaging.operation.name": "process",
+            "messaging.destination.name": "orders",
+            "messaging.message.id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+            "messaging.message.conversation_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "babelqueue.attempts": 3,
+            "messaging.operation": "process",
+            "messaging.babelqueue.attempts": 3
+          }
+        },
+        "description": "`attempts` 3: both `babelqueue.attempts` and the deprecated `messaging.babelqueue.attempts` are 3."
+      },
+      {
+        "name": "process-non-uuid-trace-id",
+        "mode": "span",
+        "operation": "process",
+        "queue": "orders",
+        "urn": "urn:acme:order.created",
+        "trace_id": "abc",
+        "message_id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+        "attempts": 0,
+        "schema_version": 1,
+        "outcome": "ok",
+        "expect": {
+          "span_name": "process orders",
+          "span_kind": "CONSUMER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "babelqueue",
+            "messaging.operation.type": "process",
+            "messaging.operation.name": "process",
+            "messaging.destination.name": "orders",
+            "messaging.message.id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+            "messaging.message.conversation_id": "abc",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "babelqueue.attempts": 0,
+            "messaging.operation": "process",
+            "messaging.babelqueue.attempts": 0
+          }
+        },
+        "description": "A non-UUID `trace_id` is written to `messaging.message.conversation_id` byte for byte (ADR-0038 section 4 and 7)."
+      },
+      {
+        "name": "process-trace-id-with-inner-spaces",
+        "mode": "span",
+        "operation": "process",
+        "queue": "orders",
+        "urn": "urn:acme:order.created",
+        "trace_id": "order 42 / trace",
+        "message_id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+        "attempts": 0,
+        "schema_version": 1,
+        "outcome": "ok",
+        "expect": {
+          "span_name": "process orders",
+          "span_kind": "CONSUMER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "babelqueue",
+            "messaging.operation.type": "process",
+            "messaging.operation.name": "process",
+            "messaging.destination.name": "orders",
+            "messaging.message.id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+            "messaging.message.conversation_id": "order 42 / trace",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "babelqueue.attempts": 0,
+            "messaging.operation": "process",
+            "messaging.babelqueue.attempts": 0
+          }
+        },
+        "description": "A non-UUID `trace_id` with inner spaces is written byte for byte."
+      },
+      {
+        "name": "process-padded-trace-id",
+        "mode": "span",
+        "operation": "process",
+        "queue": "orders",
+        "urn": "urn:acme:order.created",
+        "trace_id": " 7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\t",
+        "message_id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+        "attempts": 0,
+        "schema_version": 1,
+        "outcome": "ok",
+        "expect": {
+          "span_name": "process orders",
+          "span_kind": "CONSUMER",
+          "status": "unset",
+          "attributes": {
+            "messaging.system": "babelqueue",
+            "messaging.operation.type": "process",
+            "messaging.operation.name": "process",
+            "messaging.destination.name": "orders",
+            "messaging.message.id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+            "messaging.message.conversation_id": " 7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\t",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "babelqueue.attempts": 0,
+            "messaging.operation": "process",
+            "messaging.babelqueue.attempts": 0
+          }
+        },
+        "description": "A `trace_id` with surrounding ASCII whitespace is written byte for byte: no trim on consume (ADR-0032, message-envelope.md section 5.1)."
+      },
+      {
+        "name": "process-handler-failure",
+        "mode": "span",
+        "operation": "process",
+        "system": "kafka",
+        "queue": "orders.events",
+        "urn": "urn:acme:order.created",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "message_id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+        "attempts": 2,
+        "schema_version": 1,
+        "outcome": "error",
+        "expect": {
+          "span_name": "process orders.events",
+          "span_kind": "CONSUMER",
+          "status": "error",
+          "error_type": "present",
+          "attributes": {
+            "messaging.system": "kafka",
+            "messaging.operation.type": "process",
+            "messaging.operation.name": "process",
+            "messaging.destination.name": "orders.events",
+            "messaging.message.id": "0b6f3e1c-5d2a-4c7e-9a41-8f3d2b6c1e90",
+            "messaging.message.conversation_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+            "babelqueue.urn": "urn:acme:order.created",
+            "babelqueue.schema_version": 1,
+            "babelqueue.attempts": 2,
+            "messaging.operation": "process",
+            "messaging.babelqueue.attempts": 2
+          }
+        },
+        "description": "The handler fails: status Error, `error.type` present and non-empty (value not asserted, ADR-0038 section 6), error recorded, error returned to the caller unchanged. Every other attribute is as on success."
+      }
+    ]
+  },
+  "trace-id": {
+    "description": "Non-UUID `trace_id` rule and the OpenTelemetry TraceID mapping (ADR-0038 section 7, message-envelope.md sections 5.1 and 7 rule 2, ADR-0025, ADR-0032 section 5). Scope: `otel` (ADR-0032 section 2). Every case has a `mode`. `map`: the OTel mapping of `trace_id` MUST give `expect.trace_id_hex` (32 lower-case hex digits) through `expect.mapping`: `decode` (the value is 32 hex digits once the hyphens are removed and is not all zero: the bytes of the UUID, no hashing) or `hash` (SHA-256 of the value's UTF-8 bytes, first 16 bytes). The edge cases are pinned to the Go reference `otel.TraceIDOf`: hyphens are optional, hex is case-insensitive, the all-zero value is hashed because it is not a valid TraceID, and there is no trim, so a value with a leading or trailing ASCII space is hashed over its raw bytes. `decode`: decoding an envelope that carries `trace_id` succeeds and the decoded `trace_id` equals `expect.trace_id` byte for byte (no rejection, no regeneration). `reemit`: decode, increment `attempts`, re-encode: the written `trace_id` equals `expect.trace_id` byte for byte; re-emit never trims. `downstream`: a consumer handling an envelope produces a downstream message with `make(urn, trace_id)` given the inbound value: the produced `trace_id` equals `expect.trace_id` and `make` does not raise (no value here has ASCII padding, so the ADR-0032 trim is a no-op). `make`: the producer's `make` with a caller-supplied `trace_id` (and `urn`) produces an envelope whose `trace_id` equals `expect.trace_id`, the ADR-0032 trimmed value, never rejected and never regenerated; `expect.trace_id_hex` is the OTel mapping of that stored value. The warning the mapping SHOULD log when it hashes a value (message-envelope.md section 5.1) is not asserted.",
+    "cases": [
+      {
+        "name": "uuid-lowercase-hyphenated",
+        "mode": "map",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "expect": {
+          "trace_id_hex": "7b3f9c2ae41d4f889b2a1c0d5e6f7a8b",
+          "mapping": "decode"
+        },
+        "description": "A UUID decodes to its 16 bytes: `trace_id_hex` is the value without hyphens."
+      },
+      {
+        "name": "uuid-lowercase-hyphenated-other",
+        "mode": "map",
+        "trace_id": "4bf92f35-77b3-4da6-a3ce-929d0e0e4736",
+        "expect": {
+          "trace_id_hex": "4bf92f3577b34da6a3ce929d0e0e4736",
+          "mapping": "decode"
+        }
+      },
+      {
+        "name": "uuid-without-hyphens",
+        "mode": "map",
+        "trace_id": "7b3f9c2ae41d4f889b2a1c0d5e6f7a8b",
+        "expect": {
+          "trace_id_hex": "7b3f9c2ae41d4f889b2a1c0d5e6f7a8b",
+          "mapping": "decode"
+        },
+        "description": "32 hex digits without hyphens decode as a UUID and are not hashed (Go reference `TraceIDOf`)."
+      },
+      {
+        "name": "uuid-uppercase-hyphenated",
+        "mode": "map",
+        "trace_id": "7B3F9C2A-E41D-4F88-9B2A-1C0D5E6F7A8B",
+        "expect": {
+          "trace_id_hex": "7b3f9c2ae41d4f889b2a1c0d5e6f7a8b",
+          "mapping": "decode"
+        },
+        "description": "Upper-case hex decodes (not hashed); `trace_id_hex` is the lower-case form of the bytes."
+      },
+      {
+        "name": "uuid-uppercase-without-hyphens",
+        "mode": "map",
+        "trace_id": "7B3F9C2AE41D4F889B2A1C0D5E6F7A8B",
+        "expect": {
+          "trace_id_hex": "7b3f9c2ae41d4f889b2a1c0d5e6f7a8b",
+          "mapping": "decode"
+        }
+      },
+      {
+        "name": "uuid-mixed-case",
+        "mode": "map",
+        "trace_id": "7b3F9c2A-e41D-4f88-9B2a-1c0D5e6F7a8B",
+        "expect": {
+          "trace_id_hex": "7b3f9c2ae41d4f889b2a1c0d5e6f7a8b",
+          "mapping": "decode"
+        }
+      },
+      {
+        "name": "all-zero-uuid-is-hashed",
+        "mode": "map",
+        "trace_id": "00000000-0000-0000-0000-000000000000",
+        "expect": {
+          "trace_id_hex": "12b9377cbe7e5c94e8a70d9d23929523",
+          "mapping": "hash"
+        },
+        "description": "The all-zero UUID is not a valid TraceID, so it is hashed (SHA-256 of the UTF-8 bytes, first 16 bytes)."
+      },
+      {
+        "name": "all-zero-without-hyphens-is-hashed",
+        "mode": "map",
+        "trace_id": "00000000000000000000000000000000",
+        "expect": {
+          "trace_id_hex": "84e0c0eafaa95a34c293f278ac52e45c",
+          "mapping": "hash"
+        }
+      },
+      {
+        "name": "non-uuid-short",
+        "mode": "map",
+        "trace_id": "abc",
+        "expect": {
+          "trace_id_hex": "ba7816bf8f01cfea414140de5dae2223",
+          "mapping": "hash"
+        },
+        "description": "A value that is not a UUID is hashed: SHA-256 of the UTF-8 bytes, first 16 bytes (ADR-0025, ADR-0038 section 7)."
+      },
+      {
+        "name": "non-uuid-dashed-word",
+        "mode": "map",
+        "trace_id": "not-a-uuid",
+        "expect": {
+          "trace_id_hex": "2184a32a3bae6ad756d745ec8678ad6a",
+          "mapping": "hash"
+        }
+      },
+      {
+        "name": "non-uuid-inner-spaces",
+        "mode": "map",
+        "trace_id": "order 42 trace",
+        "expect": {
+          "trace_id_hex": "d31787beda85c54d582034d147738486",
+          "mapping": "hash"
+        }
+      },
+      {
+        "name": "non-uuid-with-slash-and-colon",
+        "mode": "map",
+        "trace_id": "req/2026-10-31:abc",
+        "expect": {
+          "trace_id_hex": "23ca4f77c10633c877479239a3510ccf",
+          "mapping": "hash"
+        }
+      },
+      {
+        "name": "non-uuid-non-ascii",
+        "mode": "map",
+        "trace_id": "izleme-\u65e5\u672c\u8a9e-\u00df",
+        "expect": {
+          "trace_id_hex": "a9ff8aedaf39e2ed7fbe36ddeee77627",
+          "mapping": "hash"
+        },
+        "description": "Hashed over the UTF-8 bytes of the value."
+      },
+      {
+        "name": "non-uuid-32-chars-not-hex",
+        "mode": "map",
+        "trace_id": "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz",
+        "expect": {
+          "trace_id_hex": "a9ca111109de4c6a0d65d6b25588f771",
+          "mapping": "hash"
+        }
+      },
+      {
+        "name": "non-uuid-31-hex-digits",
+        "mode": "map",
+        "trace_id": "7b3f9c2ae41d4f889b2a1c0d5e6f7a8",
+        "expect": {
+          "trace_id_hex": "fe89ad340d456da74a71a468e51bdda6",
+          "mapping": "hash"
+        }
+      },
+      {
+        "name": "non-uuid-33-hex-digits",
+        "mode": "map",
+        "trace_id": "7b3f9c2ae41d4f889b2a1c0d5e6f7a8b0",
+        "expect": {
+          "trace_id_hex": "4e80c1ce29e48dbb79ba44854128afc9",
+          "mapping": "hash"
+        }
+      },
+      {
+        "name": "non-uuid-urn-uuid-prefix",
+        "mode": "map",
+        "trace_id": "urn:uuid:7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "expect": {
+          "trace_id_hex": "71553c8bc2cb2685b813e18d0bd074fa",
+          "mapping": "hash"
+        }
+      },
+      {
+        "name": "uuid-with-leading-space-is-hashed",
+        "mode": "map",
+        "trace_id": " 7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",
+        "expect": {
+          "trace_id_hex": "a0c7cfbf156086cc3ca3aee6a2fc5e51",
+          "mapping": "hash"
+        },
+        "description": "No trim before the mapping: a leading ASCII space makes the value non-UUID, so the raw value (space included) is hashed."
+      },
+      {
+        "name": "uuid-with-trailing-space-is-hashed",
+        "mode": "map",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b ",
+        "expect": {
+          "trace_id_hex": "d93dfd3c387a0dbccaee2e95d0639b6d",
+          "mapping": "hash"
+        },
+        "description": "No trim before the mapping: a trailing ASCII space makes the value non-UUID, so the raw value is hashed."
+      },
+      {
+        "name": "uuid-with-tab-and-newline-is-hashed",
+        "mode": "map",
+        "trace_id": "\t7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\n",
+        "expect": {
+          "trace_id_hex": "d9cf62d0e40c6639ee7131da53b3a920",
+          "mapping": "hash"
+        }
+      },
+      {
+        "name": "uuid-with-trailing-newline-is-hashed",
+        "mode": "map",
+        "trace_id": "7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\n",
+        "expect": {
+          "trace_id_hex": "4e72d2e2f40df8529256d33c375dfe8c",
+          "mapping": "hash"
+        },
+        "description": "A trailing newline alone makes the value non-UUID: it is hashed over the raw bytes, newline included. An implementation whose end-anchor matches before a final newline (PCRE `$`, Python `re.match` with `$`) would wrongly decode it."
+      },
+      {
+        "name": "uuid-without-hyphens-with-trailing-newline-is-hashed",
+        "mode": "map",
+        "trace_id": "7b3f9c2ae41d4f889b2a1c0d5e6f7a8b\n",
+        "expect": {
+          "trace_id_hex": "2092f9b3cbf4e482796b67febc62c85e",
+          "mapping": "hash"
+        }
+      },
+      {
+        "name": "decode-preserves-1",
+        "mode": "decode",
+        "trace_id": "abc",
+        "expect": {
+          "decoded": true,
+          "trace_id": "abc"
+        },
+        "description": "Decoding an envelope whose `trace_id` is not a UUID succeeds and leaves the value byte for byte; it is neither rejected nor regenerated (message-envelope.md section 5.1)."
+      },
+      {
+        "name": "decode-preserves-2",
+        "mode": "decode",
+        "trace_id": "order 42 trace",
+        "expect": {
+          "decoded": true,
+          "trace_id": "order 42 trace"
+        },
+        "description": "Same rule."
+      },
+      {
+        "name": "decode-preserves-3",
+        "mode": "decode",
+        "trace_id": "req/2026-10-31:abc",
+        "expect": {
+          "decoded": true,
+          "trace_id": "req/2026-10-31:abc"
+        },
+        "description": "Same rule."
+      },
+      {
+        "name": "decode-preserves-4",
+        "mode": "decode",
+        "trace_id": "izleme-\u65e5\u672c\u8a9e-\u00df",
+        "expect": {
+          "decoded": true,
+          "trace_id": "izleme-\u65e5\u672c\u8a9e-\u00df"
+        },
+        "description": "Same rule."
+      },
+      {
+        "name": "decode-preserves-5",
+        "mode": "decode",
+        "trace_id": " abc\t",
+        "expect": {
+          "decoded": true,
+          "trace_id": " abc\t"
+        },
+        "description": "Re-emit never trims: surrounding ASCII whitespace is kept byte for byte (ADR-0032 section 5)."
+      },
+      {
+        "name": "decode-preserves-6",
+        "mode": "decode",
+        "trace_id": " 7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\t",
+        "expect": {
+          "decoded": true,
+          "trace_id": " 7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\t"
+        },
+        "description": "Same rule."
+      },
+      {
+        "name": "reemit-preserves-1",
+        "mode": "reemit",
+        "trace_id": "abc",
+        "expect": {
+          "trace_id": "abc"
+        },
+        "description": "Re-emit of the decoded envelope (retry, DLQ, redrive, relay) writes the same `trace_id`, byte for byte."
+      },
+      {
+        "name": "reemit-preserves-2",
+        "mode": "reemit",
+        "trace_id": "order 42 trace",
+        "expect": {
+          "trace_id": "order 42 trace"
+        },
+        "description": "Same rule."
+      },
+      {
+        "name": "reemit-preserves-3",
+        "mode": "reemit",
+        "trace_id": "req/2026-10-31:abc",
+        "expect": {
+          "trace_id": "req/2026-10-31:abc"
+        },
+        "description": "Same rule."
+      },
+      {
+        "name": "reemit-preserves-4",
+        "mode": "reemit",
+        "trace_id": "izleme-\u65e5\u672c\u8a9e-\u00df",
+        "expect": {
+          "trace_id": "izleme-\u65e5\u672c\u8a9e-\u00df"
+        },
+        "description": "Same rule."
+      },
+      {
+        "name": "reemit-preserves-5",
+        "mode": "reemit",
+        "trace_id": " abc\t",
+        "expect": {
+          "trace_id": " abc\t"
+        },
+        "description": "Re-emit never trims: surrounding ASCII whitespace is kept byte for byte (ADR-0032 section 5)."
+      },
+      {
+        "name": "reemit-preserves-6",
+        "mode": "reemit",
+        "trace_id": " 7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\t",
+        "expect": {
+          "trace_id": " 7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b\t"
+        },
+        "description": "Same rule."
+      },
+      {
+        "name": "downstream-copies-1",
+        "mode": "downstream",
+        "trace_id": "abc",
+        "expect": {
+          "trace_id": "abc"
+        },
+        "description": "A handler produces a downstream message with the inbound `trace_id` (`make` given that value): the produced envelope carries it unchanged and `make` does not reject it (message-envelope.md section 5.1). Only values with no ASCII padding are used, so the ADR-0032 trim is a no-op here."
+      },
+      {
+        "name": "downstream-copies-2",
+        "mode": "downstream",
+        "trace_id": "order 42 trace",
+        "expect": {
+          "trace_id": "order 42 trace"
+        },
+        "description": "Same rule."
+      },
+      {
+        "name": "downstream-copies-3",
+        "mode": "downstream",
+        "trace_id": "req/2026-10-31:abc",
+        "expect": {
+          "trace_id": "req/2026-10-31:abc"
+        },
+        "description": "Same rule."
+      },
+      {
+        "name": "downstream-copies-4",
+        "mode": "downstream",
+        "trace_id": "izleme-\u65e5\u672c\u8a9e-\u00df",
+        "expect": {
+          "trace_id": "izleme-\u65e5\u672c\u8a9e-\u00df"
+        },
+        "description": "Same rule."
+      },
+      {
+        "name": "make-keeps-non-uuid-trace-id",
+        "mode": "make",
+        "urn": "urn:acme:a",
+        "trace_id": "abc",
+        "expect": {
+          "trace_id": "abc",
+          "trace_id_hex": "ba7816bf8f01cfea414140de5dae2223"
+        },
+        "description": "`make` with a caller-supplied non-UUID `trace_id`: the envelope carries it (only the ADR-0032 ASCII trim applies); no rejection, no regenerated UUID."
+      },
+      {
+        "name": "make-keeps-non-uuid-with-inner-spaces",
+        "mode": "make",
+        "urn": "urn:acme:a",
+        "trace_id": "order  42  trace",
+        "expect": {
+          "trace_id": "order  42  trace",
+          "trace_id_hex": "62e4e86cf9f3cd31fa7beabd74380fae"
+        },
+        "description": "Inner whitespace is part of the value; only the ends are trimmed."
+      },
+      {
+        "name": "make-trims-ascii-padding-of-non-uuid",
+        "mode": "make",
+        "urn": "urn:acme:a",
+        "trace_id": " \torder 42 trace\n",
+        "expect": {
+          "trace_id": "order 42 trace",
+          "trace_id_hex": "d31787beda85c54d582034d147738486"
+        },
+        "description": "ASCII padding is trimmed by `make` (ADR-0032 section 5) and nothing else changes; the stored value is the trimmed one."
+      },
+      {
+        "name": "make-keeps-unicode-space-padding-of-non-uuid",
+        "mode": "make",
+        "urn": "urn:acme:a",
+        "trace_id": "\u00a0abc\u00a0",
+        "expect": {
+          "trace_id": "\u00a0abc\u00a0",
+          "trace_id_hex": "fb3da941d20933c9f0bc0dece6a173d5"
+        },
+        "description": "U+00A0 is not ASCII whitespace (ADR-0032 section 5): it stays in the value."
+      },
+      {
+        "name": "make-keeps-all-zero-uuid",
+        "mode": "make",
+        "urn": "urn:acme:a",
+        "trace_id": "00000000-0000-0000-0000-000000000000",
+        "expect": {
+          "trace_id": "00000000-0000-0000-0000-000000000000",
+          "trace_id_hex": "12b9377cbe7e5c94e8a70d9d23929523"
+        },
+        "description": "The all-zero UUID is a non-UUID for the OTel mapping, but `make` still carries it as given: only the mapping hashes it."
+      }
+    ]
+  },
+  "metrics": {
+    "description": "Standard metric set and the dead-letter observer (ADR-0039, semantic conventions v1.44.0). Scope: `otel` (ADR-0032 section 2). Every case has a `mode`. `instrument`: the metric `expect.metric` MUST exist with `expect.instrument` (`histogram` | `counter`), `expect.unit` and exactly this attribute key set: `attributes.always`, `attributes.when_destination_known` (written only when the destination is known: present and not blank) and `attributes.on_failure` (written only when the operation failed); `operation_name` is the value of `messaging.operation.name`; none of `forbidden_attributes` may appear (cardinality limit, ADR-0039 section 2). `advisory_bucket_boundaries` (the histogram's advice) is a SHOULD, applied where the platform API supports advice, and is not asserted otherwise. `publish`, `consume` and `dead_letter`: the scenario drives the SDK's producer wrapper, consumer wrapper or dead-letter observer (in the `otel` module) with a meter backed by an in-memory reader, then the metric data points recorded MUST equal `expect.records` as a multiset and nothing else may be recorded. A `records` entry has `metric`, `kind` (`add`: a counter increment of `value`; `record`: one histogram observation, `value` `non_negative_seconds` meaning a finite value >= 0 that is not otherwise asserted), the exact `attributes` map (string values), and `error_type: present` when the data point MUST also carry a non-empty string `error.type` (its value is language-specific and not asserted; `attributes` omits it). Inputs: `system` (the `system` option; absent or empty means `babelqueue`), `queue` (consume: `meta.queue`, where absent, empty or blank means no destination; publish: the queue given to the producer, where an absent, empty or blank queue is resolved by the SDK and the destination is `$produced.meta.queue`, the produced envelope's `meta.queue`, written only when it is not empty or blank), `attempts` (consume: top-level `attempts`), `outcome` (`ok` | `error`; for `publish` an error is a failure of the transport after the envelope was handed to it, for `consume` an error returned or raised by the wrapped handler), `meter: false` (no meter supplied, nothing is recorded). The `dead_letter` cases are defined at the level of the observer event `{queue, dead_letter_queue, reason}` so a runner needs no broker: `trigger` says what the SDK did, `observer_called` says whether the core invokes the dead-letter observer with `event` (true) or not at all (false, `records` empty). The rule (ADR-0039 section 5.1, owner decision 2026-10-31): a successful write to the BabelQueue DLQ counts (+1), and so does a successful SDK-initiated native dead-letter (+1, same attribute set, no native/BabelQueue distinction, `dead_letter_queue` empty); a failed write, a failed native call, a native no-op (SQS), a broker-autonomous dead-letter and a disabled DLQ count 0. The SDKs' own tests (ADR-0039 sections 5.2-5.3) drive their transports to the trigger; conformance pins the observer-level contract. A case with `observer_called: false` also has `sdk_test_required: true`: it states a rule a runner cannot test at observer level (no event is delivered, so nothing is recorded, whatever the SDK does), so the runner reports it `pass` trivially and the rule is only enforced by the SDK's own transport or core test, which MUST assert that the observer is not called for that trigger.",
+    "cases": [
+      {
+        "name": "instrument-messaging-process-duration",
+        "mode": "instrument",
+        "when": "once per handler invocation: the handler's wall time in seconds, success or failure",
+        "expect": {
+          "metric": "messaging.process.duration",
+          "instrument": "histogram",
+          "unit": "s",
+          "recorded_by": "consumer wrapper",
+          "operation_name": "process",
+          "attributes": {
+            "always": [
+              "messaging.system",
+              "messaging.operation.name"
+            ],
+            "when_destination_known": [
+              "messaging.destination.name"
+            ],
+            "on_failure": [
+              "error.type"
+            ]
+          },
+          "forbidden_attributes": [
+            "babelqueue.urn",
+            "messaging.message.id",
+            "messaging.message.conversation_id",
+            "babelqueue.attempts",
+            "babelqueue.schema_version",
+            "messaging.consumer.group.name",
+            "dead_letter.reason",
+            "trace_id"
+          ],
+          "advisory_bucket_boundaries": [
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.075,
+            0.1,
+            0.25,
+            0.5,
+            0.75,
+            1,
+            2.5,
+            5,
+            7.5,
+            10
+          ]
+        }
+      },
+      {
+        "name": "instrument-messaging-client-sent-messages",
+        "mode": "instrument",
+        "when": "+1 per publish attempt, success or failure",
+        "expect": {
+          "metric": "messaging.client.sent.messages",
+          "instrument": "counter",
+          "unit": "{message}",
+          "recorded_by": "producer wrapper",
+          "operation_name": "send",
+          "attributes": {
+            "always": [
+              "messaging.system",
+              "messaging.operation.name"
+            ],
+            "when_destination_known": [
+              "messaging.destination.name"
+            ],
+            "on_failure": [
+              "error.type"
+            ]
+          },
+          "forbidden_attributes": [
+            "babelqueue.urn",
+            "messaging.message.id",
+            "messaging.message.conversation_id",
+            "babelqueue.attempts",
+            "babelqueue.schema_version",
+            "messaging.consumer.group.name",
+            "dead_letter.reason",
+            "trace_id"
+          ]
+        }
+      },
+      {
+        "name": "instrument-messaging-client-consumed-messages",
+        "mode": "instrument",
+        "when": "+1 per delivery that enters the wrapper (no `error.type`: the delivery was received)",
+        "expect": {
+          "metric": "messaging.client.consumed.messages",
+          "instrument": "counter",
+          "unit": "{message}",
+          "recorded_by": "consumer wrapper",
+          "operation_name": "process",
+          "attributes": {
+            "always": [
+              "messaging.system",
+              "messaging.operation.name"
+            ],
+            "when_destination_known": [
+              "messaging.destination.name"
+            ]
+          },
+          "forbidden_attributes": [
+            "babelqueue.urn",
+            "messaging.message.id",
+            "messaging.message.conversation_id",
+            "babelqueue.attempts",
+            "babelqueue.schema_version",
+            "messaging.consumer.group.name",
+            "dead_letter.reason",
+            "trace_id"
+          ]
+        }
+      },
+      {
+        "name": "instrument-babelqueue-retries",
+        "mode": "instrument",
+        "when": "+1 per delivery that enters the wrapper with top-level `attempts` > 0",
+        "expect": {
+          "metric": "babelqueue.retries",
+          "instrument": "counter",
+          "unit": "{message}",
+          "recorded_by": "consumer wrapper",
+          "operation_name": "process",
+          "attributes": {
+            "always": [
+              "messaging.system",
+              "messaging.operation.name"
+            ],
+            "when_destination_known": [
+              "messaging.destination.name"
+            ]
+          },
+          "forbidden_attributes": [
+            "babelqueue.urn",
+            "messaging.message.id",
+            "messaging.message.conversation_id",
+            "babelqueue.attempts",
+            "babelqueue.schema_version",
+            "messaging.consumer.group.name",
+            "dead_letter.reason",
+            "trace_id"
+          ]
+        }
+      },
+      {
+        "name": "instrument-babelqueue-dlq-messages",
+        "mode": "instrument",
+        "when": "+1 per dead-letter the SDK itself completed (ADR-0039 section 5.1); `messaging.destination.name` is the source queue",
+        "expect": {
+          "metric": "babelqueue.dlq.messages",
+          "instrument": "counter",
+          "unit": "{message}",
+          "recorded_by": "dead-letter observer",
+          "operation_name": "process",
+          "attributes": {
+            "always": [
+              "messaging.system",
+              "messaging.operation.name"
+            ],
+            "when_destination_known": [
+              "messaging.destination.name"
+            ]
+          },
+          "forbidden_attributes": [
+            "babelqueue.urn",
+            "messaging.message.id",
+            "messaging.message.conversation_id",
+            "babelqueue.attempts",
+            "babelqueue.schema_version",
+            "messaging.consumer.group.name",
+            "dead_letter.reason",
+            "trace_id"
+          ]
+        }
+      },
+      {
+        "name": "consume-one-success",
+        "mode": "consume",
+        "system": "kafka",
+        "queue": "orders.events",
+        "attempts": 0,
+        "outcome": "ok",
+        "expect": {
+          "records": [
+            {
+              "metric": "messaging.client.consumed.messages",
+              "kind": "add",
+              "value": 1,
+              "attributes": {
+                "messaging.system": "kafka",
+                "messaging.operation.name": "process",
+                "messaging.destination.name": "orders.events"
+              }
+            },
+            {
+              "metric": "messaging.process.duration",
+              "kind": "record",
+              "value": "non_negative_seconds",
+              "attributes": {
+                "messaging.system": "kafka",
+                "messaging.operation.name": "process",
+                "messaging.destination.name": "orders.events"
+              }
+            }
+          ]
+        },
+        "description": "One successful consume (attempts 0): `consumed.messages` +1 and one `process.duration` record without `error.type`; no `retries` record. The attribute maps are exact: no URN, id, trace id, attempts, schema version or reason."
+      },
+      {
+        "name": "consume-failure-with-attempts-2",
+        "mode": "consume",
+        "system": "kafka",
+        "queue": "orders.events",
+        "attempts": 2,
+        "outcome": "error",
+        "expect": {
+          "records": [
+            {
+              "metric": "messaging.client.consumed.messages",
+              "kind": "add",
+              "value": 1,
+              "attributes": {
+                "messaging.system": "kafka",
+                "messaging.operation.name": "process",
+                "messaging.destination.name": "orders.events"
+              }
+            },
+            {
+              "metric": "babelqueue.retries",
+              "kind": "add",
+              "value": 1,
+              "attributes": {
+                "messaging.system": "kafka",
+                "messaging.operation.name": "process",
+                "messaging.destination.name": "orders.events"
+              }
+            },
+            {
+              "metric": "messaging.process.duration",
+              "kind": "record",
+              "value": "non_negative_seconds",
+              "attributes": {
+                "messaging.system": "kafka",
+                "messaging.operation.name": "process",
+                "messaging.destination.name": "orders.events"
+              },
+              "error_type": "present"
+            }
+          ]
+        },
+        "description": "One consume whose handler fails (the wrapped handler returns or raises an error; the same definition as the `span-shape` case `process-handler-failure`) with `attempts` 2: `consumed.messages` +1 (no `error.type`: the delivery was received), `retries` +1, and one `process.duration` record carrying `error.type` (present, non-empty; value not asserted). The wrapper's result is unchanged."
+      },
+      {
+        "name": "consume-attempts-1-counts-as-retry",
+        "mode": "consume",
+        "queue": "orders",
+        "attempts": 1,
+        "outcome": "ok",
+        "expect": {
+          "records": [
+            {
+              "metric": "messaging.client.consumed.messages",
+              "kind": "add",
+              "value": 1,
+              "attributes": {
+                "messaging.system": "babelqueue",
+                "messaging.operation.name": "process",
+                "messaging.destination.name": "orders"
+              }
+            },
+            {
+              "metric": "babelqueue.retries",
+              "kind": "add",
+              "value": 1,
+              "attributes": {
+                "messaging.system": "babelqueue",
+                "messaging.operation.name": "process",
+                "messaging.destination.name": "orders"
+              }
+            },
+            {
+              "metric": "messaging.process.duration",
+              "kind": "record",
+              "value": "non_negative_seconds",
+              "attributes": {
+                "messaging.system": "babelqueue",
+                "messaging.operation.name": "process",
+                "messaging.destination.name": "orders"
+              }
+            }
+          ]
+        },
+        "description": "The `retries` threshold is `attempts` > 0: attempts 1 counts."
+      },
+      {
+        "name": "consume-default-system",
+        "mode": "consume",
+        "queue": "orders",
+        "attempts": 0,
+        "outcome": "ok",
+        "expect": {
+          "records": [
+            {
+              "metric": "messaging.client.consumed.messages",
+              "kind": "add",
+              "value": 1,
+              "attributes": {
+                "messaging.system": "babelqueue",
+                "messaging.operation.name": "process",
+                "messaging.destination.name": "orders"
+              }
+            },
+            {
+              "metric": "messaging.process.duration",
+              "kind": "record",
+              "value": "non_negative_seconds",
+              "attributes": {
+                "messaging.system": "babelqueue",
+                "messaging.operation.name": "process",
+                "messaging.destination.name": "orders"
+              }
+            }
+          ]
+        },
+        "description": "No `system` option: `messaging.system` is `babelqueue` on every metric."
+      },
+      {
+        "name": "consume-no-destination-empty-queue",
+        "mode": "consume",
+        "queue": "",
+        "attempts": 0,
+        "outcome": "ok",
+        "expect": {
+          "records": [
+            {
+              "metric": "messaging.client.consumed.messages",
+              "kind": "add",
+              "value": 1,
+              "attributes": {
+                "messaging.system": "babelqueue",
+                "messaging.operation.name": "process"
+              }
+            },
+            {
+              "metric": "messaging.process.duration",
+              "kind": "record",
+              "value": "non_negative_seconds",
+              "attributes": {
+                "messaging.system": "babelqueue",
+                "messaging.operation.name": "process"
+              }
+            }
+          ]
+        },
+        "description": "`meta.queue` empty: `messaging.destination.name` is not a metric attribute."
+      },
+      {
+        "name": "consume-no-destination-absent-queue",
+        "mode": "consume",
+        "attempts": 0,
+        "outcome": "ok",
+        "expect": {
+          "records": [
+            {
+              "metric": "messaging.client.consumed.messages",
+              "kind": "add",
+              "value": 1,
+              "attributes": {
+                "messaging.system": "babelqueue",
+                "messaging.operation.name": "process"
+              }
+            },
+            {
+              "metric": "messaging.process.duration",
+              "kind": "record",
+              "value": "non_negative_seconds",
+              "attributes": {
+                "messaging.system": "babelqueue",
+                "messaging.operation.name": "process"
+              }
+            }
+          ]
+        },
+        "description": "`meta.queue` absent: same."
+      },
+      {
+        "name": "consume-without-meter-records-nothing",
+        "mode": "consume",
+        "system": "kafka",
+        "queue": "orders.events",
+        "attempts": 0,
+        "outcome": "ok",
+        "meter": false,
+        "expect": {
+          "records": []
+        },
+        "description": "No meter supplied (ADR-0039 section 3): the wrapper records nothing. On .NET the instruments exist but no listener is subscribed, so nothing is collected."
+      },
+      {
+        "name": "publish-one-success",
+        "mode": "publish",
+        "system": "kafka",
+        "queue": "orders.events",
+        "outcome": "ok",
+        "expect": {
+          "records": [
+            {
+              "metric": "messaging.client.sent.messages",
+              "kind": "add",
+              "value": 1,
+              "attributes": {
+                "messaging.system": "kafka",
+                "messaging.operation.name": "send",
+                "messaging.destination.name": "orders.events"
+              }
+            }
+          ]
+        },
+        "description": "One successful publish: `sent.messages` +1 with `messaging.operation.name = send`, no `error.type`."
+      },
+      {
+        "name": "publish-failure",
+        "mode": "publish",
+        "system": "rabbitmq",
+        "queue": "orders",
+        "outcome": "error",
+        "expect": {
+          "records": [
+            {
+              "metric": "messaging.client.sent.messages",
+              "kind": "add",
+              "value": 1,
+              "attributes": {
+                "messaging.system": "rabbitmq",
+                "messaging.operation.name": "send",
+                "messaging.destination.name": "orders"
+              },
+              "error_type": "present"
+            }
+          ]
+        },
+        "description": "The publish fails after the envelope was handed to the transport (the transport rejects or fails the publish; the same definition as the `span-shape` case `send-failure-after-envelope-built`): `sent.messages` +1 (an attempt) carrying `error.type` (present, non-empty). The publish result is unchanged. A failure before the envelope reaches the transport (build or encode) is not pinned by this section."
+      },
+      {
+        "name": "publish-default-system",
+        "mode": "publish",
+        "queue": "orders",
+        "outcome": "ok",
+        "expect": {
+          "records": [
+            {
+              "metric": "messaging.client.sent.messages",
+              "kind": "add",
+              "value": 1,
+              "attributes": {
+                "messaging.system": "babelqueue",
+                "messaging.operation.name": "send",
+                "messaging.destination.name": "orders"
+              }
+            }
+          ]
+        },
+        "description": "No `system` option: `messaging.system` is `babelqueue`."
+      },
+      {
+        "name": "publish-empty-queue-follows-produced-meta-queue",
+        "mode": "publish",
+        "queue": "",
+        "outcome": "ok",
+        "expect": {
+          "records": [
+            {
+              "metric": "messaging.client.sent.messages",
+              "kind": "add",
+              "value": 1,
+              "attributes": {
+                "messaging.system": "babelqueue",
+                "messaging.operation.name": "send",
+                "messaging.destination.name": "$produced.meta.queue"
+              }
+            }
+          ]
+        },
+        "description": "An empty queue is given to the producer. The destination is `meta.queue` of the produced envelope, which the SDK decides (Python and Go fall back to the app's default queue): the expectation uses the placeholder `$produced.meta.queue`; when the produced `meta.queue` is empty or blank `messaging.destination.name` is not written."
+      },
+      {
+        "name": "publish-without-meter-records-nothing",
+        "mode": "publish",
+        "system": "kafka",
+        "queue": "orders.events",
+        "outcome": "ok",
+        "meter": false,
+        "expect": {
+          "records": []
+        }
+      },
+      {
+        "name": "dlq-write-ok-retries-exhausted",
+        "mode": "dead_letter",
+        "trigger": "bq_dlq_write_ok",
+        "system": "redis",
+        "observer_called": true,
+        "event": {
+          "queue": "orders",
+          "dead_letter_queue": "orders.dlq",
+          "reason": "failed"
+        },
+        "expect": {
+          "observer_called": true,
+          "records": [
+            {
+              "metric": "babelqueue.dlq.messages",
+              "kind": "add",
+              "value": 1,
+              "attributes": {
+                "messaging.system": "redis",
+                "messaging.operation.name": "process",
+                "messaging.destination.name": "orders"
+              }
+            }
+          ]
+        },
+        "description": "A successful write to the BabelQueue DLQ after the retries are exhausted: the observer is called once and `babelqueue.dlq.messages` +1 with `messaging.operation.name = process` and the source queue. The reason is not a metric attribute."
+      },
+      {
+        "name": "dlq-write-ok-unknown-urn",
+        "mode": "dead_letter",
+        "trigger": "bq_dlq_write_ok",
+        "system": "redis",
+        "observer_called": true,
+        "event": {
+          "queue": "orders",
+          "dead_letter_queue": "orders.dlq",
+          "reason": "unknown_urn"
+        },
+        "expect": {
+          "observer_called": true,
+          "records": [
+            {
+              "metric": "babelqueue.dlq.messages",
+              "kind": "add",
+              "value": 1,
+              "attributes": {
+                "messaging.system": "redis",
+                "messaging.operation.name": "process",
+                "messaging.destination.name": "orders"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "dlq-write-ok-poison",
+        "mode": "dead_letter",
+        "trigger": "bq_dlq_write_ok",
+        "system": "kafka",
+        "observer_called": true,
+        "event": {
+          "queue": "orders.events",
+          "dead_letter_queue": "orders.events.dlq",
+          "reason": "poison"
+        },
+        "expect": {
+          "observer_called": true,
+          "records": [
+            {
+              "metric": "babelqueue.dlq.messages",
+              "kind": "add",
+              "value": 1,
+              "attributes": {
+                "messaging.system": "kafka",
+                "messaging.operation.name": "process",
+                "messaging.destination.name": "orders.events"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "dlq-write-ok-version-gate-raw-body",
+        "mode": "dead_letter",
+        "trigger": "bq_dlq_write_ok",
+        "system": "aws_sqs",
+        "observer_called": true,
+        "event": {
+          "queue": "orders",
+          "dead_letter_queue": "orders-dlq",
+          "reason": ""
+        },
+        "expect": {
+          "observer_called": true,
+          "records": [
+            {
+              "metric": "babelqueue.dlq.messages",
+              "kind": "add",
+              "value": 1,
+              "attributes": {
+                "messaging.system": "aws_sqs",
+                "messaging.operation.name": "process",
+                "messaging.destination.name": "orders"
+              }
+            }
+          ]
+        },
+        "description": "A raw version-gated body written to the DLQ (ADR-0037 decision 1) has no `dead_letter` block, so the event's `reason` is empty. Counted."
+      },
+      {
+        "name": "dlq-native-dead-letter-ok",
+        "mode": "dead_letter",
+        "trigger": "native_dead_letter_ok",
+        "system": "servicebus",
+        "observer_called": true,
+        "event": {
+          "queue": "orders",
+          "dead_letter_queue": "",
+          "reason": ""
+        },
+        "expect": {
+          "observer_called": true,
+          "records": [
+            {
+              "metric": "babelqueue.dlq.messages",
+              "kind": "add",
+              "value": 1,
+              "attributes": {
+                "messaging.system": "servicebus",
+                "messaging.operation.name": "process",
+                "messaging.destination.name": "orders"
+              }
+            }
+          ]
+        },
+        "description": "An SDK-initiated native dead-letter that the broker confirmed (Azure Service Bus `DeadLetterMessage`): the observer is called with an empty `dead_letter_queue` and `babelqueue.dlq.messages` +1. The attribute set is the same as for a BabelQueue DLQ write: there is no native/BabelQueue split (ADR-0039 section 5.1, owner decision 2026-10-31)."
+      },
+      {
+        "name": "dlq-default-system",
+        "mode": "dead_letter",
+        "trigger": "bq_dlq_write_ok",
+        "observer_called": true,
+        "event": {
+          "queue": "orders",
+          "dead_letter_queue": "orders.dlq",
+          "reason": "failed"
+        },
+        "expect": {
+          "observer_called": true,
+          "records": [
+            {
+              "metric": "babelqueue.dlq.messages",
+              "kind": "add",
+              "value": 1,
+              "attributes": {
+                "messaging.system": "babelqueue",
+                "messaging.operation.name": "process",
+                "messaging.destination.name": "orders"
+              }
+            }
+          ]
+        },
+        "description": "No `system` option on the observer: `messaging.system` is `babelqueue`."
+      },
+      {
+        "name": "dlq-no-source-queue",
+        "mode": "dead_letter",
+        "trigger": "bq_dlq_write_ok",
+        "system": "redis",
+        "observer_called": true,
+        "event": {
+          "queue": "",
+          "dead_letter_queue": "orders.dlq",
+          "reason": "failed"
+        },
+        "expect": {
+          "observer_called": true,
+          "records": [
+            {
+              "metric": "babelqueue.dlq.messages",
+              "kind": "add",
+              "value": 1,
+              "attributes": {
+                "messaging.system": "redis",
+                "messaging.operation.name": "process"
+              }
+            }
+          ]
+        },
+        "description": "No source queue known: `messaging.destination.name` is not written."
+      },
+      {
+        "name": "dlq-write-failed",
+        "mode": "dead_letter",
+        "trigger": "bq_dlq_write_failed",
+        "system": "redis",
+        "observer_called": false,
+        "sdk_test_required": true,
+        "expect": {
+          "observer_called": false,
+          "records": []
+        },
+        "description": "The DLQ write failed: the message stays unsettled and the observer is NOT called; the counter stays unchanged."
+      },
+      {
+        "name": "dlq-native-call-failed",
+        "mode": "dead_letter",
+        "trigger": "native_dead_letter_failed",
+        "system": "servicebus",
+        "observer_called": false,
+        "sdk_test_required": true,
+        "expect": {
+          "observer_called": false,
+          "records": []
+        },
+        "description": "The native dead-letter call failed (or the receiver lacks the call and the SDK fell back to abandon): the observer is NOT called."
+      },
+      {
+        "name": "dlq-native-noop-sqs",
+        "mode": "dead_letter",
+        "trigger": "native_noop",
+        "system": "aws_sqs",
+        "observer_called": false,
+        "sdk_test_required": true,
+        "expect": {
+          "observer_called": false,
+          "records": []
+        },
+        "description": "The SQS native settle is a no-op that leaves the message to `RedrivePolicy`; it is not a dead-letter by the SDK, so the observer is NOT called."
+      },
+      {
+        "name": "dlq-broker-own-dead-letter",
+        "mode": "dead_letter",
+        "trigger": "broker_autonomous",
+        "system": "servicebus",
+        "observer_called": false,
+        "sdk_test_required": true,
+        "expect": {
+          "observer_called": false,
+          "records": []
+        },
+        "description": "The broker dead-letters on its own (SQS `RedrivePolicy` after `maxReceiveCount`, Azure Service Bus `MaxDeliveryCount`, Pulsar or Artemis broker-side policy): the SDK did nothing, so the observer is NOT called."
+      },
+      {
+        "name": "dlq-writing-disabled-message-dropped",
+        "mode": "dead_letter",
+        "trigger": "dlq_disabled_dropped",
+        "system": "redis",
+        "observer_called": false,
+        "sdk_test_required": true,
+        "expect": {
+          "observer_called": false,
+          "records": []
+        },
+        "description": "DLQ writing is disabled and the message is dropped or acknowledged instead: the observer is NOT called."
       }
     ]
   }

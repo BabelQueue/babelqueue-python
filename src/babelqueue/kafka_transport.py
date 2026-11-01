@@ -46,6 +46,13 @@ ignored there). A :class:`~babelqueue.kafka_retry.RetryReinjector` (the re-injec
 each parked record back to its work topic once the tier delay has elapsed. With no tiers
 configured both operations raise :class:`BabelQueueError` and nothing is produced.
 
+Out-of-band transport headers (a W3C ``traceparent`` for cross-hop span linkage, ADR-0028) ride as
+extra record headers (UTF-8 values) beside the ``bq-*`` projection: :meth:`KafkaTransport.publish_with_headers`
+writes them (the projection wins a collision), :meth:`~KafkaTransport.pop` surfaces every non-projection
+header on :attr:`~babelqueue.transport.ReceivedMessage.headers` (the ``bq-*`` projection keys are not
+leaked), and a retry parks the consumed record's ``traceparent`` / ``tracestate`` on the tier topic, from
+where the re-inject consumer keeps them. The record value is untouched (GR-1).
+
 This implements §6 of the broker-bindings contract. The envelope is unchanged
 (``schema_version`` stays 1); Apache Kafka is purely additive.
 
@@ -67,6 +74,7 @@ from .codec import ASCII_WHITESPACE, SCHEMA_VERSION, EnvelopeCodec, parse_envelo
 from ._envelope_shape import envelope_violation
 from ._poison_record import build_poison_record
 from .exceptions import BabelQueueError
+from .headers import TRACE_CONTEXT_HEADER_KEYS, out_of_band_headers
 from .transport import (
     PoisonRoute,
     ReceivedMessage,
@@ -422,8 +430,51 @@ class KafkaTransport(Transport):
         producer.produce(queue, **kwargs)
         producer.poll(0)
 
+    def publish_with_headers(self, queue: str, body: str, headers: Dict[str, str]) -> None:
+        """:meth:`publish` with out-of-band ``headers`` (a W3C ``traceparent``, the replay-bypass
+        marker ...) written as extra record headers (UTF-8 values) beside the ``bq-*`` projection
+        (:class:`~babelqueue.transport.HeaderPublisher`, ADR-0028, broker-bindings 6.3). The
+        projection wins a key collision, and the record value is byte-identical to the one
+        :meth:`publish` writes."""
+        producer = self._producer_()
+        kwargs = self._record_kwargs(body)
+        kwargs["headers"] = self._with_extra_headers(kwargs["headers"], headers)
+        producer.produce(queue, **kwargs)
+        producer.poll(0)
+
+    @staticmethod
+    def _with_extra_headers(projected: Headers, extra: Optional[Dict[str, str]]) -> Headers:
+        """``projected`` followed by the out-of-band ``extra`` headers. A key the projection (or
+        the retry bookkeeping) already owns is never taken from ``extra``."""
+        merged: Headers = list(projected)
+        taken = {name for name, _ in merged}
+        for name, value in out_of_band_headers(extra).items():
+            if name not in taken:
+                merged.append((name, value.encode("utf-8")))
+        return merged
+
+    def publish_redriven(
+        self,
+        queue: str,
+        body: str,
+        headers: Dict[str, str],
+        route_urn: str = "",
+        key: Optional[bytes] = None,
+    ) -> None:
+        """:class:`~babelqueue.transport.RedrivePublisher`: the ``redrive(bypass=True)`` write. It is
+        :meth:`publish_settle` plus the out-of-band ``headers`` (the ``bq-replay-bypass`` marker): the
+        broker must confirm it (a delivery error or timeout raises :class:`KafkaDeliveryError`, so
+        ``redrive`` restores the DLQ record instead of committing past it) and the DLQ record's
+        ``key`` is written back unchanged."""
+        self.publish_settle(queue, body, route_urn, key, headers=headers)
+
     def publish_settle(
-        self, queue: str, body: str, route_urn: str = "", key: Optional[bytes] = None
+        self,
+        queue: str,
+        body: str,
+        route_urn: str = "",
+        key: Optional[bytes] = None,
+        headers: Optional[Dict[str, str]] = None,
     ) -> None:
         """:class:`~babelqueue.transport.SettlePublisher`: the runtime's settle write (retry
         republish, envelope / poison / gate DLQ, ``redrive`` restore). Unlike :meth:`publish` it
@@ -439,6 +490,8 @@ class KafkaTransport(Transport):
                 body, route_urn.cause, route_urn.original_queue, route_urn.attempts
             )
         kwargs = self._record_kwargs(body, raw_ok=True)
+        if headers:
+            kwargs["headers"] = self._with_extra_headers(kwargs["headers"], headers)
         if key is not None:
             kwargs["key"] = key
         self._produce_confirmed(self._producer_(), queue, kwargs)
@@ -559,6 +612,13 @@ class KafkaTransport(Transport):
         next_attempts = attempts_before + 1
         topic, kwargs = self._tier_record(
             message.queue, self._with_attempts(body, next_attempts), n, tier_ms, next_attempts
+        )
+        # The W3C trace context of the consumed record rides on to the retry topic (and, kept by
+        # the re-inject consumer, back to the work topic) so the retried handler still joins the
+        # original trace (broker-bindings 6.3 / 6.4).
+        kwargs["headers"] = self._with_extra_headers(
+            kwargs["headers"],
+            {k: v for k, v in message.headers.items() if k in TRACE_CONTEXT_HEADER_KEYS},
         )
         if message.key is not None:
             kwargs["key"] = message.key
@@ -716,7 +776,13 @@ class KafkaTransport(Transport):
             )
             self._pending.setdefault(queue, []).append(message)
             return received
-        received = ReceivedMessage(body=body, queue=queue, handle=message, key=self._key(message))
+        received = ReceivedMessage(
+            body=body,
+            queue=queue,
+            handle=message,
+            key=self._key(message),
+            headers=out_of_band_headers(headers),
+        )
         # Track the record as in flight only once ``pop`` has built it. Any decode error above is
         # routed as poison instead of escaping: an escape would leave the record uncommitted, so the
         # next ``pop`` would seek back to it and fail identically, wedging the partition forever.
