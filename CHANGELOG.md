@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.25.0] - 2026-11-01
+
 ### Changed (dashboard-breaking) — `babelqueue.otel` follows the OpenTelemetry messaging semantic conventions v1.44.0 (ADR-0038)
 - **Span names change with no overlap:** `publish <urn>` becomes `send <queue>` and
   `process <urn>` becomes `process <queue>` (the bare `send` / `process` when there is no queue).
