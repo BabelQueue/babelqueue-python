@@ -23,6 +23,10 @@ v1.10.0 (section `payload_schema_keywords`). Only the optional `data` validation
   unchanged (the keyword is evaluated as absent). Annotation keywords (`$schema`, `$id`, `title`, `description`,
   `examples`, `default`, `$comment`, `x-*`) never warn. `unsupported_keywords(schema)` is the pure helper.
 
+### Fixed
+- A non-finite `minLength` / `maxLength` (`NaN`, `±Infinity`; reachable through `json.loads`, which accepts them) is
+  ignored instead of raising `ValueError` / `OverflowError` out of `validate_schema`. Matches the other SDKs.
+
 ### Changed
 - **`const` / `enum` compare numbers by mathematical value**, recursively inside arrays and objects: `1`, `1.0` and
   `Decimal("1")` are equal, while `True` is never `1` and `"1"` is never `1`. Before, `const: 1` rejected `1.0`.

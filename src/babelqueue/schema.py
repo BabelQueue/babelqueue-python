@@ -39,6 +39,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import math
 import os
 import threading
 from decimal import Decimal
@@ -235,11 +236,11 @@ def _check_type(schema: Mapping[str, Any], typ: str, value: Any, path: str) -> O
     if typ == "string":
         if not isinstance(value, str):
             return _violation(path, "not_a_string")
-        min_len = schema.get("minLength")
-        if isinstance(min_len, (int, float, Decimal)) and not isinstance(min_len, bool) and len(value) < int(min_len):
+        min_len = _length_bound(schema.get("minLength"))
+        if min_len is not None and len(value) < min_len:
             return _violation(path, "below_min_length")
-        max_len = schema.get("maxLength")
-        if isinstance(max_len, (int, float, Decimal)) and not isinstance(max_len, bool) and len(value) > int(max_len):
+        max_len = _length_bound(schema.get("maxLength"))
+        if max_len is not None and len(value) > max_len:
             return _violation(path, "above_max_length")
         return None
     if typ == "integer":
@@ -296,6 +297,21 @@ def _check_array(schema: Mapping[str, Any], value: Any, path: str) -> Optional[s
         if violation is not None:
             return violation
     return None
+
+
+def _length_bound(bound: Any) -> Optional[int]:
+    """``minLength`` / ``maxLength`` as an int, truncated toward zero like Go and PHP.
+
+    A non-numeric, boolean or non-finite (NaN / +-Infinity) bound is ignored (``None``), as in the
+    other SDKs; ``int()`` would raise ``ValueError`` / ``OverflowError`` on those.
+    """
+    if isinstance(bound, bool) or not isinstance(bound, (int, float, Decimal)):
+        return None
+    if isinstance(bound, float) and not math.isfinite(bound):
+        return None
+    if isinstance(bound, Decimal) and not bound.is_finite():
+        return None
+    return int(bound)
 
 
 def _check_minimum(schema: Mapping[str, Any], value: Any, path: str) -> Optional[str]:
