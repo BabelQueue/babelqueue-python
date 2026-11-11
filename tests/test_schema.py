@@ -113,6 +113,14 @@ class UnionTypeTest(unittest.TestCase):
         self.assertIsNone(validate_schema({"type": "string", "maxLength": 2.9}, "ab"))
         self.assertIsNotNone(validate_schema({"type": "string", "maxLength": 2.9}, "abc"))
 
+    def test_non_finite_length_bounds_are_ignored(self) -> None:
+        # A NaN / Infinity bound (reachable through json.loads) never raises and never changes a verdict.
+        for keyword in ("minLength", "maxLength"):
+            for bound in (float("nan"), float("inf"), float("-inf"), Decimal("NaN"), Decimal("Infinity")):
+                schema = {"type": "string", keyword: bound}
+                for text in ("", "a", "abc"):
+                    self.assertIsNone(validate_schema(schema, text), (keyword, bound, text))
+
     def test_provider_warnings_are_read_only_copies(self) -> None:
         with self.assertLogs("babelqueue.schema", level=logging.WARNING):
             provider = MapProvider({"urn:a": {"type": "object", "minProperties": 1}})
