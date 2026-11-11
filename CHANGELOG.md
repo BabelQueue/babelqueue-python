@@ -9,6 +9,25 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+Brings the opt-in payload validator (ADR-0024) to the K-17 Draft-07 subset behaviour pinned by conformance
+v1.10.0 (section `payload_schema_keywords`). Only the optional `data` validation changes; the envelope stays at
+`schema_version: 1` and nothing on the wire changes.
+
+### Added
+- `type` may be a **union list** (`["string", "null"]`): a value is valid when it matches any listed type, and the
+  keywords of the matched type then apply. `integer` accepts every integral number (`1.0`, `Decimal("2")`).
+- `maxLength` (Unicode code points, like `minLength`).
+- **Registration warnings for unsupported keywords.** `MapProvider` / `DirProvider` report one `SchemaWarning(pointer,
+  keyword)` per keyword outside the subset (`pattern`, `format`, `allOf`, `$ref`, `maximum`, ...) when the schema is
+  first processed: logged on the `babelqueue.schema` logger and kept in the provider's `warnings` map. The verdict is
+  unchanged (the keyword is evaluated as absent). Annotation keywords (`$schema`, `$id`, `title`, `description`,
+  `examples`, `default`, `$comment`, `x-*`) never warn. `unsupported_keywords(schema)` is the pure helper.
+
+### Changed
+- **`const` / `enum` compare numbers by mathematical value**, recursively inside arrays and objects: `1`, `1.0` and
+  `Decimal("1")` are equal, while `True` is never `1` and `"1"` is never `1`. Before, `const: 1` rejected `1.0`.
+- Vendored conformance suite updated to v1.10.0.
+
 ## [1.25.0] - 2026-11-01
 
 ### Changed (dashboard-breaking) — `babelqueue.otel` follows the OpenTelemetry messaging semantic conventions v1.44.0 (ADR-0038)

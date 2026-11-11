@@ -89,6 +89,7 @@ _RUNNERS: Dict[str, List[Tuple[str, str, str]]] = {
     "extension_write": [("test_behaviour_conformance", "ExtensionWriteConformanceTest", "test_extension_write_cases")],
     "encode_reject": [("test_behaviour_conformance", "EncodeRejectConformanceTest", "test_encode_reject_cases")],
     "payload_schema_unicode": [("test_behaviour_conformance", "PayloadSchemaUnicodeConformanceTest", "test_unicode_length_cases")],
+    "payload_schema_keywords": [("test_schema_conformance", "PayloadKeywordsConformanceTest", "test_payload_keywords_cases")],
     "trim": [("test_behaviour_conformance", "TrimConformanceTest", "test_trim_cases")],
     "job_type": [("test_behaviour_conformance", "JobTypeConformanceTest", "test_job_type_cases")],
     "traceparent": [("test_behaviour_conformance", "TraceparentConformanceTest", "test_traceparent_cases")],

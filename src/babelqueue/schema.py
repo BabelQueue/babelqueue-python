@@ -24,22 +24,31 @@ It is opt-in: a URN with no registered schema is never validated.
   handler unchanged.
 
 The validator is a small subset of JSON Schema (draft-07) whose verdicts match the Go and
-PHP validators and babelqueue-registry's ``compat`` linter: ``type``, ``required``,
-``properties``, ``additionalProperties``, ``items``, ``enum``, ``const``, ``minLength``,
-``minimum``. Unknown keywords are ignored. Zero dependencies (stdlib only).
+PHP validators and babelqueue-registry's ``compat`` linter: ``type`` (a name or a union list
+such as ``["string", "null"]``), ``required``, ``properties``, ``additionalProperties``,
+``items``, ``enum``, ``const``, ``minLength``, ``maxLength``, ``minimum``. ``const`` / ``enum``
+compare numbers by mathematical value (``1 == 1.0``; ``True`` is never ``1``), also inside arrays
+and objects. A keyword outside the subset never changes the verdict (it is evaluated as absent),
+but registering the schema with a :class:`MapProvider` / :class:`DirProvider` reports one
+:class:`SchemaWarning` per occurrence through the ``babelqueue.schema`` logger and the provider's
+``warnings`` map (conformance ``payload_schema_keywords``). Zero dependencies (stdlib only).
 """
 
 from __future__ import annotations
 
 import functools
 import json
+import logging
 import os
 import threading
-from typing import Any, Callable, List, Mapping, NamedTuple, Optional, Protocol, runtime_checkable
+from decimal import Decimal
+from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Protocol, runtime_checkable
 
 from .exceptions import InvalidPayloadError
 
 Handler = Callable[..., None]
+
+logger = logging.getLogger("babelqueue.schema")
 
 
 @runtime_checkable
@@ -55,6 +64,17 @@ class MapProvider:
 
     def __init__(self, schemas: Mapping[str, Mapping[str, Any]]) -> None:
         self._schemas: dict[str, Mapping[str, Any]] = dict(schemas)
+        self._warnings: Dict[str, List["SchemaWarning"]] = {}
+        for urn, schema in self._schemas.items():
+            found = report_unsupported(urn, schema)
+            if found:
+                self._warnings[urn] = found
+
+    @property
+    def warnings(self) -> Dict[str, List["SchemaWarning"]]:
+        """urn -> the unsupported-keyword warnings its schema produced at registration (only URNs
+        that produced at least one). Read-only: a copy; each was also logged on ``babelqueue.schema``."""
+        return {urn: list(found) for urn, found in self._warnings.items()}
 
     @classmethod
     def from_json(cls, raw: Mapping[str, str]) -> "MapProvider":
@@ -88,6 +108,7 @@ class DirProvider:
         self._files: dict[str, str] = {}
         self._cache: dict[str, Mapping[str, Any]] = {}
         self._lock = threading.Lock()
+        self._warnings: Dict[str, List["SchemaWarning"]] = {}
 
         entries = manifest.get("schemas") or []
         if isinstance(entries, list):
@@ -98,6 +119,13 @@ class DirProvider:
                 file = entry.get("schema")
                 if isinstance(urn, str) and urn and isinstance(file, str) and file:
                     self._files[urn] = file
+
+    @property
+    def warnings(self) -> Dict[str, List["SchemaWarning"]]:
+        """urn -> the unsupported-keyword warnings reported when its schema was first loaded.
+        Read-only: a copy."""
+        with self._lock:
+            return {urn: list(found) for urn, found in self._warnings.items()}
 
     def schema_for(self, urn: str) -> Optional[Mapping[str, Any]]:
         with self._lock:
@@ -113,6 +141,9 @@ class DirProvider:
             if not isinstance(decoded, dict):
                 raise ValueError(f"schema: invalid schema for {urn!r} ({file})")
             self._cache[urn] = decoded
+            found = report_unsupported(urn, decoded)
+            if found:
+                self._warnings[urn] = found
             return decoded
 
 
@@ -151,6 +182,9 @@ def wrap(provider: SchemaProvider, urn: str, handler: Handler) -> Handler:
     return wrapped
 
 
+_KNOWN_TYPES = ("object", "array", "string", "integer", "number", "boolean", "null")
+
+
 def validate_schema(schema: Mapping[str, Any], value: Any, path: str = "") -> Optional[str]:
     """The first violation of ``value`` against a (subset) JSON Schema node, or None."""
     if "const" in schema and not _equal(value, schema["const"]):
@@ -161,6 +195,39 @@ def validate_schema(schema: Mapping[str, Any], value: Any, path: str = "") -> Op
         return _violation(path, "not_in_enum")
 
     typ = schema.get("type")
+    if isinstance(typ, str):
+        return _check_type(schema, typ, value, path)
+    if isinstance(typ, list):
+        # Union (Draft-07): valid when the value matches ANY listed type, and then the keywords of
+        # the matched type apply. Names outside the known types can never match; a list with no
+        # known name constrains nothing, like an unknown single ``type``.
+        names = [t for t in typ if isinstance(t, str) and t in _KNOWN_TYPES]
+        if not names:
+            return None
+        for name in names:
+            if _matches_type(name, value):
+                return _check_type(schema, name, value, path)
+        return _violation(path, "wrong_type")
+    return None
+
+
+def _matches_type(typ: str, value: Any) -> bool:
+    if typ == "object":
+        return isinstance(value, Mapping)
+    if typ == "array":
+        return isinstance(value, list)
+    if typ == "string":
+        return isinstance(value, str)
+    if typ == "integer":
+        return _is_integer(value)
+    if typ == "number":
+        return _is_number(value)
+    if typ == "boolean":
+        return isinstance(value, bool)
+    return value is None  # "null"
+
+
+def _check_type(schema: Mapping[str, Any], typ: str, value: Any, path: str) -> Optional[str]:
     if typ == "object":
         return _check_object(schema, value, path)
     if typ == "array":
@@ -169,8 +236,11 @@ def validate_schema(schema: Mapping[str, Any], value: Any, path: str = "") -> Op
         if not isinstance(value, str):
             return _violation(path, "not_a_string")
         min_len = schema.get("minLength")
-        if isinstance(min_len, (int, float)) and len(value) < int(min_len):
+        if isinstance(min_len, (int, float, Decimal)) and not isinstance(min_len, bool) and len(value) < int(min_len):
             return _violation(path, "below_min_length")
+        max_len = schema.get("maxLength")
+        if isinstance(max_len, (int, float, Decimal)) and not isinstance(max_len, bool) and len(value) > int(max_len):
+            return _violation(path, "above_max_length")
         return None
     if typ == "integer":
         if not _is_integer(value):
@@ -230,27 +300,46 @@ def _check_array(schema: Mapping[str, Any], value: Any, path: str) -> Optional[s
 
 def _check_minimum(schema: Mapping[str, Any], value: Any, path: str) -> Optional[str]:
     minimum = schema.get("minimum")
-    if isinstance(minimum, (int, float)) and not isinstance(minimum, bool) and float(value) < float(minimum):
+    if isinstance(minimum, (int, float, Decimal)) and not isinstance(minimum, bool) and value < minimum:
         return _violation(path, "below_minimum")
     return None
 
 
 def _is_integer(value: Any) -> bool:
+    """``integer`` accepts every number whose mathematical value is integral (``1.0`` too)."""
     if isinstance(value, bool):
         return False
     if isinstance(value, int):
         return True
-    return isinstance(value, float) and value.is_integer()
+    if isinstance(value, float):
+        return value.is_integer()
+    if isinstance(value, Decimal):
+        return value.is_finite() and value == value.to_integral_value()
+    return False
 
 
 def _is_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    # int / float / Decimal (what a ``parse_float=Decimal`` decoder yields); never a bool.
+    return isinstance(value, (int, float, Decimal)) and not isinstance(value, bool)
 
 
 def _equal(a: Any, b: Any) -> bool:
-    # Type-aware equality so True != 1 and an integer const never matches a float value,
-    # matching the strict comparisons in the Go and PHP validators.
-    return type(a) is type(b) and a == b
+    """JSON equality for ``const`` / ``enum``: numbers compare by mathematical value (``1`` ==
+    ``1.0`` == ``Decimal("1")``), recursively inside arrays and objects (object key order is
+    irrelevant); ``True`` is never ``1``, ``"1"`` is never ``1`` and ``None`` equals only ``None``."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool) and a == b
+    if _is_number(a) and _is_number(b):
+        return bool(a == b)
+    if a is None or b is None:
+        return a is None and b is None
+    if isinstance(a, str) and isinstance(b, str):
+        return a == b
+    if isinstance(a, Mapping) and isinstance(b, Mapping):
+        return a.keys() == b.keys() and all(_equal(a[k], b[k]) for k in a)
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        return len(a) == len(b) and all(_equal(x, y) for x, y in zip(a, b))
+    return False
 
 
 def _violation(path: str, reason: str) -> str:
@@ -259,6 +348,70 @@ def _violation(path: str, reason: str) -> str:
 
 def _join(path: str, key: str) -> str:
     return key if path == "" else f"{path}.{key}"
+
+
+class SchemaWarning(NamedTuple):
+    """One keyword outside the supported subset, found while registering a schema. ``pointer`` is
+    the RFC 6901 JSON Pointer, within the schema document, of the schema object carrying
+    ``keyword`` (``""`` for the root, ``/properties/<name>``, ``/items``,
+    ``/additionalProperties``). The keyword never changes the verdict; this is only a notice."""
+
+    pointer: str
+    keyword: str
+
+
+_SUPPORTED_KEYWORDS = frozenset(
+    ("type", "required", "properties", "additionalProperties", "items", "enum", "const",
+     "minLength", "maxLength", "minimum")
+)
+_ANNOTATION_KEYWORDS = frozenset(("$schema", "$id", "title", "description", "examples", "default", "$comment"))
+
+
+def unsupported_keywords(schema: Mapping[str, Any]) -> List[SchemaWarning]:
+    """Every keyword in ``schema`` outside the supported subset, one entry per occurrence.
+
+    Annotation keywords (``$schema``, ``$id``, ``title``, ``description``, ``examples``,
+    ``default``, ``$comment`` and anything starting with ``x-``) never count. The walk descends
+    only into the values of ``properties``, into ``items`` and into ``additionalProperties`` when
+    each is an object; it never descends into an unsupported keyword's value, so ``allOf`` or
+    ``definitions`` is one warning and what is inside produces none.
+    """
+    found: List[SchemaWarning] = []
+    _walk_unsupported(schema, "", found)
+    return found
+
+
+def _escape_pointer(token: str) -> str:
+    return token.replace("~", "~0").replace("/", "~1")
+
+
+def _walk_unsupported(node: Any, pointer: str, out: List[SchemaWarning]) -> None:
+    if not isinstance(node, Mapping):
+        return
+    for key in node:
+        name = str(key)
+        if name in _SUPPORTED_KEYWORDS or name in _ANNOTATION_KEYWORDS or name.startswith("x-"):
+            continue
+        out.append(SchemaWarning(pointer, name))
+    properties = node.get("properties")
+    if isinstance(properties, Mapping):
+        for name, sub in properties.items():
+            _walk_unsupported(sub, f"{pointer}/properties/{_escape_pointer(str(name))}", out)
+    _walk_unsupported(node.get("items"), f"{pointer}/items", out)
+    _walk_unsupported(node.get("additionalProperties"), f"{pointer}/additionalProperties", out)
+
+
+def report_unsupported(urn: str, schema: Mapping[str, Any]) -> List[SchemaWarning]:
+    """Find the unsupported keywords of ``schema`` (registered under ``urn``), log one warning each
+    on the ``babelqueue.schema`` logger and return them."""
+    found = unsupported_keywords(schema)
+    for warning in found:
+        logger.warning(
+            "Schema for %s uses keyword %r at %r, which the payload validator does not support; "
+            "it is ignored (the verdict is unchanged).",
+            urn, warning.keyword, warning.pointer,
+        )
+    return found
 
 
 class SensitivePath(NamedTuple):

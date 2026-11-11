@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "conformance_version": "1.9.0",
+  "conformance_version": "1.10.0",
   "sections": {
     "cases": {
       "scope": "core"
@@ -48,6 +48,9 @@
       "scope": "core"
     },
     "payload_schema_unicode": {
+      "scope": "core"
+    },
+    "payload_schema_keywords": {
       "scope": "core"
     },
     "trim": {
@@ -1072,6 +1075,244 @@
         "data": {
           "min2": "e\u0301"
         }
+      }
+    ]
+  },
+  "payload_schema_keywords": {
+    "description": "Draft-07 subset keyword semantics (ADR-0024, K-17). The subset is exactly `type`, `required`, `properties`, `additionalProperties`, `items`, `enum`, `const`, `minLength`, `maxLength`, `minimum`; every SDK's optional payload validator MUST agree on both the verdict and the registration warnings below (GR-5). The wire envelope stays frozen: this governs the opt-in `data` validation only. Shape: `cases` is a list of `{ name, schema, data, valid, warnings? }`; unlike `payload_schema` each case carries its own `schema`. A runner registers `schema`, collects the warnings the registration produces, then validates `data` and compares `valid`. Three rules are pinned. (1) UNION TYPES: `type` may be an array of type names (`[\"string\", \"null\"]`); a value is valid when it matches ANY listed type. `integer` accepts every number whose mathematical value is integral, so `1.0` and `1e0` and `1e2` are integers and `1.5` is not (Draft-07). `number` accepts any number, `boolean` accepts only `true`/`false` (never `0`/`1`), `null` accepts only `null`. (2) NUMERIC EQUALITY in `const` and `enum`: numbers compare by mathematical value, so `1`, `1.0` and `1e0` are equal and `2.5` equals `2.50`; the rule applies recursively inside arrays and objects (objects compare by key set and values, key order is irrelevant; arrays compare element by element in order). `true` is not `1`, `false` is not `0`, `\"1\"` is not `1`, and `null` equals only `null`. Write the JSON number literal as the case does (`1.0`, `1e0`, `2.50`): a runner MUST NOT reject or normalise it before comparing. (3) UNSUPPORTED KEYWORDS: a keyword outside the subset does NOT change the verdict (the schema is evaluated as if the keyword were absent) but registering the schema produces exactly one warning per unsupported keyword occurrence, `{ pointer, keyword }`. `pointer` is the RFC 6901 JSON Pointer, within the schema document, of the schema object that carries the keyword: the root is the empty string `\"\"`, then `/properties/<name>`, `/items`, `/additionalProperties` (property names are escaped `~` -> `~0`, `/` -> `~1`). The walk descends only into the values of `properties`, into `items` and into `additionalProperties` when each is a JSON object; it never descends into the value of an unsupported keyword (`allOf`, `definitions`, ...), so keywords inside such a value produce no warning, and the names inside `properties` are property names, never keywords. Annotation keywords are not unsupported and never warn: `$schema`, `$id`, `title`, `description`, `examples`, `default`, `$comment`, and every keyword whose name starts with `x-` (for example the ADR-0030 `x-gdpr-sensitive`). The expected warnings of a case are the `warnings` field compared as a SET of `{ pointer, keyword }` pairs (order is irrelevant, the message text is the SDK's own and is never compared); an absent `warnings` means the expected set is empty. Because rule 3 evaluates an unsupported keyword as absent, a case whose schema uses a keyword that a full Draft-07 validator enforces (`allOf`, `$ref`, `maximum`, `pattern`, ...) has the subset's verdict, not Draft-07's; for that reason the reference Draft-07 cross-check of `ci.yml` does not cover this section.",
+    "cases": [
+      { "name": "union-string-null-accepts-string", "schema": { "type": "object", "properties": { "v": { "type": ["string", "null"] } } }, "data": { "v": "abc" }, "valid": true },
+      { "name": "union-string-null-accepts-null", "schema": { "type": "object", "properties": { "v": { "type": ["string", "null"] } } }, "data": { "v": null }, "valid": true },
+      { "name": "union-string-null-rejects-number", "schema": { "type": "object", "properties": { "v": { "type": ["string", "null"] } } }, "data": { "v": 5 }, "valid": false },
+      { "name": "union-string-null-rejects-boolean", "schema": { "type": "object", "properties": { "v": { "type": ["string", "null"] } } }, "data": { "v": false }, "valid": false },
+      { "name": "union-integer-null-accepts-1.0", "schema": { "type": "object", "properties": { "v": { "type": ["integer", "null"] } } }, "data": { "v": 1.0 }, "valid": true },
+      { "name": "union-integer-null-accepts-1e2", "schema": { "type": "object", "properties": { "v": { "type": ["integer", "null"] } } }, "data": { "v": 1e2 }, "valid": true },
+      { "name": "union-integer-null-rejects-1.5", "schema": { "type": "object", "properties": { "v": { "type": ["integer", "null"] } } }, "data": { "v": 1.5 }, "valid": false },
+      { "name": "union-integer-null-accepts-null", "schema": { "type": "object", "properties": { "v": { "type": ["integer", "null"] } } }, "data": { "v": null }, "valid": true },
+      { "name": "union-integer-boolean-rejects-numeric-string", "schema": { "type": "object", "properties": { "v": { "type": ["integer", "boolean"] } } }, "data": { "v": "1" }, "valid": false },
+      { "name": "type-integer-accepts-1.0", "schema": { "type": "object", "properties": { "v": { "type": "integer" } } }, "data": { "v": 1.0 }, "valid": true },
+      { "name": "type-integer-rejects-1.5", "schema": { "type": "object", "properties": { "v": { "type": "integer" } } }, "data": { "v": 1.5 }, "valid": false },
+      { "name": "union-nested-properties-accepts-null", "schema": { "type": "object", "properties": { "user": { "type": "object", "properties": { "email": { "type": ["string", "null"] }, "age": { "type": ["integer", "null"], "minimum": 0 } } } } }, "data": { "user": { "email": null, "age": 30.0 } }, "valid": true },
+      { "name": "union-nested-properties-rejects-wrong-type", "schema": { "type": "object", "properties": { "user": { "type": "object", "properties": { "email": { "type": ["string", "null"] } } } } }, "data": { "user": { "email": 7 } }, "valid": false },
+      { "name": "union-nested-minimum-still-applies", "schema": { "type": "object", "properties": { "user": { "type": "object", "properties": { "age": { "type": ["integer", "null"], "minimum": 0 } } } } }, "data": { "user": { "age": -1 } }, "valid": false },
+      { "name": "union-items-accepts-member-types", "schema": { "type": "object", "properties": { "list": { "type": "array", "items": { "type": ["string", "number"] } } } }, "data": { "list": ["a", 2, 3.5] }, "valid": true },
+      { "name": "union-items-rejects-boolean-member", "schema": { "type": "object", "properties": { "list": { "type": "array", "items": { "type": ["string", "number"] } } } }, "data": { "list": ["a", true] }, "valid": false },
+      { "name": "const-number-accepts-1", "schema": { "type": "object", "properties": { "v": { "const": 1 } } }, "data": { "v": 1 }, "valid": true },
+      { "name": "const-number-accepts-1.0", "schema": { "type": "object", "properties": { "v": { "const": 1 } } }, "data": { "v": 1.0 }, "valid": true },
+      { "name": "const-number-accepts-1e0", "schema": { "type": "object", "properties": { "v": { "const": 1 } } }, "data": { "v": 1e0 }, "valid": true },
+      { "name": "const-number-rejects-true", "schema": { "type": "object", "properties": { "v": { "const": 1 } } }, "data": { "v": true }, "valid": false },
+      { "name": "const-number-rejects-string-1", "schema": { "type": "object", "properties": { "v": { "const": 1 } } }, "data": { "v": "1" }, "valid": false },
+      { "name": "const-number-rejects-1.5", "schema": { "type": "object", "properties": { "v": { "const": 1 } } }, "data": { "v": 1.5 }, "valid": false },
+      { "name": "const-number-rejects-null", "schema": { "type": "object", "properties": { "v": { "const": 1 } } }, "data": { "v": null }, "valid": false },
+      { "name": "const-1.0-accepts-integer-1", "schema": { "type": "object", "properties": { "v": { "const": 1.0 } } }, "data": { "v": 1 }, "valid": true },
+      { "name": "const-true-rejects-1", "schema": { "type": "object", "properties": { "v": { "const": true } } }, "data": { "v": 1 }, "valid": false },
+      { "name": "const-false-rejects-0", "schema": { "type": "object", "properties": { "v": { "const": false } } }, "data": { "v": 0 }, "valid": false },
+      { "name": "const-null-accepts-null", "schema": { "type": "object", "properties": { "v": { "const": null } } }, "data": { "v": null }, "valid": true },
+      { "name": "const-null-rejects-zero", "schema": { "type": "object", "properties": { "v": { "const": null } } }, "data": { "v": 0 }, "valid": false },
+      { "name": "const-null-rejects-empty-string", "schema": { "type": "object", "properties": { "v": { "const": null } } }, "data": { "v": "" }, "valid": false },
+      { "name": "enum-numbers-accepts-2.50", "schema": { "type": "object", "properties": { "v": { "enum": [1, 2.5] } } }, "data": { "v": 2.50 }, "valid": true },
+      { "name": "enum-numbers-accepts-1.0", "schema": { "type": "object", "properties": { "v": { "enum": [1, 2.5] } } }, "data": { "v": 1.0 }, "valid": true },
+      { "name": "enum-numbers-accepts-exponent-form", "schema": { "type": "object", "properties": { "v": { "enum": [10, 2.5] } } }, "data": { "v": 1e1 }, "valid": true },
+      { "name": "enum-numbers-rejects-3", "schema": { "type": "object", "properties": { "v": { "enum": [1, 2.5] } } }, "data": { "v": 3 }, "valid": false },
+      { "name": "enum-numbers-rejects-string-1", "schema": { "type": "object", "properties": { "v": { "enum": [1, 2.5] } } }, "data": { "v": "1" }, "valid": false },
+      { "name": "enum-numbers-rejects-true", "schema": { "type": "object", "properties": { "v": { "enum": [1, 2.5] } } }, "data": { "v": true }, "valid": false },
+      { "name": "enum-mixed-keeps-booleans-apart", "schema": { "type": "object", "properties": { "v": { "enum": [true, null, 0] } } }, "data": { "v": 1 }, "valid": false },
+      { "name": "enum-mixed-accepts-0.0-for-listed-0", "schema": { "type": "object", "properties": { "v": { "enum": [true, null, 0] } } }, "data": { "v": 0.0 }, "valid": true },
+      { "name": "const-object-accepts-1.0-in-nested-array", "schema": { "const": { "a": [1] } }, "data": { "a": [1.0] }, "valid": true },
+      { "name": "const-object-rejects-true-in-nested-array", "schema": { "const": { "a": [1] } }, "data": { "a": [true] }, "valid": false },
+      { "name": "const-object-rejects-longer-array", "schema": { "const": { "a": [1] } }, "data": { "a": [1, 2] }, "valid": false },
+      { "name": "const-object-rejects-extra-key", "schema": { "const": { "a": [1] } }, "data": { "a": [1], "b": 1 }, "valid": false },
+      { "name": "const-object-ignores-key-order", "schema": { "const": { "a": 1, "b": [2, { "c": 3 }] } }, "data": { "b": [2.0, { "c": 3e0 }], "a": 1.0 }, "valid": true },
+      { "name": "const-object-keeps-array-order", "schema": { "const": { "a": [1, 2] } }, "data": { "a": [2, 1] }, "valid": false },
+      { "name": "enum-object-accepts-1.0-inside-object", "schema": { "type": "object", "properties": { "v": { "enum": [{ "n": 1 }, { "n": 2 }] } } }, "data": { "v": { "n": 1.0 } }, "valid": true },
+      { "name": "enum-object-rejects-string-inside-object", "schema": { "type": "object", "properties": { "v": { "enum": [{ "n": 1 }, { "n": 2 }] } } }, "data": { "v": { "n": "1" } }, "valid": false },
+      {
+        "name": "unsupported-pattern-format-maxitems-valid-unchanged",
+        "schema": { "type": "object", "properties": { "email": { "type": "string", "pattern": "^.+@.+$", "format": "email" }, "tags": { "type": "array", "items": { "type": "string" }, "maxItems": 1 } } },
+        "data": { "email": "not-an-email", "tags": ["a", "b"] },
+        "valid": true,
+        "warnings": [
+          { "pointer": "/properties/email", "keyword": "pattern" },
+          { "pointer": "/properties/email", "keyword": "format" },
+          { "pointer": "/properties/tags", "keyword": "maxItems" }
+        ]
+      },
+      {
+        "name": "unsupported-keywords-supported-ones-still-enforced",
+        "schema": { "type": "object", "properties": { "email": { "type": "string", "pattern": "^.+@.+$", "format": "email" } } },
+        "data": { "email": 12 },
+        "valid": false,
+        "warnings": [
+          { "pointer": "/properties/email", "keyword": "pattern" },
+          { "pointer": "/properties/email", "keyword": "format" }
+        ]
+      },
+      {
+        "name": "unsupported-root-keyword",
+        "schema": { "type": "object", "minProperties": 2 },
+        "data": { "a": 1 },
+        "valid": true,
+        "warnings": [{ "pointer": "", "keyword": "minProperties" }]
+      },
+      {
+        "name": "unsupported-maximum-is-not-enforced",
+        "schema": { "type": "object", "properties": { "n": { "type": "integer", "minimum": 1, "maximum": 5 } } },
+        "data": { "n": 10 },
+        "valid": true,
+        "warnings": [{ "pointer": "/properties/n", "keyword": "maximum" }]
+      },
+      {
+        "name": "unsupported-in-items-schema",
+        "schema": { "type": "object", "properties": { "list": { "type": "array", "items": { "type": "integer", "multipleOf": 2 } } } },
+        "data": { "list": [1, 2, 3] },
+        "valid": true,
+        "warnings": [{ "pointer": "/properties/list/items", "keyword": "multipleOf" }]
+      },
+      {
+        "name": "unsupported-in-additional-properties-schema",
+        "schema": { "type": "object", "additionalProperties": { "type": "string", "pattern": "^x" } },
+        "data": { "a": "y" },
+        "valid": true,
+        "warnings": [{ "pointer": "/additionalProperties", "keyword": "pattern" }]
+      },
+      {
+        "name": "unsupported-deeply-nested",
+        "schema": { "type": "object", "properties": { "a": { "type": "object", "properties": { "b": { "type": "array", "items": { "type": "object", "properties": { "c": { "type": "string", "pattern": "^z" } } } } } } } },
+        "data": { "a": { "b": [{ "c": "q" }] } },
+        "valid": true,
+        "warnings": [{ "pointer": "/properties/a/properties/b/items/properties/c", "keyword": "pattern" }]
+      },
+      {
+        "name": "unsupported-pointer-escapes-property-names",
+        "schema": { "type": "object", "properties": { "a/b": { "type": "string", "pattern": "x" }, "m~n": { "type": "string", "format": "x" } } },
+        "data": { "a/b": "q", "m~n": "q" },
+        "valid": true,
+        "warnings": [
+          { "pointer": "/properties/a~1b", "keyword": "pattern" },
+          { "pointer": "/properties/m~0n", "keyword": "format" }
+        ]
+      },
+      {
+        "name": "unsupported-container-is-one-warning-and-not-descended",
+        "schema": { "type": "object", "properties": { "a": { "type": "string" } }, "allOf": [{ "type": "integer", "pattern": "x" }], "definitions": { "s": { "type": "string", "format": "x" } } },
+        "data": { "a": "s" },
+        "valid": true,
+        "warnings": [
+          { "pointer": "", "keyword": "allOf" },
+          { "pointer": "", "keyword": "definitions" }
+        ]
+      },
+      {
+        "name": "unsupported-ref-is-ignored",
+        "schema": { "type": "object", "properties": { "a": { "$ref": "#/definitions/s" } }, "definitions": { "s": { "type": "string" } } },
+        "data": { "a": 5 },
+        "valid": true,
+        "warnings": [
+          { "pointer": "", "keyword": "definitions" },
+          { "pointer": "/properties/a", "keyword": "$ref" }
+        ]
+      },
+      {
+        "name": "unsupported-same-keyword-at-two-places-warns-twice",
+        "schema": { "type": "object", "pattern": "x", "properties": { "a": { "type": "string", "pattern": "x" } } },
+        "data": { "a": "s" },
+        "valid": true,
+        "warnings": [
+          { "pointer": "", "keyword": "pattern" },
+          { "pointer": "/properties/a", "keyword": "pattern" }
+        ]
+      },
+      {
+        "name": "annotations-never-warn",
+        "schema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "$id": "urn:example:order",
+          "title": "Order",
+          "description": "An order.",
+          "$comment": "annotation only",
+          "examples": [{ "order_id": 1 }],
+          "default": {},
+          "type": "object",
+          "properties": {
+            "order_id": { "type": "integer", "title": "Order id", "description": "The id.", "$comment": "c", "default": 0, "examples": [1] }
+          }
+        },
+        "data": { "order_id": 7 },
+        "valid": true
+      },
+      {
+        "name": "x-prefixed-keywords-never-warn",
+        "schema": {
+          "type": "object",
+          "x-owner": "billing",
+          "properties": {
+            "email": { "type": "string", "x-gdpr-sensitive": true },
+            "tags": { "type": "array", "items": { "type": "string", "x-gdpr-sensitive": { "category": "pii" } } }
+          },
+          "additionalProperties": { "type": "string", "x-custom": 1 }
+        },
+        "data": { "email": "a@b.c", "tags": ["x"], "extra": "s" },
+        "valid": true
+      },
+      {
+        "name": "annotation-and-unsupported-mixed-warns-only-for-unsupported",
+        "schema": { "type": "object", "title": "T", "x-gdpr-sensitive": true, "properties": { "email": { "type": "string", "description": "d", "x-gdpr-sensitive": true, "format": "email" } } },
+        "data": { "email": "q" },
+        "valid": true,
+        "warnings": [{ "pointer": "/properties/email", "keyword": "format" }]
+      },
+      {
+        "name": "property-names-are-not-keywords",
+        "schema": { "type": "object", "properties": { "title": { "type": "string" }, "pattern": { "type": "string" }, "format": { "type": "string" }, "x-gdpr-sensitive": { "type": "string" } } },
+        "data": { "title": "t", "pattern": "p", "format": "f", "x-gdpr-sensitive": "s" },
+        "valid": true
+      },
+      {
+        "name": "all-supported-keywords-produce-no-warnings",
+        "schema": {
+          "type": "object",
+          "required": ["name", "score", "kind"],
+          "properties": {
+            "name": { "type": "string", "minLength": 2, "maxLength": 5 },
+            "score": { "type": ["number", "null"], "minimum": 0 },
+            "kind": { "enum": ["a", "b"] },
+            "version": { "const": 1 },
+            "tags": { "type": "array", "items": { "type": "string" } }
+          },
+          "additionalProperties": false
+        },
+        "data": { "name": "abc", "score": 0, "kind": "a", "version": 1.0, "tags": ["x"] },
+        "valid": true
+      },
+      {
+        "name": "max-length-ascii-boundary-valid",
+        "schema": { "type": "object", "properties": { "v": { "type": "string", "maxLength": 3 } } },
+        "data": { "v": "abc" },
+        "valid": true
+      },
+      {
+        "name": "max-length-turkish-3cp-6-bytes-boundary-valid",
+        "schema": { "type": "object", "properties": { "v": { "type": "string", "maxLength": 3 } } },
+        "data": { "v": "ğüş" },
+        "valid": true
+      },
+      {
+        "name": "max-length-emoji-3cp-6-utf16-units-boundary-valid",
+        "schema": { "type": "object", "properties": { "v": { "type": "string", "maxLength": 3 } } },
+        "data": { "v": "😀😀😀" },
+        "valid": true
+      },
+      {
+        "name": "max-length-emoji-4cp-max3-invalid",
+        "schema": { "type": "object", "properties": { "v": { "type": "string", "maxLength": 3 } } },
+        "data": { "v": "😀😀😀😀" },
+        "valid": false
+      },
+      {
+        "name": "max-length-combining-2cp-1-grapheme-max1-invalid",
+        "schema": { "type": "object", "properties": { "v": { "type": "string", "maxLength": 1 } } },
+        "data": { "v": "e\u0301" },
+        "valid": false
       }
     ]
   },
