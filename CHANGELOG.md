@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.26.0] - 2026-11-11
+
 Brings the opt-in payload validator (ADR-0024) to the K-17 Draft-07 subset behaviour pinned by conformance
 v1.10.0 (section `payload_schema_keywords`). Only the optional `data` validation changes; the envelope stays at
 `schema_version: 1` and nothing on the wire changes.
