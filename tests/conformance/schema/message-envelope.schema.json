@@ -46,7 +46,7 @@
         },
         "lang": {
           "type": "string",
-          "enum": ["php", "go", "python", "java", "dotnet", "node"],
+          "pattern": "^[a-z][a-z0-9-]*$",
           "description": "Producer language tag."
         },
         "schema_version": {
@@ -101,7 +101,7 @@
         },
         "lang": {
           "type": "string",
-          "enum": ["php", "go", "python", "java", "dotnet", "node"],
+          "pattern": "^[a-z][a-z0-9-]*$",
           "description": "Language of the SDK that dead-lettered the message."
         }
       }

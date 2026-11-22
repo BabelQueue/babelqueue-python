@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "conformance_version": "1.10.0",
+  "conformance_version": "1.11.0",
   "sections": {
     "cases": {
       "scope": "core"
@@ -626,11 +626,20 @@
       {
         "name": "unknown-lang",
         "file": "fixtures/unknown-lang.json",
-        "description": "A meta.lang outside the known language list (a future/community SDK) is decoded without error and re-emitted unchanged — a consumer MUST NOT reject or rewrite it.",
-        "producer_schema_valid": false,
+        "description": "A meta.lang outside the built-in language list (a future/community SDK) is decoded without error and re-emitted unchanged — a consumer MUST NOT reject or rewrite it. Since 1.11.0 (ADR-0040) the tag 'cobol' matches the open pattern ^[a-z][a-z0-9-]*$, so this fixture passes the producer JSON Schema.",
         "expect_attempts": 1,
         "expect_preserved": {
           "/meta/lang": "cobol"
+        }
+      },
+      {
+        "name": "malformed-lang",
+        "file": "fixtures/malformed-lang.json",
+        "description": "A meta.lang that does not match the open tag pattern ^[a-z][a-z0-9-]*$ (upper case and a space) is a producer-side violation, but a consumer is tolerant (ADR-0040): it is decoded without error and re-emitted unchanged — a consumer MUST NOT reject or rewrite it.",
+        "producer_schema_valid": false,
+        "expect_attempts": 1,
+        "expect_preserved": {
+          "/meta/lang": "Rust 1"
         }
       },
       {
